@@ -1,0 +1,10 @@
+[package]
+name = "argus-common"
+description = "Constants and small shared types for the Argus control plane and agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+# Intentionally empty for the skeleton: this crate currently holds only constants.
+# Shared types (identity newtypes, error enums) land here as slices are built.

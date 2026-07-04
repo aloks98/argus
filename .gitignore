@@ -1,0 +1,15 @@
+# Rust
+/target
+**/*.rs.bk
+
+# Node / frontend (frontend/dist is a build artifact, embedded at compile time)
+node_modules
+frontend/dist
+
+# Local env / secrets
+.env
+*.local
+.cargo/config.toml
+
+# SDD progress ledger + scratch (skill-managed, local only)
+.superpowers/

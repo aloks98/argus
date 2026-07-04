@@ -1,0 +1,182 @@
+syntax = "proto3";
+package argus.v1;
+
+// The agent-facing service, served on the MetalLB agent LoadBalancer
+// (agents.argus.lab.<domain>). The control plane terminates TLS itself with
+// rustls configured for OPTIONAL client auth. Per-RPC enforcement:
+//   - Enroll : NO client cert required; gated by a join token. Returns the
+//              agent's signed client certificate (its mTLS identity).
+//   - Session: client cert REQUIRED and validated against the internal CA; the
+//              agent_id is read from the cert. One long-lived bidi stream carries
+//              everything, multiplexed by stream_id.
+service AgentService {
+  rpc Enroll (EnrollRequest) returns (EnrollResponse);
+  rpc Session (stream AgentFrame) returns (stream ServerFrame);
+}
+
+// ---- Enrollment ------------------------------------------------------------
+
+message EnrollRequest {
+  string join_token = 1;   // shared secret baked into the template
+  string csr_pem = 2;      // agent-generated CSR; the private key never leaves the agent
+  AgentInfo info = 3;
+}
+
+message EnrollResponse {
+  string client_cert_pem = 1; // signed by the internal CA
+  string ca_cert_pem = 2;     // so the agent can also verify the server
+  string agent_id = 3;        // UUID assigned to this machine
+}
+
+message AgentInfo {
+  string hostname = 1;
+  string machine_id = 2;    // /etc/machine-id -- stable identity across reboots
+  string os = 3;            // "Debian 12", "Flatcar 3975.2.0"
+  string kernel = 4;
+  string primary_ip = 5;
+  string arch = 6;          // "x86_64"
+  string agent_version = 7;
+}
+
+// ---- Session multiplexing --------------------------------------------------
+// stream_id == 0 -> connection-level control (hello/heartbeat/ping).
+// stream_id  > 0 -> a logical sub-stream (one command, one log tail, one PTY).
+
+message AgentFrame {
+  uint64 stream_id = 1;
+  oneof payload {
+    Hello hello = 2;                    // first frame after connect; snapshot begins
+    Heartbeat heartbeat = 3;
+    MetricsSample metrics = 4;
+    DockerState docker_state = 5;
+    SystemdState systemd_state = 6;
+    LogChunk log_chunk = 7;
+    PtyOutput pty_output = 8;
+    CommandResult command_result = 9;
+    Ack ack = 10;
+  }
+}
+
+message ServerFrame {
+  uint64 stream_id = 1;
+  oneof payload {
+    HelloAck hello_ack = 2;
+    Command command = 3;                // a verb to execute
+    LogTailRequest log_tail_start = 4;
+    LogTailStop log_tail_stop = 5;
+    PtyOpen pty_open = 6;
+    PtyInput pty_input = 7;
+    PtyResize pty_resize = 8;
+    PtyClose pty_close = 9;
+    UpdateAgent update = 10;            // self-update: download new binary + re-exec
+    Ping ping = 11;
+  }
+}
+
+// ---- Connection control ----------------------------------------------------
+
+message Hello { AgentInfo info = 1; }                       // full snapshot follows
+message HelloAck { string server_version = 1; uint32 heartbeat_secs = 2; }
+message Heartbeat { int64 unix_ms = 1; uint64 uptime_secs = 2; }
+message Ping { int64 unix_ms = 1; }
+message Ack { uint64 ref_stream_id = 1; bool ok = 2; string message = 3; }
+
+// ---- Metrics ---------------------------------------------------------------
+
+message MetricsSample {
+  int64 unix_ms = 1;
+  float cpu_pct = 2;
+  uint64 mem_used = 3;
+  uint64 mem_total = 4;
+  uint64 swap_used = 5;
+  uint64 swap_total = 6;
+  float load1 = 7;
+  float load5 = 8;
+  float load15 = 9;
+  uint64 disk_used = 10;   // aggregate of monitored filesystems
+  uint64 disk_total = 11;
+  uint64 net_rx_bytes = 12; // cumulative; deltas computed control-plane-side
+  uint64 net_tx_bytes = 13;
+  uint64 uptime_secs = 14;
+  // Long tail (per-disk, per-net, temps, ZFS ARC) rides a JSON string so the
+  // proto and the metrics table both stay boring.
+  string extra_json = 15;
+}
+
+// ---- Docker & systemd state ------------------------------------------------
+
+message DockerState { repeated Container containers = 1; }
+message Container {
+  string id = 1;
+  string name = 2;
+  string image = 3;
+  string state = 4;    // running|exited|paused|...
+  string status = 5;   // human string
+  string health = 6;   // healthy|unhealthy|starting|"" (none)
+}
+
+message SystemdState { repeated Unit units = 1; }
+message Unit {
+  string name = 1;
+  string load_state = 2;    // loaded|not-found|...
+  string active_state = 3;  // active|failed|inactive|...
+  string sub_state = 4;     // running|dead|exited|...
+  string description = 5;
+}
+
+// ---- Verbs (V1: deliberately short) ----------------------------------------
+
+enum Verb {
+  VERB_UNSPECIFIED = 0;
+  CONTAINER_START = 1;
+  CONTAINER_STOP = 2;
+  CONTAINER_RESTART = 3;
+  UNIT_START = 4;
+  UNIT_STOP = 5;
+  UNIT_RESTART = 6;
+}
+
+message Command {
+  string command_id = 1;   // UUID; correlates to audit_log + CommandResult
+  Verb verb = 2;
+  string target = 3;       // container id or unit name
+  string issued_by = 4;    // OIDC subject/email -- for the agent-side audit trail
+}
+
+message CommandResult {
+  string command_id = 1;
+  bool ok = 2;
+  int32 exit_code = 3;
+  string message = 4;
+}
+
+// ---- Log tailing (pull-on-demand) ------------------------------------------
+
+message LogTailRequest {
+  string request_id = 1;
+  string source = 2;       // "docker:<container-id>" | "journal:<unit>"
+  uint32 tail_lines = 3;
+  bool follow = 4;
+}
+message LogTailStop { string request_id = 1; }
+message LogChunk {
+  string request_id = 1;
+  bytes data = 2;
+  bool eof = 3;
+}
+
+// ---- Terminal (PTY) --------------------------------------------------------
+
+message PtyOpen { string session_id = 1; uint32 cols = 2; uint32 rows = 3; string shell = 4; }
+message PtyInput { string session_id = 1; bytes data = 2; }
+message PtyOutput { string session_id = 1; bytes data = 2; }
+message PtyResize { string session_id = 1; uint32 cols = 2; uint32 rows = 3; }
+message PtyClose { string session_id = 1; }
+
+// ---- Self-update -----------------------------------------------------------
+
+message UpdateAgent {
+  string url = 1;      // mTLS URL on the control plane to fetch the new binary
+  string version = 2;
+  string sha256 = 3;   // verified before re-exec
+}

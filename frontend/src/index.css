@@ -1,0 +1,5 @@
+@import "tailwindcss";
+
+/* @e412/rnui-react is built on Tailwind v4. Its theme tokens are wired in during
+   implementation (import "@e412/rnui-themes"); this placeholder keeps the build
+   self-contained. */

@@ -1,0 +1,36 @@
+[package]
+name = "argus-agent"
+description = "Argus guest agent"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "argus-agent"
+path = "src/main.rs"
+
+[dependencies]
+argus-proto.workspace = true
+argus-common.workspace = true
+
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+tonic-prost.workspace = true
+prost.workspace = true
+
+rustls.workspace = true
+tokio-rustls.workspace = true
+rcgen.workspace = true
+rustls-pemfile.workspace = true
+
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+# Per-slice deps are added when their slice is built (keeps the agent lean):
+#   sysinfo       -> slice 2 (metrics)
+#   bollard       -> slice 3 (docker)
+#   zbus          -> slice 4 (systemd)
+#   portable-pty  -> slice 6 (terminal)
