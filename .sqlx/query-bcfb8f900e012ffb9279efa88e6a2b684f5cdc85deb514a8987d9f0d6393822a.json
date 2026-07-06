@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO enrollment_tokens (name, token_hash, max_uses, uses, expires_at, revoked)\n             VALUES ($1, $2, 1, 0, NULL, false)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "bcfb8f900e012ffb9279efa88e6a2b684f5cdc85deb514a8987d9f0d6393822a"
+}

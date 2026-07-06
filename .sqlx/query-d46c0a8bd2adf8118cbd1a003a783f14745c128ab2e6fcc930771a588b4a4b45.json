@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO machines (machine_id, hostname, os, primary_ip, status, last_seen_at)\n               VALUES ('test-fleet-online', 'a-online-host', 'Debian 12', '10.0.0.5'::inet, 'online', now())",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "d46c0a8bd2adf8118cbd1a003a783f14745c128ab2e6fcc930771a588b4a4b45"
+}

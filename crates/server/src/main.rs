@@ -10,13 +10,17 @@
 
 mod ca;
 mod config;
+mod crypto;
 mod db;
 mod embed;
 mod grpc;
 mod http;
+mod identity;
 mod jobs;
+mod repo;
 
 use anyhow::Result;
+use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -38,12 +42,21 @@ async fn main() -> Result<()> {
     db::migrate(&pool).await?;
     tracing::info!("migrations applied");
 
-    // Build slice #1 (Spine) continues here: load/create the CA (`ca`), then serve
-    // the agent mTLS gRPC surface (`grpc`) alongside the browser surface, and start
-    // background jobs (`jobs`). Until wired, only the browser surface runs.
-    tracing::warn!(
-        "agent gRPC surface, internal CA, and jobs are not yet wired -- see docs/PRD.md §5, §8"
-    );
+    // Load (or generate + persist) the internal CA, then issue the control
+    // plane's own TLS leaf for the agent gRPC surface (Spine, build slice #1).
+    let field_cipher = crypto::FieldCipher::from_b64_key(&cfg.field_key_b64)?;
+    let ca = Arc::new(ca::CertAuthority::load_or_init(&pool, &field_cipher).await?);
+    let server_identity = ca.issue_server_cert(&cfg.agent_sans)?;
 
-    http::serve(&cfg).await
+    let agent_svc = grpc::AgentSvc::new(ca, pool.clone());
+
+    // Serve the browser HTTP surface, the agent gRPC surface, and the offline
+    // sweeper (Task 7) concurrently.
+    tokio::try_join!(
+        http::serve(&cfg, pool.clone()),
+        grpc::serve(&cfg, agent_svc, server_identity),
+        jobs::run(pool.clone()),
+    )?;
+
+    Ok(())
 }

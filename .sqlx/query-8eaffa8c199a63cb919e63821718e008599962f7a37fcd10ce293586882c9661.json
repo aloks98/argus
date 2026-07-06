@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO ca_material (id, cert_pem, key_ciphertext, key_nonce) VALUES (1, $1, $2, $3)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8eaffa8c199a63cb919e63821718e008599962f7a37fcd10ce293586882c9661"
+}

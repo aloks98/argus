@@ -36,6 +36,20 @@ serde_json.workspace = true
 uuid.workspace = true
 time.workspace = true
 anyhow.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+aes-gcm.workspace = true
+sha2.workspace = true
+base64.workspace = true
+hex.workspace = true
+x509-parser.workspace = true
+rand.workspace = true
+
+[dev-dependencies]
+# For parsing PEM in tests only; `rcgen`/`x509-parser` already pull in `pem`
+# transitively, but Rust requires a direct dependency to `use` a crate.
+pem = "3"
+# For driving the axum router directly in tests via `ServiceExt::oneshot`,
+# without binding a socket.
+tower = { version = "0.5", features = ["util"] }

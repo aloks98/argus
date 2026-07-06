@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE agent_certs SET revoked = true WHERE fingerprint = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "cf89fc902988501b456d4d6f2be9b48dc7f52329eeb56005142d3da396747287"
+}

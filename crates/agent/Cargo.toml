@@ -25,9 +25,12 @@ rcgen.workspace = true
 rustls-pemfile.workspace = true
 
 anyhow.workspace = true
-thiserror.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+
+rand.workspace = true
+rustix.workspace = true
+x509-parser.workspace = true
 
 # Per-slice deps are added when their slice is built (keeps the agent lean):
 #   sysinfo       -> slice 2 (metrics)

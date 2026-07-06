@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM ca_material",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "8058cc882f00078fcad6f92efbbcb2621b9746a5c04a00d297c758bdb30aadb2"
+}

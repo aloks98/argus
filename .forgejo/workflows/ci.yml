@@ -1,0 +1,98 @@
+# Forgejo Actions CI for Argus.
+#
+# Runs on a `medium`-labelled act_runner using catthehacker's Rust image
+# (rustc/cargo/rustfmt/clippy + node + git + gcc/make preinstalled — no rustup or
+# node install step needed).
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  check-test:
+    runs-on: medium
+    container:
+      image: catthehacker/ubuntu:rust-24.04
+    env:
+      # Postgres is started inside this job's container (see "Start Postgres") and
+      # reached over localhost. This deliberately avoids a `services:` container,
+      # whose name resolution depends on the act_runner's network mode.
+      DATABASE_URL: postgres://postgres:argus@localhost:5432/argus
+      CARGO_TERM_COLOR: always
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Start Postgres
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends postgresql
+          PGVER=$(ls /etc/postgresql | sort -V | tail -1)
+          pg_ctlcluster "$PGVER" main start || true
+          for i in $(seq 1 30); do pg_isready -h localhost -p 5432 && break; sleep 1; done
+          su postgres -c "psql -v ON_ERROR_STOP=1 -c \"ALTER USER postgres PASSWORD 'argus';\""
+          su postgres -c "psql -v ON_ERROR_STOP=1 -c \"CREATE DATABASE argus;\""
+
+      # The server embeds frontend/dist via rust-embed, so it MUST exist before any
+      # cargo build/clippy/test of the workspace.
+      - name: Build the embedded frontend
+        run: |
+          npm --prefix frontend ci
+          npm --prefix frontend run typecheck
+          npm --prefix frontend run build
+
+      - name: Rustfmt
+        run: cargo fmt --all --check
+
+      # Uses the committed .sqlx offline cache, so no database is needed here.
+      - name: Clippy (deny warnings)
+        env:
+          SQLX_OFFLINE: "true"
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      # Guards against a stale committed query cache: fails if a query! changed
+      # without `cargo sqlx prepare` being re-run. Needs the live schema.
+      - name: Verify the .sqlx offline cache is current
+        run: |
+          cargo install sqlx-cli --version ^0.9 --no-default-features --features rustls,postgres --locked
+          sqlx migrate run --source crates/server/migrations
+          cargo sqlx prepare --workspace --check -- --all-targets
+
+      - name: Test (unit + sqlx::test + live-DB integration)
+        run: |
+          cargo test --workspace
+          cargo test --workspace -- --ignored
+
+  # The agent must ship as a fully static binary for Flatcar (CLAUDE.md standing
+  # convention). This builds it for the musl target and asserts it's static, so a
+  # dependency that breaks the static build is caught here rather than at deploy.
+  agent-musl:
+    runs-on: medium
+    container:
+      image: catthehacker/ubuntu:rust-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install musl toolchain
+        run: |
+          apt-get update
+          apt-get install -y --no-install-recommends musl-tools
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Build the static agent (Flatcar target)
+        env:
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: cargo build -p argus-agent --release --target x86_64-unknown-linux-musl
+
+      - name: Assert the agent binary is statically linked
+        run: |
+          BIN=target/x86_64-unknown-linux-musl/release/argus-agent
+          file "$BIN"
+          file "$BIN" | grep -qi 'static' || { echo "ERROR: agent is not statically linked"; exit 1; }

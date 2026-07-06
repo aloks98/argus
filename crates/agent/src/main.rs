@@ -9,6 +9,8 @@
 
 mod config;
 mod enroll;
+mod identity;
+mod info;
 mod session;
 
 use anyhow::Result;

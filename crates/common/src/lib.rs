@@ -26,6 +26,9 @@ pub mod env {
     pub const HTTP_ADDR: &str = "ARGUS_HTTP_ADDR";
     /// Listen address for the agent mTLS gRPC surface (MetalLB upstream).
     pub const AGENT_ADDR: &str = "ARGUS_AGENT_ADDR";
+    /// Comma-separated SANs for the control plane's own agent-surface TLS leaf
+    /// (hostnames/IPs agents dial). Defaults to localhost.
+    pub const AGENT_SANS: &str = "ARGUS_AGENT_SANS";
 
     // ---- Agent ----
     /// Control-plane agent endpoint, e.g. `https://agents.argus.lab.example`.
@@ -34,4 +37,7 @@ pub mod env {
     pub const JOIN_TOKEN: &str = "ARGUS_JOIN_TOKEN";
     /// Path to the baked-in Argus CA certificate (PEM).
     pub const CA_CERT_PATH: &str = "ARGUS_CA_CERT";
+    /// Directory where the agent persists its key + issued cert. Overrides the
+    /// default [`super::AGENT_DATA_DIR`] (useful for local dev / non-root runs).
+    pub const DATA_DIR: &str = "ARGUS_DATA_DIR";
 }

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE machines\n        SET status = 'offline', updated_at = now()\n        WHERE status = 'online'\n          AND (last_seen_at IS NULL OR last_seen_at < $1)\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Timestamptz"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "4a3f299bc8cc59d5c670380209d52346a47fd62cdf82dfff5465141a81219723"
+}

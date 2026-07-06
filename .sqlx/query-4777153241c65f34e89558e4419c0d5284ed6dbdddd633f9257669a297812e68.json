@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT machine_id\n        FROM agent_certs\n        WHERE fingerprint = $1\n          AND NOT revoked\n          AND not_after > now()\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "machine_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "agent_certs",
+            "name": "machine_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4777153241c65f34e89558e4419c0d5284ed6dbdddd633f9257669a297812e68"
+}

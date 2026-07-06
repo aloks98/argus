@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM enrollment_tokens WHERE token_hash = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Bytea"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "c7002d4690c27eb2c67d76f7cf7c91f3b4b46ca6a4e8e8f57666614da6e88e0b"
+}

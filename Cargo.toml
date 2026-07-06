@@ -17,7 +17,7 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 
 # gRPC (tonic 0.14 split the prost codec into tonic-prost / tonic-prost-build)
-tonic = "0.14"
+tonic = { version = "0.14", features = ["tls-ring"] }
 tonic-prost = "0.14"
 prost = "0.14"
 tonic-prost-build = "0.14"
@@ -50,11 +50,20 @@ sqlx = { version = "0.9", default-features = false, features = [
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 uuid = { version = "1", features = ["v4", "serde"] }
-time = { version = "0.3", features = ["serde"] }
+time = { version = "0.3", features = ["serde", "serde-well-known"] }
 anyhow = "1"
 thiserror = "2"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Spine slice: field encryption, hashing, cert/identity parsing, agent host facts
+aes-gcm = "0.10"
+sha2 = "0.10"
+base64 = "0.22"
+hex = "0.4"
+x509-parser = "0.16"
+rand = "0.9"
+rustix = { version = "1", features = ["system"] }
 
 [profile.release]
 lto = "thin"

@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT machine_id FROM agent_certs WHERE machine_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "machine_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "agent_certs",
+            "name": "machine_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1c1b655a48eca6888955330995beac90d7209f916079782ada4e0720c47e2661"
+}

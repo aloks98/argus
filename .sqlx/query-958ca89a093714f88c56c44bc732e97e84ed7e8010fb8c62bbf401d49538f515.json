@@ -1,0 +1,50 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT cert_pem, key_ciphertext, key_nonce FROM ca_material WHERE id = 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cert_pem",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "ca_material",
+            "name": "cert_pem"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "key_ciphertext",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "ca_material",
+            "name": "key_ciphertext"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "key_nonce",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "ca_material",
+            "name": "key_nonce"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "958ca89a093714f88c56c44bc732e97e84ed7e8010fb8c62bbf401d49538f515"
+}

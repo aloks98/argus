@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT actor, result, machine_id FROM audit_log WHERE action = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "actor",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "actor"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "result",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "result"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "machine_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "machine_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "5f377a55e5ff9004bc9645ef71d043b5ccd9b1024e01cf1cdd62f173be61c6c2"
+}

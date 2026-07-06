@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO machines (machine_id, hostname, status)\n               VALUES ('test-fleet-offline', 'z-offline-host', 'offline')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "f9e86d9085fc73bb85c2a62570fd0f3f54f6ea80b06dad79ab599972e898b94c"
+}

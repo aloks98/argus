@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO machines (machine_id, hostname, os, kernel, arch, primary_ip, agent_version)\n        VALUES ($1, $2, $3, $4, $5, $6::text::inet, $7)\n        ON CONFLICT (machine_id) DO UPDATE SET\n            hostname      = EXCLUDED.hostname,\n            os            = EXCLUDED.os,\n            kernel        = EXCLUDED.kernel,\n            arch          = EXCLUDED.arch,\n            primary_ip    = EXCLUDED.primary_ip,\n            agent_version = EXCLUDED.agent_version,\n            updated_at    = now()\n        RETURNING id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "53cd98365a831e5f353cc0e3de950102f62198e132bbfc2d9b603cb1135fab21"
+}
