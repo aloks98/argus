@@ -254,13 +254,40 @@ async fn handle_agent_frame(
         Some(agent_frame::Payload::Heartbeat(_)) => {
             repo::touch_last_seen(pool, machine_id).await?;
         }
+        Some(agent_frame::Payload::Metrics(m)) => {
+            let row = metrics_row_from_proto(&m);
+            repo::insert_metrics(pool, machine_id, &row).await?;
+            repo::touch_last_seen(pool, machine_id).await?;
+        }
         _ => {
-            // Metrics/docker/systemd/logs/pty/etc. are later slices; ignore
-            // for the Spine.
+            // Docker/systemd/logs/pty/etc. are later slices; ignore for now.
         }
     }
 
     Ok(())
+}
+
+/// Map the proto `MetricsSample` -> the repo's `MetricsSampleRow`. The proto
+/// carries mem/swap/disk/net counters as `uint64` (never negative on the
+/// wire), but `metrics` stores them as `bigint` (`i64`) -- Postgres has no
+/// unsigned integer type -- so each is cast `as i64` here. `cpu_pct`/`load*`
+/// are already `f32` on both sides.
+fn metrics_row_from_proto(m: &argus_proto::v1::MetricsSample) -> repo::MetricsSampleRow {
+    repo::MetricsSampleRow {
+        cpu_pct: m.cpu_pct,
+        mem_used: m.mem_used as i64,
+        mem_total: m.mem_total as i64,
+        swap_used: m.swap_used as i64,
+        swap_total: m.swap_total as i64,
+        load1: m.load1,
+        load5: m.load5,
+        load15: m.load15,
+        disk_used: m.disk_used as i64,
+        disk_total: m.disk_total as i64,
+        net_rx_bytes: m.net_rx_bytes as i64,
+        net_tx_bytes: m.net_tx_bytes as i64,
+        uptime_secs: m.uptime_secs as i64,
+    }
 }
 
 /// Map the proto `AgentInfo` -> the repo's `AgentInfoRow`, shared by `enroll`
@@ -709,6 +736,83 @@ mod tests {
         assert_eq!(
             row_a.hostname, "pwned-by-a",
             "A's own inventory must still be refreshed, keyed by its authenticated id"
+        );
+
+        Ok(())
+    }
+
+    /// A `Metrics` frame must insert one `metrics` row for the authenticated
+    /// machine (server-stamped `ts`, so the row's presence/values are what we
+    /// check) and advance `last_seen_at`, exactly like `Heartbeat` does.
+    #[sqlx::test]
+    async fn handle_agent_frame_metrics_inserts_row_and_touches_last_seen(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        // Seed an enrolled machine directly, same pattern as the Hello/
+        // Heartbeat seam test above -- Session's authn is out of scope here.
+        let machine_id = repo::upsert_machine(
+            &pool,
+            &AgentInfoRow {
+                machine_id: "m-metrics-1".to_string(),
+                hostname: "metrics-host".to_string(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+            },
+        )
+        .await?;
+
+        let (tx, _rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
+
+        handle_agent_frame(
+            &pool,
+            machine_id,
+            AgentFrame {
+                stream_id: 0,
+                payload: Some(agent_frame::Payload::Metrics(
+                    argus_proto::v1::MetricsSample {
+                        cpu_pct: 12.5,
+                        mem_used: 100,
+                        mem_total: 200,
+                        ..Default::default()
+                    },
+                )),
+            },
+            &tx,
+        )
+        .await?;
+
+        let count = sqlx::query!(
+            "SELECT count(*) AS count FROM metrics WHERE machine_id = $1",
+            machine_id,
+        )
+        .fetch_one(&pool)
+        .await?
+        .count
+        .unwrap_or(0);
+        assert_eq!(count, 1, "Metrics frame must insert exactly one row");
+
+        let row = sqlx::query!(
+            "SELECT cpu_pct, mem_used, mem_total FROM metrics WHERE machine_id = $1",
+            machine_id,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.cpu_pct, Some(12.5));
+        assert_eq!(row.mem_used, Some(100));
+        assert_eq!(row.mem_total, Some(200));
+
+        let machine_row = sqlx::query!(
+            "SELECT last_seen_at FROM machines WHERE id = $1",
+            machine_id,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(
+            machine_row.last_seen_at.is_some(),
+            "Metrics frame must stamp last_seen_at"
         );
 
         Ok(())

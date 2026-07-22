@@ -9,10 +9,58 @@ export type FleetRow = {
   status: "pending" | "online" | "offline";
   last_seen_at: string | null;
   tags: string[];
+  cpu_pct: number | null;
+  mem_pct: number | null;
+  spark_cpu: number[];
+  spark_mem: number[];
 };
 
 export async function getFleet(): Promise<FleetRow[]> {
   const r = await fetch("/api/fleet");
   if (!r.ok) throw new Error(`fleet request failed: ${r.status}`);
+  return r.json();
+}
+
+export type MachineDetail = {
+  id: string;
+  hostname: string;
+  os: string | null;
+  kernel: string | null;
+  arch: string | null;
+  primary_ip: string | null;
+  agent_version: string | null;
+  status: string;
+  last_seen_at: string | null;
+  enrolled_at: string;
+  tags: string[];
+  notes: string | null;
+};
+
+export type MetricPoint = {
+  ts: string;
+  cpu_pct: number | null;
+  mem_used: number | null;
+  mem_total: number | null;
+  swap_used: number | null;
+  swap_total: number | null;
+  load1: number | null;
+  disk_used: number | null;
+  disk_total: number | null;
+  net_rx_bytes: number | null;
+  net_tx_bytes: number | null;
+};
+
+export async function getMachine(id: string): Promise<MachineDetail> {
+  const r = await fetch(`/api/machines/${id}`);
+  if (!r.ok) throw new Error(`machine ${r.status}`);
+  return r.json();
+}
+
+export async function getMetrics(
+  id: string,
+  range: "1h" | "6h" | "24h",
+): Promise<MetricPoint[]> {
+  const r = await fetch(`/api/machines/${id}/metrics?range=${range}`);
+  if (!r.ok) throw new Error(`metrics ${r.status}`);
   return r.json();
 }

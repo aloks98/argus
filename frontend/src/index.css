@@ -1,5 +1,6 @@
 @import "tailwindcss";
-
-/* @e412/rnui-react is built on Tailwind v4. Its theme tokens are wired in during
-   implementation (import "@e412/rnui-themes"); this placeholder keeps the build
-   self-contained. */
+/* rnui design tokens + base styles + the @theme color mapping (light/dark). */
+@import "@e412/rnui-themes";
+/* Tailwind v4 does not scan node_modules by default; point it at the rnui
+   library so the utility classes its compiled components use are generated. */
+@source "../node_modules/@e412/rnui-react/dist";

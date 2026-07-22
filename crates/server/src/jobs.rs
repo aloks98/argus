@@ -30,3 +30,25 @@ pub async fn run(pool: PgPool) -> Result<()> {
         }
     }
 }
+
+/// Every hour, delete `metrics` rows past the retention window
+/// (`argus_common::METRICS_RETENTION_HOURS`, 48h). Runs for the lifetime of
+/// the process alongside the HTTP and gRPC surfaces and the offline sweeper
+/// (see `main.rs`'s `try_join!`). A missed tick is harmless -- the next tick
+/// catches up -- which is exactly the "loss-tolerant" background-work rule.
+pub async fn prune_metrics(pool: PgPool) -> Result<()> {
+    let mut interval = tokio::time::interval(Duration::from_secs(3600));
+    loop {
+        interval.tick().await;
+        match repo::prune_metrics(
+            &pool,
+            Duration::from_secs(argus_common::METRICS_RETENTION_HOURS as u64 * 3600),
+        )
+        .await
+        {
+            Ok(n) if n > 0 => tracing::info!(count = n, "pruned old metrics"),
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "metrics prune failed"),
+        }
+    }
+}

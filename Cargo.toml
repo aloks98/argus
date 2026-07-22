@@ -65,6 +65,9 @@ x509-parser = "0.16"
 rand = "0.9"
 rustix = { version = "1", features = ["system"] }
 
+# Metrics slice: host CPU/mem/swap/load/disk/net/uptime sampling
+sysinfo = "0.39"
+
 [profile.release]
 lto = "thin"
 strip = true

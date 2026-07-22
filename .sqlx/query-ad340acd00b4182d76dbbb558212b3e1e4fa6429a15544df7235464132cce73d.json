@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            INSERT INTO metrics (machine_id, ts, cpu_pct, mem_used, mem_total, swap_used,\n                swap_total, load1, load5, load15, disk_used, disk_total, net_rx_bytes,\n                net_tx_bytes, uptime_secs)\n            VALUES ($1, now() - interval '3 days', 1.0, 1, 1, 0, 0, 0.1, 0.1, 0.1, 1, 1, 1, 1, 1)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ad340acd00b4182d76dbbb558212b3e1e4fa6429a15544df7235464132cce73d"
+}

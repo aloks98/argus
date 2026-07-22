@@ -78,3 +78,15 @@ Verified manually per the plan's Task 11 (`docs/plans/2026-07-05-spine-slice.md`
   `session failed; backing off` (exponential backoff + jitter, backoff correctly
   *not* reset for a sub-30s session); on restart it reconnected on its own and the
   machine returned to `online` with a fresh `last_seen_at` — no agent restart.
+
+## Metrics slice end-to-end verification (2026-07-07)
+Verified manually per the plan's Task 10 (`docs/plans/2026-07-07-metrics-slice.md`):
+
+- A live agent enrolled, connected, and streamed `MetricsSample` frames every 15s;
+  rows accumulated in `metrics`.
+- `GET /api/fleet` returned per-machine `cpu_pct` + a `spark_cpu`/`spark_mem` series
+  (e.g. `spark_cpu:[2.32,1.17,0.96]`); the fleet grid renders inline-SVG sparklines.
+- `GET /api/machines/:id` returned machine detail; `GET /api/machines/:id/metrics?range=1h`
+  returned the ascending time series; `?range=bogus` returned HTTP 400.
+- Retention: a 3-day-old row was removed by `DELETE FROM metrics WHERE ts < now() - 48h`
+  (the hourly `jobs::prune_metrics` task) while fresh rows remained.

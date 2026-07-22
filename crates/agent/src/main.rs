@@ -11,6 +11,7 @@ mod config;
 mod enroll;
 mod identity;
 mod info;
+mod metrics;
 mod session;
 
 use anyhow::Result;

@@ -1,0 +1,52 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT cpu_pct, mem_used, mem_total FROM metrics WHERE machine_id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cpu_pct",
+        "type_info": "Float4",
+        "origin": {
+          "Table": {
+            "table": "metrics",
+            "name": "cpu_pct"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "mem_used",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "metrics",
+            "name": "mem_used"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "mem_total",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "metrics",
+            "name": "mem_total"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "0b699f2ebedba1f1a7f5b5fbcb0d4c7744322835e5f2482d7ad85764ec35164a"
+}

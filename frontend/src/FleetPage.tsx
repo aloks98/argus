@@ -3,6 +3,7 @@
 // badge per row, plus an amber "reconnecting…" hint for rows that were
 // online/pending but have gone quiet.
 import { useEffect, useState } from "react";
+import { Link } from "react-router-dom";
 import {
   Alert,
   AlertDescription,
@@ -21,7 +22,9 @@ import {
   TableHeader,
   TableRow,
 } from "@e412/rnui-react";
-import { getFleet, type FleetRow } from "./api";
+import { getFleet } from "./api";
+import type { FleetRow } from "./api";
+import Sparkline from "./Sparkline";
 
 const POLL_INTERVAL_MS = 5_000;
 const RECONNECT_THRESHOLD_MS = 45_000;
@@ -42,6 +45,10 @@ function isReconnecting(row: FleetRow): boolean {
 function formatLastSeen(lastSeenAt: string | null): string {
   if (lastSeenAt === null) return "never";
   return new Date(lastSeenAt).toLocaleString();
+}
+
+function formatPct(pct: number | null): string {
+  return pct == null ? "—" : `${pct.toFixed(0)}%`;
 }
 
 function StatusCell({ row }: { row: FleetRow }) {
@@ -121,6 +128,10 @@ export default function FleetPage() {
                   <TableHead>IP</TableHead>
                   <TableHead>OS</TableHead>
                   <TableHead>Tags</TableHead>
+                  <TableHead>CPU</TableHead>
+                  <TableHead>CPU trend</TableHead>
+                  <TableHead>Mem</TableHead>
+                  <TableHead>Mem trend</TableHead>
                   <TableHead>Last seen</TableHead>
                 </TableRow>
               </TableHeader>
@@ -128,7 +139,7 @@ export default function FleetPage() {
                 {rows.map((row) => (
                   <TableRow key={row.id}>
                     <TableCell className="font-medium">
-                      {row.hostname}
+                      <Link to={`/machines/${row.id}`}>{row.hostname}</Link>
                     </TableCell>
                     <TableCell>
                       <StatusCell row={row} />
@@ -147,6 +158,14 @@ export default function FleetPage() {
                           ))}
                         </div>
                       )}
+                    </TableCell>
+                    <TableCell>{formatPct(row.cpu_pct)}</TableCell>
+                    <TableCell>
+                      <Sparkline values={row.spark_cpu} />
+                    </TableCell>
+                    <TableCell>{formatPct(row.mem_pct)}</TableCell>
+                    <TableCell>
+                      <Sparkline values={row.spark_mem} />
                     </TableCell>
                     <TableCell>{formatLastSeen(row.last_seen_at)}</TableCell>
                   </TableRow>

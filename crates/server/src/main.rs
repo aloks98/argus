@@ -50,12 +50,13 @@ async fn main() -> Result<()> {
 
     let agent_svc = grpc::AgentSvc::new(ca, pool.clone());
 
-    // Serve the browser HTTP surface, the agent gRPC surface, and the offline
-    // sweeper (Task 7) concurrently.
+    // Serve the browser HTTP surface, the agent gRPC surface, the offline
+    // sweeper, and the hourly metrics-retention prune concurrently.
     tokio::try_join!(
         http::serve(&cfg, pool.clone()),
         grpc::serve(&cfg, agent_svc, server_identity),
         jobs::run(pool.clone()),
+        jobs::prune_metrics(pool.clone()),
     )?;
 
     Ok(())

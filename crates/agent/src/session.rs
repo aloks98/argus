@@ -133,14 +133,20 @@ async fn connect_and_serve(cfg: &Config, identity: &Identity) -> Result<()> {
         // "just connected," so skip it and wait for the first real interval.
         ticker.tick().await;
 
+        // Lives across ticks (not constructed per-tick) so its CPU-usage
+        // reading is a real delta between samples rather than the unreliable
+        // first-call reading (see metrics.rs's module doc).
+        let mut sampler = crate::metrics::Sampler::new();
+
         loop {
             ticker.tick().await;
             let unix_ms = std::time::SystemTime::now()
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            // TODO(metrics slice): report real host uptime; process uptime is
-            // a placeholder that's good enough for the Spine.
+            // The Heartbeat's uptime is process uptime and is vestigial -- the
+            // server only uses a Heartbeat to refresh last_seen. Real host uptime
+            // ships in MetricsSample.uptime_secs (via sysinfo, see metrics.rs).
             let uptime_secs = start.elapsed().as_secs();
 
             if tx
@@ -155,6 +161,18 @@ async fn connect_and_serve(cfg: &Config, identity: &Identity) -> Result<()> {
                 .is_err()
             {
                 tracing::debug!(agent_id = %sender_agent_id, "session: heartbeat sender exiting, channel closed");
+                return;
+            }
+
+            if tx
+                .send(AgentFrame {
+                    stream_id: argus_common::CONTROL_STREAM_ID,
+                    payload: Some(agent_frame::Payload::Metrics(sampler.sample())),
+                })
+                .await
+                .is_err()
+            {
+                tracing::debug!(agent_id = %sender_agent_id, "session: metrics sender exiting, channel closed");
                 return;
             }
         }

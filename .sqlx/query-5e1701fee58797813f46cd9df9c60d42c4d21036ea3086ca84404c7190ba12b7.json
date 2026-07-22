@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n                INSERT INTO metrics (machine_id, ts, cpu_pct, mem_used, mem_total, swap_used,\n                    swap_total, load1, load5, load15, disk_used, disk_total, net_rx_bytes,\n                    net_tx_bytes, uptime_secs)\n                VALUES ($1, now() - (interval '1 minute' * $2::float8), $3, 1000, 4000, 0, 0,\n                        0.1, 0.1, 0.1, 1, 1, 1, 1, 1)\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Float8",
+        "Float4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "5e1701fee58797813f46cd9df9c60d42c4d21036ea3086ca84404c7190ba12b7"
+}

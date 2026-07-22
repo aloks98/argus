@@ -239,6 +239,23 @@ pub async fn mark_stale_offline(pool: &PgPool, older_than: std::time::Duration) 
     Ok(result.rows_affected())
 }
 
+/// Delete `metrics` rows older than `older_than` (the hourly retention prune;
+/// PRD's 48h retention window). Mirrors `mark_stale_offline`: the cutoff is
+/// computed in Rust and bound as a plain `timestamptz` rather than binding a
+/// Postgres interval. Returns the number of rows deleted.
+pub async fn prune_metrics(
+    exec: impl sqlx::PgExecutor<'_>,
+    older_than: std::time::Duration,
+) -> Result<u64> {
+    let cutoff = OffsetDateTime::now_utc() - older_than;
+
+    let result = sqlx::query!("DELETE FROM metrics WHERE ts < $1", cutoff)
+        .execute(exec)
+        .await?;
+
+    Ok(result.rows_affected())
+}
+
 /// Append an audit log entry. Every verb goes through this from the start
 /// (CLAUDE.md: "a verb without an audit_log write is incomplete").
 pub async fn audit(
@@ -259,6 +276,180 @@ pub async fn audit(
     .await?;
 
     Ok(())
+}
+
+/// One heartbeat's worth of host metrics (mirrors the agent's metrics-sample
+/// proto message). Persisted as-is into `metrics`; `ts` is stamped by
+/// Postgres (`now()`) at insert time, not carried from the agent.
+pub struct MetricsSampleRow {
+    pub cpu_pct: f32,
+    pub mem_used: i64,
+    pub mem_total: i64,
+    pub swap_used: i64,
+    pub swap_total: i64,
+    pub load1: f32,
+    pub load5: f32,
+    pub load15: f32,
+    pub disk_used: i64,
+    pub disk_total: i64,
+    pub net_rx_bytes: i64,
+    pub net_tx_bytes: i64,
+    pub uptime_secs: i64,
+}
+
+/// Append one metrics sample for `machine_id`. `ts` is always `now()` at
+/// insert time -- the session handler calls this once per heartbeat, so
+/// there is no client-supplied timestamp to trust or distrust.
+pub async fn insert_metrics(
+    executor: impl sqlx::PgExecutor<'_>,
+    machine_id: Uuid,
+    s: &MetricsSampleRow,
+) -> Result<()> {
+    sqlx::query!(
+        r#"
+        INSERT INTO metrics (machine_id, ts, cpu_pct, mem_used, mem_total, swap_used,
+            swap_total, load1, load5, load15, disk_used, disk_total, net_rx_bytes,
+            net_tx_bytes, uptime_secs)
+        VALUES ($1, now(), $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+        "#,
+        machine_id,
+        s.cpu_pct,
+        s.mem_used,
+        s.mem_total,
+        s.swap_used,
+        s.swap_total,
+        s.load1,
+        s.load5,
+        s.load15,
+        s.disk_used,
+        s.disk_total,
+        s.net_rx_bytes,
+        s.net_tx_bytes,
+        s.uptime_secs,
+    )
+    .execute(executor)
+    .await?;
+
+    Ok(())
+}
+
+/// One point of a fleet-grid sparkline row.
+pub struct SparkRow {
+    pub machine_id: Uuid,
+    pub cpu_pct: Option<f32>,
+    pub mem_pct: Option<f64>,
+}
+
+/// The last `per_machine` metrics samples for EVERY machine that has any,
+/// ordered `(machine_id, ts ASC)` -- backs the fleet-grid sparklines, which
+/// need a short recent-history strip per row without a per-machine round trip.
+pub async fn recent_series_all(
+    executor: impl sqlx::PgExecutor<'_>,
+    per_machine: i64,
+) -> Result<Vec<SparkRow>> {
+    let rows = sqlx::query_as!(
+        SparkRow,
+        r#"
+        SELECT machine_id, cpu_pct,
+               (100.0 * mem_used / NULLIF(mem_total, 0))::float8 AS "mem_pct?"
+        FROM (
+            SELECT machine_id, ts, cpu_pct, mem_used, mem_total,
+                   row_number() OVER (PARTITION BY machine_id ORDER BY ts DESC) AS rn
+            FROM metrics
+        ) t
+        WHERE rn <= $1
+        ORDER BY machine_id, ts ASC
+        "#,
+        per_machine,
+    )
+    .fetch_all(executor)
+    .await?;
+
+    Ok(rows)
+}
+
+/// One sample of a machine's metrics history (detail-page charts). All
+/// numeric fields are nullable in `metrics`, so a sample missing a given
+/// reading (older agent, unreadable sysinfo field) still round-trips.
+pub struct MetricPoint {
+    pub ts: OffsetDateTime,
+    pub cpu_pct: Option<f32>,
+    pub mem_used: Option<i64>,
+    pub mem_total: Option<i64>,
+    pub swap_used: Option<i64>,
+    pub swap_total: Option<i64>,
+    pub load1: Option<f32>,
+    pub disk_used: Option<i64>,
+    pub disk_total: Option<i64>,
+    pub net_rx_bytes: Option<i64>,
+    pub net_tx_bytes: Option<i64>,
+}
+
+/// A machine's metrics history since `since`, ascending -- backs the
+/// detail-page charts.
+pub async fn metrics_history(
+    executor: impl sqlx::PgExecutor<'_>,
+    machine_id: Uuid,
+    since: OffsetDateTime,
+) -> Result<Vec<MetricPoint>> {
+    let rows = sqlx::query_as!(
+        MetricPoint,
+        r#"
+        SELECT ts, cpu_pct, mem_used, mem_total, swap_used, swap_total, load1,
+               disk_used, disk_total, net_rx_bytes, net_tx_bytes
+        FROM metrics
+        WHERE machine_id = $1 AND ts >= $2
+        ORDER BY ts ASC
+        "#,
+        machine_id,
+        since,
+    )
+    .fetch_all(executor)
+    .await?;
+
+    Ok(rows)
+}
+
+/// The machine-detail page's inventory panel: the full `machines` row, with
+/// `primary_ip` rendered as text via `host()`, matching the fleet query's
+/// idiom for the same column.
+pub struct MachineDetail {
+    pub id: Uuid,
+    pub machine_id: String,
+    pub hostname: String,
+    pub os: Option<String>,
+    pub kernel: Option<String>,
+    pub arch: Option<String>,
+    pub primary_ip: Option<String>,
+    pub agent_version: Option<String>,
+    pub status: String,
+    pub last_seen_at: Option<OffsetDateTime>,
+    pub enrolled_at: OffsetDateTime,
+    pub tags: Vec<String>,
+    pub notes: Option<String>,
+}
+
+/// Look up one machine's full inventory row for the detail page, or `None`
+/// if `id` doesn't match any machine.
+pub async fn machine_detail(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: Uuid,
+) -> Result<Option<MachineDetail>> {
+    let row = sqlx::query_as!(
+        MachineDetail,
+        r#"
+        SELECT id, machine_id, hostname, os, kernel, arch,
+               host(primary_ip) as "primary_ip?", agent_version, status,
+               last_seen_at, enrolled_at, tags, notes
+        FROM machines
+        WHERE id = $1
+        "#,
+        id,
+    )
+    .fetch_optional(executor)
+    .await?;
+
+    Ok(row)
 }
 
 #[cfg(test)]
@@ -559,5 +750,136 @@ mod tests {
             .execute(&pool)
             .await
             .expect("cleanup");
+    }
+
+    /// Seed a minimal `machines` row for the metrics tests below, returning
+    /// its `id`. These run against `#[sqlx::test]`'s fresh, auto-migrated
+    /// per-test database, so unlike the tests above there is no shared-DB
+    /// cleanup to do.
+    async fn seed_machine(pool: &PgPool, hostname: &str) -> Uuid {
+        let machine_id_str = format!("test-metrics-machine-{}", Uuid::new_v4());
+        sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname) VALUES ($1, $2) RETURNING id",
+            machine_id_str,
+            hostname,
+        )
+        .fetch_one(pool)
+        .await
+        .expect("seed machine")
+        .id
+    }
+
+    /// A fully-populated `MetricsSampleRow` with `cpu_pct` set to `cpu_pct`
+    /// so tests can distinguish samples without repeating every other field.
+    fn sample_row(cpu_pct: f32) -> MetricsSampleRow {
+        MetricsSampleRow {
+            cpu_pct,
+            mem_used: 1_000,
+            mem_total: 4_000,
+            swap_used: 0,
+            swap_total: 2_000,
+            load1: 0.1,
+            load5: 0.2,
+            load15: 0.3,
+            disk_used: 10_000,
+            disk_total: 100_000,
+            net_rx_bytes: 111,
+            net_tx_bytes: 222,
+            uptime_secs: 3_600,
+        }
+    }
+
+    #[sqlx::test]
+    async fn insert_metrics_then_history_returns_it(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id = seed_machine(&pool, "metrics-host-1").await;
+
+        let sample = sample_row(12.5);
+        insert_metrics(&pool, machine_id, &sample).await?;
+        insert_metrics(&pool, machine_id, &sample).await?;
+
+        let since = OffsetDateTime::now_utc() - time::Duration::hours(1);
+        let history = metrics_history(&pool, machine_id, since).await?;
+
+        assert_eq!(history.len(), 2, "expected both inserted samples back");
+        assert!(
+            history[0].ts <= history[1].ts,
+            "history must be ascending by ts"
+        );
+        assert_eq!(history[0].cpu_pct, Some(12.5));
+        assert_eq!(history[1].cpu_pct, Some(12.5));
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn recent_series_all_limits_per_machine(pool: PgPool) -> anyhow::Result<()> {
+        let machine_a = seed_machine(&pool, "spark-host-a").await;
+        let machine_b = seed_machine(&pool, "spark-host-b").await;
+
+        for _ in 0..30 {
+            insert_metrics(&pool, machine_a, &sample_row(1.0)).await?;
+            insert_metrics(&pool, machine_b, &sample_row(2.0)).await?;
+        }
+
+        let rows = recent_series_all(&pool, 20).await?;
+        assert_eq!(rows.len(), 40, "expected 20 rows for each of 2 machines");
+
+        let a_count = rows.iter().filter(|r| r.machine_id == machine_a).count();
+        let b_count = rows.iter().filter(|r| r.machine_id == machine_b).count();
+        assert_eq!(a_count, 20, "machine_a must be capped at per_machine=20");
+        assert_eq!(b_count, 20, "machine_b must be capped at per_machine=20");
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn machine_detail_returns_row_or_none(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id = seed_machine(&pool, "detail-host").await;
+
+        let detail = machine_detail(&pool, machine_id)
+            .await?
+            .expect("expected Some for a seeded machine");
+        assert_eq!(detail.hostname, "detail-host");
+        assert_eq!(detail.id, machine_id);
+
+        let missing = machine_detail(&pool, Uuid::new_v4()).await?;
+        assert!(missing.is_none(), "expected None for an unknown id");
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn prune_metrics_deletes_old_rows(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id = seed_machine(&pool, "prune-host").await;
+
+        // insert_metrics always stamps ts = now(), so the old row needs a
+        // direct query! INSERT specifying an explicit, stale ts.
+        sqlx::query!(
+            r#"
+            INSERT INTO metrics (machine_id, ts, cpu_pct, mem_used, mem_total, swap_used,
+                swap_total, load1, load5, load15, disk_used, disk_total, net_rx_bytes,
+                net_tx_bytes, uptime_secs)
+            VALUES ($1, now() - interval '3 days', 1.0, 1, 1, 0, 0, 0.1, 0.1, 0.1, 1, 1, 1, 1, 1)
+            "#,
+            machine_id,
+        )
+        .execute(&pool)
+        .await?;
+
+        insert_metrics(&pool, machine_id, &sample_row(2.0)).await?;
+
+        let deleted = prune_metrics(&pool, std::time::Duration::from_secs(48 * 3600)).await?;
+        assert_eq!(deleted, 1, "expected only the stale row to be deleted");
+
+        let remaining = sqlx::query!(
+            "SELECT count(*) as \"count!\" FROM metrics WHERE machine_id = $1",
+            machine_id
+        )
+        .fetch_one(&pool)
+        .await?
+        .count;
+        assert_eq!(remaining, 1, "expected the fresh row to remain");
+
+        Ok(())
     }
 }

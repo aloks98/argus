@@ -1,0 +1,149 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        SELECT ts, cpu_pct, mem_used, mem_total, swap_used, swap_total, load1,\n               disk_used, disk_total, net_rx_bytes, net_tx_bytes\n        FROM metrics\n        WHERE machine_id = $1 AND ts >= $2\n        ORDER BY ts ASC\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "ts",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "metrics",
+            "name": "ts"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "cpu_pct",
+        "type_info": "Float4",
+        "origin": {
+          "Table": {
+            "table": "metrics",
+            "name": "cpu_pct"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "mem_used",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "metrics",
+            "name": "mem_used"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "mem_total",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "metrics",
+            "name": "mem_total"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "swap_used",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "metrics",
+            "name": "swap_used"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "swap_total",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "metrics",
+            "name": "swap_total"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "load1",
+        "type_info": "Float4",
+        "origin": {
+          "Table": {
+            "table": "metrics",
+            "name": "load1"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "disk_used",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "metrics",
+            "name": "disk_used"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "disk_total",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "metrics",
+            "name": "disk_total"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "net_rx_bytes",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "metrics",
+            "name": "net_rx_bytes"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "net_tx_bytes",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "metrics",
+            "name": "net_tx_bytes"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Timestamptz"
+      ]
+    },
+    "nullable": [
+      false,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "f2edf44b90309c8de5ed20057cce2ddd33fc66ec115dc7b1c27fb6cfe5538d44"
+}

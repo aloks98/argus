@@ -31,9 +31,9 @@ tracing-subscriber.workspace = true
 rand.workspace = true
 rustix.workspace = true
 x509-parser.workspace = true
+sysinfo.workspace = true
 
 # Per-slice deps are added when their slice is built (keeps the agent lean):
-#   sysinfo       -> slice 2 (metrics)
 #   bollard       -> slice 3 (docker)
 #   zbus          -> slice 4 (systemd)
 #   portable-pty  -> slice 6 (terminal)
