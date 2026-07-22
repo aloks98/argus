@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO audit_log (actor, action, machine_id, target_ref, command_id, result)\n             VALUES ('anonymous', 'container.restart', $1, 'web', $2, 'dispatched')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8a5235c82c4a5c9555bda1e0eb8b0995019cefad1fd35f5891970b2d11320f48"
+}

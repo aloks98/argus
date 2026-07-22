@@ -34,6 +34,9 @@ x509-parser.workspace = true
 sysinfo.workspace = true
 
 # Per-slice deps are added when their slice is built (keeps the agent lean):
-#   bollard       -> slice 3 (docker)
 #   zbus          -> slice 4 (systemd)
 #   portable-pty  -> slice 6 (terminal)
+
+# Docker slice: local daemon over its unix socket only (never TCP/TLS), so the
+# `pipe` feature (hyperlocal) is all we need — no openssl/cmake, ring-only.
+bollard = { version = "0.19", default-features = false, features = ["pipe"] }

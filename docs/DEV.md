@@ -90,3 +90,30 @@ Verified manually per the plan's Task 10 (`docs/plans/2026-07-07-metrics-slice.m
   returned the ascending time series; `?range=bogus` returned HTTP 400.
 - Retention: a 3-day-old row was removed by `DELETE FROM metrics WHERE ts < now() - 48h`
   (the hourly `jobs::prune_metrics` task) while fresh rows remained.
+
+## Docker slice end-to-end verification (2026-07-23)
+Verified manually against the live Docker daemon on the dev host (Task 5 of the
+Docker slice). A throwaway `argus-verify-test` container (from the cached
+`registry:3` image, no published ports) was the only verb target; every other host
+container was read-only.
+
+- **State:** with the agent connected (`machine_id=56c5ab05-…`, `hostname=fatman`,
+  `online`), `GET /api/machines/:id/docker` returned the host's full container list
+  with `state`/`status`/`health` populated — `argus-verify-test` as
+  `state:"running"` alongside the real host containers the agent also reports
+  (`argus-pg`, `registry-cache` shown `health:"healthy"`, `buildx_buildkit_*`,
+  plus `exited` ones like `eye-victoriametrics-1`).
+- **Verbs (only against `argus-verify-test`):** each POST returned HTTP 200 with
+  `{"ok":true,"message":"ok","status":"completed"}` and flipped the *real*
+  container state on the next `docker ps`:
+  - `…/stop`  → container `Exited (2)`.
+  - `…/start` → back to `Up`.
+  - `…/restart` → `Up` (fresh uptime).
+- **Audit trail:** `audit_log` gained `container.stop` / `container.start` /
+  `container.restart` rows, each `result = ok`, `actor = anonymous`, `target_ref`
+  = the container id.
+- **Offline path:** killing the agent process, the server logged
+  `session: agent disconnected`; a subsequent `…/restart` POST returned **HTTP 409**
+  (`agent not connected`, from `DispatchError::NotConnected`) and wrote a
+  `container.restart` row with `result = denied` — the verb was never dispatched to
+  a daemon.

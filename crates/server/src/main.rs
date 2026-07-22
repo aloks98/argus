@@ -15,6 +15,7 @@ mod db;
 mod embed;
 mod grpc;
 mod http;
+mod hub;
 mod identity;
 mod jobs;
 mod repo;
@@ -48,12 +49,13 @@ async fn main() -> Result<()> {
     let ca = Arc::new(ca::CertAuthority::load_or_init(&pool, &field_cipher).await?);
     let server_identity = ca.issue_server_cert(&cfg.agent_sans)?;
 
-    let agent_svc = grpc::AgentSvc::new(ca, pool.clone());
+    let hub = Arc::new(hub::Hub::new());
+    let agent_svc = grpc::AgentSvc::new(ca, pool.clone(), hub.clone());
 
     // Serve the browser HTTP surface, the agent gRPC surface, the offline
     // sweeper, and the hourly metrics-retention prune concurrently.
     tokio::try_join!(
-        http::serve(&cfg, pool.clone()),
+        http::serve(&cfg, pool.clone(), hub.clone()),
         grpc::serve(&cfg, agent_svc, server_identity),
         jobs::run(pool.clone()),
         jobs::prune_metrics(pool.clone()),

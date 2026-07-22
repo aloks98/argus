@@ -19,10 +19,21 @@ import {
   CardTitle,
   EmptyState,
   LineChart,
+  Table,
+  TableBody,
+  TableCell,
+  TableHead,
+  TableHeader,
+  TableRow,
 } from "@e412/rnui-react";
 import type { LineChartSeries } from "@e412/rnui-react";
-import { getMachine, getMetrics } from "./api";
-import type { MachineDetail, MetricPoint } from "./api";
+import { containerAction, getDocker, getMachine, getMetrics } from "./api";
+import type {
+  Container,
+  ContainerAction,
+  MachineDetail,
+  MetricPoint,
+} from "./api";
 
 const POLL_INTERVAL_MS = 10_000;
 const RANGES = ["1h", "6h", "24h"] as const;
@@ -38,6 +49,19 @@ const STATUS_VARIANT: Record<string, StatusBadgeVariant> = {
 
 function statusVariant(status: string): StatusBadgeVariant {
   return STATUS_VARIANT[status] ?? "outline";
+}
+
+const CONTAINER_STATE_VARIANT: Record<string, StatusBadgeVariant> = {
+  running: "success",
+  restarting: "info",
+  paused: "info",
+  created: "outline",
+  exited: "secondary",
+  dead: "secondary",
+};
+
+function containerStateVariant(state: string): StatusBadgeVariant {
+  return CONTAINER_STATE_VARIANT[state] ?? "outline";
 }
 
 function formatLastSeen(lastSeenAt: string | null): string {
@@ -159,11 +183,134 @@ function MetricChartCard({
   );
 }
 
+function ContainersCard({
+  machineId,
+  containers,
+  onChanged,
+}: {
+  machineId: string;
+  containers: Container[];
+  onChanged: () => void;
+}) {
+  // container ids with a verb currently in flight -> disables those rows' buttons
+  const [busy, setBusy] = useState<Set<string>>(new Set());
+  const [actionError, setActionError] = useState<string | null>(null);
+
+  async function run(container: Container, action: ContainerAction) {
+    setBusy((prev) => new Set(prev).add(container.id));
+    setActionError(null);
+    try {
+      await containerAction(machineId, container.id, action);
+      onChanged();
+    } catch (err) {
+      setActionError(
+        err instanceof Error ? err.message : `failed to ${action} ${container.name}`,
+      );
+    } finally {
+      setBusy((prev) => {
+        const next = new Set(prev);
+        next.delete(container.id);
+        return next;
+      });
+    }
+  }
+
+  return (
+    <Card className="mt-6">
+      <CardHeader>
+        <CardTitle>Containers</CardTitle>
+        <CardDescription>Docker containers on this host</CardDescription>
+      </CardHeader>
+      <CardContent>
+        {actionError !== null && (
+          <Alert variant="destructive" className="mb-4">
+            <AlertTitle>Action failed</AlertTitle>
+            <AlertDescription>{actionError}</AlertDescription>
+          </Alert>
+        )}
+        {containers.length === 0 ? (
+          <EmptyState
+            title="No containers"
+            description="This host reported no Docker containers (or has no Docker daemon)."
+          />
+        ) : (
+          <Table>
+            <TableHeader>
+              <TableRow>
+                <TableHead>Name</TableHead>
+                <TableHead>Image</TableHead>
+                <TableHead>State</TableHead>
+                <TableHead>Status</TableHead>
+                <TableHead className="text-right">Actions</TableHead>
+              </TableRow>
+            </TableHeader>
+            <TableBody>
+              {containers.map((c) => {
+                const running = c.state === "running";
+                const rowBusy = busy.has(c.id);
+                return (
+                  <TableRow key={c.id}>
+                    <TableCell className="font-medium">{c.name}</TableCell>
+                    <TableCell className="text-gray-600">{c.image}</TableCell>
+                    <TableCell>
+                      <Badge variant={containerStateVariant(c.state)}>{c.state}</Badge>
+                      {c.health !== "" && (
+                        <Badge variant="outline" className="ml-1">
+                          {c.health}
+                        </Badge>
+                      )}
+                    </TableCell>
+                    <TableCell className="text-gray-600">{c.status}</TableCell>
+                    <TableCell className="text-right">
+                      <ButtonGroup>
+                        {running ? (
+                          <>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled={rowBusy}
+                              onClick={() => void run(c, "restart")}
+                            >
+                              {rowBusy ? "…" : "Restart"}
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled={rowBusy}
+                              onClick={() => void run(c, "stop")}
+                            >
+                              {rowBusy ? "…" : "Stop"}
+                            </Button>
+                          </>
+                        ) : (
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={rowBusy}
+                            onClick={() => void run(c, "start")}
+                          >
+                            {rowBusy ? "…" : "Start"}
+                          </Button>
+                        )}
+                      </ButtonGroup>
+                    </TableCell>
+                  </TableRow>
+                );
+              })}
+            </TableBody>
+          </Table>
+        )}
+      </CardContent>
+    </Card>
+  );
+}
+
 export default function MachineDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [range, setRange] = useState<Range>("1h");
   const [machine, setMachine] = useState<MachineDetail | null>(null);
   const [metrics, setMetrics] = useState<MetricPoint[]>([]);
+  const [containers, setContainers] = useState<Container[]>([]);
   const [loading, setLoading] = useState(true);
   const [notFound, setNotFound] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -174,13 +321,15 @@ export default function MachineDetailPage() {
 
     async function poll() {
       try {
-        const [machineData, metricsData] = await Promise.all([
+        const [machineData, metricsData, dockerData] = await Promise.all([
           getMachine(id as string),
           getMetrics(id as string, range),
+          getDocker(id as string),
         ]);
         if (cancelled) return;
         setMachine(machineData);
         setMetrics(metricsData);
+        setContainers(dockerData);
         setNotFound(false);
         setError(null);
       } catch (err) {
@@ -259,6 +408,10 @@ export default function MachineDetailPage() {
     );
   }
 
+  const refetchDocker = () => {
+    void getDocker(id).then(setContainers).catch(() => {});
+  };
+
   const cpuPoints = buildCpuSeries(metrics);
   const memPoints = buildMemSeries(metrics);
   const loadPoints = buildLoadSeries(metrics);
@@ -312,6 +465,12 @@ export default function MachineDetailPage() {
           </p>
         </CardContent>
       </Card>
+
+      <ContainersCard
+        machineId={id}
+        containers={containers}
+        onChanged={refetchDocker}
+      />
 
       <div className="mt-6 flex flex-wrap items-center justify-between gap-2">
         <h2 className="text-lg font-semibold">Metrics</h2>

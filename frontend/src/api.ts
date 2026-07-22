@@ -64,3 +64,42 @@ export async function getMetrics(
   if (!r.ok) throw new Error(`metrics ${r.status}`);
   return r.json();
 }
+
+export type Container = {
+  id: string;
+  name: string;
+  image: string;
+  state: string;
+  status: string;
+  health: string;
+};
+
+export async function getDocker(id: string): Promise<Container[]> {
+  const r = await fetch(`/api/machines/${id}/docker`);
+  if (!r.ok) throw new Error(`docker ${r.status}`);
+  return r.json();
+}
+
+export type ContainerAction = "start" | "stop" | "restart";
+
+export type VerbResult = {
+  command_id: string;
+  ok: boolean | null;
+  message: string | null;
+  status: string;
+};
+
+export async function containerAction(
+  id: string,
+  container: string,
+  action: ContainerAction,
+): Promise<VerbResult> {
+  const r = await fetch(
+    `/api/machines/${id}/docker/${encodeURIComponent(container)}/${action}`,
+    { method: "POST" },
+  );
+  // 200 (completed) and 202 (pending) both carry a VerbResult body; 4xx/5xx
+  // (e.g. 409 agent offline) are surfaced as errors.
+  if (!r.ok) throw new Error(`action failed: ${r.status}`);
+  return r.json();
+}

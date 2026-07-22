@@ -8,6 +8,7 @@
 //! stubbed with their intended shape.
 
 mod config;
+mod docker;
 mod enroll;
 mod identity;
 mod info;

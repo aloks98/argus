@@ -278,6 +278,55 @@ pub async fn audit(
     Ok(())
 }
 
+/// Audit a dispatched verb: like `audit`, but also records the `target_ref`
+/// (container id / unit name) and the `command_id` correlating this row to the
+/// gRPC `Command` and its eventual `CommandResult` (see `update_command_result`).
+pub async fn audit_command(
+    executor: impl sqlx::PgExecutor<'_>,
+    actor: &str,
+    action: &str,
+    machine_id: Option<Uuid>,
+    target_ref: &str,
+    command_id: Uuid,
+    result: &str,
+) -> Result<()> {
+    sqlx::query!(
+        "INSERT INTO audit_log (actor, action, machine_id, target_ref, command_id, result)
+         VALUES ($1, $2, $3, $4, $5, $6)",
+        actor,
+        action,
+        machine_id,
+        target_ref,
+        command_id,
+        result,
+    )
+    .execute(executor)
+    .await?;
+
+    Ok(())
+}
+
+/// Update the audit row for a dispatched command with its final result
+/// (`ok`/`error`), matched by the correlated `command_id`. A no-op if no row
+/// carries that command_id.
+pub async fn update_command_result(
+    executor: impl sqlx::PgExecutor<'_>,
+    command_id: Uuid,
+    machine_id: Uuid,
+    result: &str,
+) -> Result<()> {
+    sqlx::query!(
+        "UPDATE audit_log SET result = $3 WHERE command_id = $1 AND machine_id = $2",
+        command_id,
+        machine_id,
+        result,
+    )
+    .execute(executor)
+    .await?;
+
+    Ok(())
+}
+
 /// One heartbeat's worth of host metrics (mirrors the agent's metrics-sample
 /// proto message). Persisted as-is into `metrics`; `ts` is stamped by
 /// Postgres (`now()`) at insert time, not carried from the agent.
@@ -844,6 +893,82 @@ mod tests {
 
         let missing = machine_detail(&pool, Uuid::new_v4()).await?;
         assert!(missing.is_none(), "expected None for an unknown id");
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn audit_command_records_target_and_command_id(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id = seed_machine(&pool, "audit-cmd-host").await;
+        let command_id = Uuid::new_v4();
+
+        audit_command(
+            &pool,
+            "anonymous",
+            "container.start",
+            Some(machine_id),
+            "web",
+            command_id,
+            "dispatched",
+        )
+        .await?;
+
+        let row = sqlx::query!(
+            "SELECT actor, action, target_ref, command_id, result
+             FROM audit_log WHERE command_id = $1",
+            command_id,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.actor, "anonymous");
+        assert_eq!(row.action, "container.start");
+        assert_eq!(row.target_ref.as_deref(), Some("web"));
+        assert_eq!(row.command_id, Some(command_id));
+        assert_eq!(row.result.as_deref(), Some("dispatched"));
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn update_command_result_is_scoped_to_the_owning_machine(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let machine_id = seed_machine(&pool, "cmd-audit-host").await;
+        let other_machine = seed_machine(&pool, "cmd-audit-other").await;
+        let command_id = Uuid::new_v4();
+
+        sqlx::query!(
+            "INSERT INTO audit_log (actor, action, machine_id, target_ref, command_id, result)
+             VALUES ('anonymous', 'container.restart', $1, 'web', $2, 'dispatched')",
+            machine_id,
+            command_id,
+        )
+        .execute(&pool)
+        .await?;
+
+        // A result attributed to a DIFFERENT machine must NOT touch this row.
+        update_command_result(&pool, command_id, other_machine, "ok").await?;
+        let row = sqlx::query!(
+            "SELECT result FROM audit_log WHERE command_id = $1",
+            command_id
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            row.result.as_deref(),
+            Some("dispatched"),
+            "wrong machine must not update the row"
+        );
+
+        // The owning machine updates it.
+        update_command_result(&pool, command_id, machine_id, "ok").await?;
+        let row = sqlx::query!(
+            "SELECT result FROM audit_log WHERE command_id = $1",
+            command_id
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.result.as_deref(), Some("ok"));
 
         Ok(())
     }

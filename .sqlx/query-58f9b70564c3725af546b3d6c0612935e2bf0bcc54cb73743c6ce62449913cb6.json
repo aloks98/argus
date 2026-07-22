@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE audit_log SET result = $3 WHERE command_id = $1 AND machine_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "58f9b70564c3725af546b3d6c0612935e2bf0bcc54cb73743c6ce62449913cb6"
+}

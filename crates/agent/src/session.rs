@@ -1,10 +1,11 @@
 //! The single persistent mTLS Session (PRD §4, §5.4).
 
 use crate::config::Config;
+use crate::docker::DockerClient;
 use crate::enroll::Identity;
 use anyhow::{Context, Result};
 use argus_proto::v1::agent_service_client::AgentServiceClient;
-use argus_proto::v1::{agent_frame, AgentFrame, Heartbeat, Hello};
+use argus_proto::v1::{agent_frame, server_frame, AgentFrame, DockerState, Heartbeat, Hello, Verb};
 use rand::Rng;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -35,10 +36,11 @@ const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 /// currently is no such path, but the signature stays fallible for that
 /// future case and to match `main`'s `?`-propagation).
 pub async fn run(cfg: &Config, identity: Identity) -> Result<()> {
+    let docker = DockerClient::connect();
     let mut attempt = 0u32;
     loop {
         let started = tokio::time::Instant::now();
-        let outcome = connect_and_serve(cfg, &identity).await;
+        let outcome = connect_and_serve(cfg, &identity, &docker).await;
         let lasted = started.elapsed();
 
         // A session that stayed up a while was healthy -> reset. A fast
@@ -72,7 +74,7 @@ fn should_reset_backoff(outcome_ok: bool, lasted: Duration) -> bool {
 /// off accordingly. `Ok(())` means the session was established and later
 /// ended cleanly (server closed its side); `Err` means the connect itself
 /// failed or the stream errored.
-async fn connect_and_serve(cfg: &Config, identity: &Identity) -> Result<()> {
+async fn connect_and_serve(cfg: &Config, identity: &Identity, docker: &DockerClient) -> Result<()> {
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(&identity.ca_cert_pem))
         .identity(tonic::transport::Identity::from_pem(
@@ -92,6 +94,9 @@ async fn connect_and_serve(cfg: &Config, identity: &Identity) -> Result<()> {
     tracing::info!(agent_id = %identity.agent_id, endpoint = %cfg.endpoint, "session: connected");
 
     let (tx, rx) = mpsc::channel::<AgentFrame>(16);
+    let inbound_tx = tx.clone();
+    let inbound_docker = docker.clone();
+    let sender_docker = docker.clone();
 
     // Sender task: Hello first (fresh snapshot, re-sent on every reconnect so
     // the fleet view self-heals), then a Heartbeat on every tick. It normally
@@ -114,6 +119,22 @@ async fn connect_and_serve(cfg: &Config, identity: &Identity) -> Result<()> {
             .send(AgentFrame {
                 stream_id: argus_common::CONTROL_STREAM_ID,
                 payload: Some(agent_frame::Payload::Hello(Hello { info: Some(info) })),
+            })
+            .await
+            .is_err()
+        {
+            return;
+        }
+
+        // Initial Docker snapshot right after Hello so the panel populates promptly
+        // (the first ticker tick is a full interval away).
+        let containers = sender_docker.list_containers().await;
+        if tx
+            .send(AgentFrame {
+                stream_id: argus_common::CONTROL_STREAM_ID,
+                payload: Some(agent_frame::Payload::DockerState(DockerState {
+                    containers,
+                })),
             })
             .await
             .is_err()
@@ -175,6 +196,21 @@ async fn connect_and_serve(cfg: &Config, identity: &Identity) -> Result<()> {
                 tracing::debug!(agent_id = %sender_agent_id, "session: metrics sender exiting, channel closed");
                 return;
             }
+
+            let containers = sender_docker.list_containers().await;
+            if tx
+                .send(AgentFrame {
+                    stream_id: argus_common::CONTROL_STREAM_ID,
+                    payload: Some(agent_frame::Payload::DockerState(DockerState {
+                        containers,
+                    })),
+                })
+                .await
+                .is_err()
+            {
+                tracing::debug!(agent_id = %sender_agent_id, "session: docker sender exiting, channel closed");
+                return;
+            }
         }
     });
 
@@ -192,9 +228,27 @@ async fn connect_and_serve(cfg: &Config, identity: &Identity) -> Result<()> {
 
         loop {
             match inbound.next().await {
-                Some(Ok(_frame)) => {
-                    // Spine: HelloAck/Ping/etc. are not yet acted on -- later
-                    // slices wire commands, PTY, etc. up here.
+                Some(Ok(frame)) => {
+                    if let Some(server_frame::Payload::Command(cmd)) = frame.payload {
+                        // Verbs run in their own task (loss-tolerant fire-and-forget) so a
+                        // slow stop can't stall the inbound loop or heartbeats.
+                        let stream_id = frame.stream_id;
+                        let docker = inbound_docker.clone();
+                        let out = inbound_tx.clone();
+                        tokio::spawn(async move {
+                            let verb = Verb::try_from(cmd.verb).unwrap_or(Verb::Unspecified);
+                            let result = docker
+                                .run_verb(cmd.command_id.clone(), verb, &cmd.target)
+                                .await;
+                            let _ = out
+                                .send(AgentFrame {
+                                    stream_id,
+                                    payload: Some(agent_frame::Payload::CommandResult(result)),
+                                })
+                                .await;
+                        });
+                    }
+                    // HelloAck / Ping / other ServerFrames remain no-ops for this slice.
                 }
                 Some(Err(status)) => {
                     return Err(anyhow::anyhow!("session stream error: {status}"));

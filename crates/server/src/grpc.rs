@@ -12,6 +12,7 @@
 
 use crate::ca::CertAuthority;
 use crate::config::Config;
+use crate::hub::Hub;
 use crate::identity;
 use crate::repo::{self, AgentInfoRow, TokenCheck};
 use anyhow::Result;
@@ -35,11 +36,12 @@ use uuid::Uuid;
 pub struct AgentSvc {
     pub ca: Arc<CertAuthority>,
     pub pool: PgPool,
+    pub hub: Arc<Hub>,
 }
 
 impl AgentSvc {
-    pub fn new(ca: Arc<CertAuthority>, pool: PgPool) -> Self {
-        Self { ca, pool }
+    pub fn new(ca: Arc<CertAuthority>, pool: PgPool, hub: Arc<Hub>) -> Self {
+        Self { ca, pool, hub }
     }
 }
 
@@ -187,13 +189,17 @@ impl AgentService for AgentSvc {
 
         let (tx, rx) = mpsc::channel::<Result<ServerFrame, Status>>(16);
         let pool = self.pool.clone();
+        let hub = self.hub.clone();
+        let epoch = hub.register(machine_id, tx.clone());
         let mut inbound = request.into_inner();
 
         tokio::spawn(async move {
             while let Some(item) = inbound.next().await {
                 match item {
                     Ok(frame) => {
-                        if let Err(e) = handle_agent_frame(&pool, machine_id, frame, &tx).await {
+                        if let Err(e) =
+                            handle_agent_frame(&pool, &hub, machine_id, frame, &tx).await
+                        {
                             tracing::warn!(error = %e, %machine_id, "session: error handling agent frame");
                         }
                     }
@@ -203,6 +209,7 @@ impl AgentService for AgentSvc {
                     }
                 }
             }
+            hub.unregister(machine_id, epoch);
             tracing::info!(%machine_id, "session: agent disconnected");
         });
 
@@ -216,6 +223,7 @@ impl AgentService for AgentSvc {
 /// seam for the bidi loop above (no TLS/transport needed to exercise it).
 async fn handle_agent_frame(
     pool: &PgPool,
+    hub: &Hub,
     machine_id: Uuid,
     frame: AgentFrame,
     tx: &mpsc::Sender<Result<ServerFrame, Status>>,
@@ -259,8 +267,45 @@ async fn handle_agent_frame(
             repo::insert_metrics(pool, machine_id, &row).await?;
             repo::touch_last_seen(pool, machine_id).await?;
         }
+        Some(agent_frame::Payload::DockerState(ds)) => {
+            hub.set_docker(machine_id, ds.containers);
+            repo::touch_last_seen(pool, machine_id).await?;
+        }
+        Some(agent_frame::Payload::CommandResult(cr)) => {
+            let command_id = cr.command_id.clone();
+            match Uuid::parse_str(&command_id) {
+                Ok(uuid) => {
+                    // Log-don't-propagate: a failed audit update must not stop us
+                    // from waking the HTTP waiter with the real result below (the
+                    // verb already ran on the agent).
+                    if let Err(e) = repo::update_command_result(
+                        pool,
+                        uuid,
+                        machine_id,
+                        if cr.ok { "ok" } else { "error" },
+                    )
+                    .await
+                    {
+                        tracing::error!(
+                            error = %e,
+                            %machine_id,
+                            command_id = %command_id,
+                            "failed to update command result audit row"
+                        );
+                    }
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        %machine_id,
+                        command_id = %command_id,
+                        "command result carried an unparseable command_id; skipping audit update"
+                    );
+                }
+            }
+            hub.complete(&command_id, machine_id, cr);
+        }
         _ => {
-            // Docker/systemd/logs/pty/etc. are later slices; ignore for now.
+            // PTY / log frames are later slices; ignore for now.
         }
     }
 
@@ -382,7 +427,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         let cipher = FieldCipher::from_b64_key(&STANDARD.encode([3u8; 32]))?;
         let ca = Arc::new(CertAuthority::load_or_init(&pool, &cipher).await?);
-        let svc = AgentSvc::new(ca, pool.clone());
+        let svc = AgentSvc::new(ca, pool.clone(), Arc::new(crate::hub::Hub::new()));
 
         seed_token(&pool, "devtoken", "dev-token").await;
 
@@ -435,7 +480,7 @@ mod tests {
     async fn enroll_with_bad_token_is_denied_and_audited(pool: PgPool) -> anyhow::Result<()> {
         let cipher = FieldCipher::from_b64_key(&STANDARD.encode([5u8; 32]))?;
         let ca = Arc::new(CertAuthority::load_or_init(&pool, &cipher).await?);
-        let svc = AgentSvc::new(ca, pool.clone());
+        let svc = AgentSvc::new(ca, pool.clone(), Arc::new(crate::hub::Hub::new()));
 
         let result = svc
             .enroll(Request::new(EnrollRequest {
@@ -473,7 +518,7 @@ mod tests {
     ) -> anyhow::Result<()> {
         let cipher = FieldCipher::from_b64_key(&STANDARD.encode([7u8; 32]))?;
         let ca = Arc::new(CertAuthority::load_or_init(&pool, &cipher).await?);
-        let svc = AgentSvc::new(ca, pool.clone());
+        let svc = AgentSvc::new(ca, pool.clone(), Arc::new(crate::hub::Hub::new()));
 
         let hash = Sha256::digest("single-use-token".as_bytes()).to_vec();
         sqlx::query!(
@@ -555,10 +600,12 @@ mod tests {
         )
         .await?;
 
+        let hub = crate::hub::Hub::new();
         let (tx, mut rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
 
         handle_agent_frame(
             &pool,
+            &hub,
             machine_id,
             AgentFrame {
                 stream_id: 0,
@@ -610,6 +657,7 @@ mod tests {
 
         handle_agent_frame(
             &pool,
+            &hub,
             machine_id,
             AgentFrame {
                 stream_id: 0,
@@ -685,6 +733,7 @@ mod tests {
             .count
             .unwrap_or(0);
 
+        let hub = crate::hub::Hub::new();
         let (tx, _rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
 
         // Authenticated as A (per the cert-derived `machine_id` param, exactly
@@ -693,6 +742,7 @@ mod tests {
         // identity inside an already-authenticated session.
         handle_agent_frame(
             &pool,
+            &hub,
             machine_a,
             AgentFrame {
                 stream_id: 0,
@@ -764,10 +814,12 @@ mod tests {
         )
         .await?;
 
+        let hub = crate::hub::Hub::new();
         let (tx, _rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
 
         handle_agent_frame(
             &pool,
+            &hub,
             machine_id,
             AgentFrame {
                 stream_id: 0,
@@ -814,6 +866,207 @@ mod tests {
             machine_row.last_seen_at.is_some(),
             "Metrics frame must stamp last_seen_at"
         );
+
+        Ok(())
+    }
+
+    /// A `DockerState` frame must cache the reported containers in the hub, keyed
+    /// by the authenticated machine_id.
+    #[sqlx::test]
+    async fn handle_agent_frame_docker_state_caches_snapshot(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id = repo::upsert_machine(
+            &pool,
+            &AgentInfoRow {
+                machine_id: "m-docker-1".to_string(),
+                hostname: "docker-host".to_string(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+            },
+        )
+        .await?;
+
+        let hub = crate::hub::Hub::new();
+        let (tx, _rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
+
+        handle_agent_frame(
+            &pool,
+            &hub,
+            machine_id,
+            AgentFrame {
+                stream_id: 0,
+                payload: Some(agent_frame::Payload::DockerState(
+                    argus_proto::v1::DockerState {
+                        containers: vec![argus_proto::v1::Container {
+                            id: "abc123".into(),
+                            name: "nginx".into(),
+                            image: "nginx:latest".into(),
+                            state: "running".into(),
+                            status: "Up 2 minutes (healthy)".into(),
+                            health: "healthy".into(),
+                        }],
+                    },
+                )),
+            },
+            &tx,
+        )
+        .await?;
+
+        let cached = hub.get_docker(machine_id);
+        assert_eq!(cached.len(), 1);
+        assert_eq!(cached[0].name, "nginx");
+        assert_eq!(cached[0].health, "healthy");
+
+        Ok(())
+    }
+
+    /// A `CommandResult` frame must (a) update the dispatched audit row to its final
+    /// result and (b) wake any pending waiter registered for that command_id.
+    #[sqlx::test]
+    async fn handle_agent_frame_command_result_updates_audit_and_wakes_waiter(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let machine_id = repo::upsert_machine(
+            &pool,
+            &AgentInfoRow {
+                machine_id: "m-cmdres-1".to_string(),
+                hostname: "cmd-host".to_string(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+            },
+        )
+        .await?;
+
+        let command_id = Uuid::new_v4();
+        sqlx::query!(
+            "INSERT INTO audit_log (actor, action, machine_id, target_ref, command_id, result)
+             VALUES ('anonymous', 'container.stop', $1, 'web', $2, 'dispatched')",
+            machine_id,
+            command_id,
+        )
+        .execute(&pool)
+        .await?;
+
+        let hub = crate::hub::Hub::new();
+        let waiter = hub.register_pending(command_id.to_string(), machine_id);
+        let (tx, _rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
+
+        handle_agent_frame(
+            &pool,
+            &hub,
+            machine_id,
+            AgentFrame {
+                stream_id: 7,
+                payload: Some(agent_frame::Payload::CommandResult(
+                    argus_proto::v1::CommandResult {
+                        command_id: command_id.to_string(),
+                        ok: true,
+                        exit_code: 0,
+                        message: "ok".into(),
+                    },
+                )),
+            },
+            &tx,
+        )
+        .await?;
+
+        // (a) waiter woken with the result
+        let delivered = waiter.await.expect("waiter must be woken");
+        assert!(delivered.ok);
+        // (b) audit row updated
+        let row = sqlx::query!(
+            "SELECT result FROM audit_log WHERE command_id = $1",
+            command_id,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.result.as_deref(), Some("ok"));
+
+        Ok(())
+    }
+
+    /// A `CommandResult` reported while authenticated as machine B, carrying a
+    /// command_id owned by machine A, must NOT resolve A's audit row or A's waiter.
+    #[sqlx::test]
+    async fn handle_agent_frame_command_result_is_scoped_to_authenticated_machine(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let machine_a = repo::upsert_machine(
+            &pool,
+            &AgentInfoRow {
+                machine_id: "m-cmd-a".to_string(),
+                hostname: "a".to_string(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+            },
+        )
+        .await?;
+        let machine_b = repo::upsert_machine(
+            &pool,
+            &AgentInfoRow {
+                machine_id: "m-cmd-b".to_string(),
+                hostname: "b".to_string(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+            },
+        )
+        .await?;
+        let command_id = Uuid::new_v4();
+        sqlx::query!(
+            "INSERT INTO audit_log (actor, action, machine_id, target_ref, command_id, result)
+             VALUES ('anonymous', 'container.stop', $1, 'web', $2, 'dispatched')",
+            machine_a,
+            command_id,
+        )
+        .execute(&pool)
+        .await?;
+
+        let hub = crate::hub::Hub::new();
+        let mut waiter = hub.register_pending(command_id.to_string(), machine_a);
+        let (tx, _rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
+
+        handle_agent_frame(
+            &pool,
+            &hub,
+            machine_b,
+            AgentFrame {
+                stream_id: 7,
+                payload: Some(agent_frame::Payload::CommandResult(
+                    argus_proto::v1::CommandResult {
+                        command_id: command_id.to_string(),
+                        ok: true,
+                        exit_code: 0,
+                        message: "spoof".into(),
+                    },
+                )),
+            },
+            &tx,
+        )
+        .await?;
+
+        let row = sqlx::query!(
+            "SELECT result FROM audit_log WHERE command_id = $1",
+            command_id
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            row.result.as_deref(),
+            Some("dispatched"),
+            "B must not resolve A's command"
+        );
+        assert!(waiter.try_recv().is_err(), "B must not wake A's waiter");
 
         Ok(())
     }

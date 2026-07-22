@@ -6,29 +6,35 @@
 
 use crate::config::Config;
 use crate::embed::Assets;
+use crate::hub::{DispatchError, Hub};
 use crate::repo;
 use anyhow::Result;
+use argus_proto::v1::Verb;
 use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode, Uri},
     response::{IntoResponse, Json, Response},
-    routing::get,
+    routing::{get, post},
     Router,
 };
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::sync::Arc;
+use std::time::Duration;
 use time::OffsetDateTime;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-/// Shared router state: the Postgres pool backing `/api` handlers.
+/// Shared router state: the Postgres pool backing `/api` handlers, plus the
+/// in-memory session `Hub` backing the Docker state + verb endpoints.
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
+    pub hub: Arc<Hub>,
 }
 
-pub async fn serve(cfg: &Config, pool: PgPool) -> Result<()> {
-    let app = router(AppState { pool });
+pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
+    let app = router(AppState { pool, hub });
 
     let listener = tokio::net::TcpListener::bind(&cfg.http_addr).await?;
     tracing::info!(addr = %cfg.http_addr, "browser HTTP surface listening");
@@ -45,7 +51,12 @@ fn router(state: AppState) -> Router {
         .route("/api/fleet", get(fleet))
         .route("/api/machines/{id}", get(machine))
         .route("/api/machines/{id}/metrics", get(machine_metrics))
-        // TODO: nest remaining /api routes (verbs, logs SSE, terminal WS,
+        .route("/api/machines/{id}/docker", get(machine_docker))
+        .route(
+            "/api/machines/{id}/docker/{container}/{action}",
+            post(container_action),
+        )
+        // TODO: nest remaining /api routes (logs SSE, terminal WS,
         // events SSE, audit, enroll-tokens) and /auth OIDC routes here (PRD
         // §9.1).
         .fallback(static_handler)
@@ -273,6 +284,159 @@ async fn machine_metrics(
     Ok(Json(history.into_iter().map(Into::into).collect()))
 }
 
+/// One container row for the detail page's container panel, mirroring the proto
+/// `Container` (which isn't `Serialize`).
+#[derive(serde::Serialize)]
+struct ContainerDto {
+    id: String,
+    name: String,
+    image: String,
+    state: String,
+    status: String,
+    health: String,
+}
+
+impl From<argus_proto::v1::Container> for ContainerDto {
+    fn from(c: argus_proto::v1::Container) -> Self {
+        ContainerDto {
+            id: c.id,
+            name: c.name,
+            image: c.image,
+            state: c.state,
+            status: c.status,
+            health: c.health,
+        }
+    }
+}
+
+/// `GET /api/machines/{id}/docker` — the machine's latest cached container list
+/// (empty when the agent hasn't reported / has no Docker daemon).
+async fn machine_docker(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Json<Vec<ContainerDto>> {
+    let containers = state.hub.get_docker(id);
+    Json(containers.into_iter().map(ContainerDto::from).collect())
+}
+
+/// The bounded wait for a dispatched verb's result.
+const VERB_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// JSON returned by a verb POST — `ok`/`message` are present on completion,
+/// absent when we returned before the agent replied (202 pending).
+#[derive(serde::Serialize)]
+struct VerbResult {
+    command_id: String,
+    ok: Option<bool>,
+    message: Option<String>,
+    status: &'static str,
+}
+
+/// `POST /api/machines/{id}/docker/{container}/{action}` — dispatch a container
+/// verb and wait up to `VERB_TIMEOUT` for the agent's result.
+async fn container_action(
+    State(state): State<AppState>,
+    Path((id, container, action)): Path<(Uuid, String, String)>,
+) -> Response {
+    run_container_verb(&state, id, &container, &action, VERB_TIMEOUT).await
+}
+
+/// Testable core (timeout injected so tests don't wait the full 10s).
+async fn run_container_verb(
+    state: &AppState,
+    id: Uuid,
+    container: &str,
+    action: &str,
+    timeout: Duration,
+) -> Response {
+    let verb = match action {
+        "start" => Verb::ContainerStart,
+        "stop" => Verb::ContainerStop,
+        "restart" => Verb::ContainerRestart,
+        _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),
+    };
+    let actor = "anonymous";
+    let audit_action = format!("container.{action}");
+    let command_id = Uuid::new_v4();
+    let cid = command_id.to_string();
+
+    // Register the waiter AND write the dispatched audit row BEFORE dispatch, so
+    // the row is guaranteed to exist before the agent can round-trip a
+    // CommandResult -- whose grpc-side UPDATE (repo::update_command_result) is
+    // keyed by command_id and would otherwise silently no-op against a
+    // not-yet-inserted row, freezing it at "dispatched" forever.
+    let rx = state.hub.register_pending(cid.clone(), id);
+    if let Err(e) = repo::audit_command(
+        &state.pool,
+        actor,
+        &audit_action,
+        Some(id),
+        container,
+        command_id,
+        "dispatched",
+    )
+    .await
+    {
+        // Fail closed: a verb must never execute unaudited (CLAUDE.md). If the
+        // dispatched audit write fails, abandon the waiter and do NOT dispatch.
+        state.hub.abandon_pending(&cid);
+        tracing::error!(error = %e, "container verb: dispatched audit write failed; not dispatching");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to record audit entry",
+        )
+            .into_response();
+    }
+
+    if let Err(DispatchError::NotConnected) = state
+        .hub
+        .send_command(
+            id,
+            cid.clone(),
+            verb,
+            container.to_string(),
+            actor.to_string(),
+        )
+        .await
+    {
+        state.hub.abandon_pending(&cid);
+        // The agent is offline: no CommandResult will ever arrive to resolve the
+        // row, so flip it to the terminal "denied" state here. This is the one
+        // case the grpc CommandResult arm cannot cover (the command was never
+        // delivered), so it does not conflict with that arm being the sole
+        // writer of a real ok/error result.
+        if let Err(e) = repo::update_command_result(&state.pool, command_id, id, "denied").await {
+            tracing::error!(error = %e, "container verb: denied audit update failed");
+        }
+        return (StatusCode::CONFLICT, "agent not connected").into_response();
+    }
+
+    match tokio::time::timeout(timeout, rx).await {
+        // The gRPC CommandResult arm already updated the audit row's result.
+        Ok(Ok(result)) => Json(VerbResult {
+            command_id: cid,
+            ok: Some(result.ok),
+            message: Some(result.message),
+            status: "completed",
+        })
+        .into_response(),
+        Ok(Err(_)) => (StatusCode::INTERNAL_SERVER_ERROR, "result channel closed").into_response(),
+        Err(_) => {
+            state.hub.abandon_pending(&cid);
+            (
+                StatusCode::ACCEPTED,
+                Json(VerbResult {
+                    command_id: cid,
+                    ok: None,
+                    message: None,
+                    status: "pending",
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Serve the embedded React app, falling back to `index.html` for client-side
 /// routes (PRD §10).
 async fn static_handler(uri: Uri) -> Response {
@@ -314,8 +478,12 @@ fn content_type(path: &str) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::hub::Hub;
+    use argus_proto::v1::{server_frame, CommandResult, ServerFrame};
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
+    use tokio::sync::mpsc;
+    use tonic::Status;
     use tower::ServiceExt;
 
     #[sqlx::test]
@@ -336,7 +504,10 @@ mod tests {
         .execute(&pool)
         .await?;
 
-        let app = router(AppState { pool });
+        let app = router(AppState {
+            pool,
+            hub: Arc::new(Hub::new()),
+        });
 
         let response = app
             .oneshot(Request::builder().uri("/api/fleet").body(Body::empty())?)
@@ -387,7 +558,10 @@ mod tests {
             .await?;
         }
 
-        let app = router(AppState { pool });
+        let app = router(AppState {
+            pool,
+            hub: Arc::new(Hub::new()),
+        });
 
         // /api/fleet: the seeded machine's row must carry a non-empty
         // spark_cpu ending in the latest sample.
@@ -458,6 +632,215 @@ mod tests {
             .await?;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
+        Ok(())
+    }
+
+    fn app_state_with_hub(pool: PgPool) -> (AppState, Arc<Hub>) {
+        let hub = Arc::new(Hub::new());
+        (
+            AppState {
+                pool,
+                hub: hub.clone(),
+            },
+            hub,
+        )
+    }
+
+    #[sqlx::test]
+    async fn get_docker_returns_cached_snapshot(pool: PgPool) -> anyhow::Result<()> {
+        let (state, hub) = app_state_with_hub(pool);
+        let id = Uuid::new_v4();
+
+        // empty before any report
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/machines/{id}/docker"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await?;
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+        assert!(rows.is_empty());
+
+        // populate the cache, then it shows up
+        hub.set_docker(
+            id,
+            vec![argus_proto::v1::Container {
+                id: "deadbeef".into(),
+                name: "grafana".into(),
+                image: "grafana/grafana".into(),
+                state: "running".into(),
+                status: "Up 1 hour".into(),
+                health: String::new(),
+            }],
+        );
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/machines/{id}/docker"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let body = to_bytes(resp.into_body(), usize::MAX).await?;
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "grafana");
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn verb_on_offline_agent_returns_409_and_audits_denied(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let machine_id: Uuid = sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname, status) VALUES ('verb-offline', 'h', 'offline') RETURNING id"
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+
+        let (state, _hub) = app_state_with_hub(pool.clone());
+        let resp = run_container_verb(
+            &state,
+            machine_id,
+            "web",
+            "restart",
+            Duration::from_millis(200),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        let row = sqlx::query!(
+            "SELECT result FROM audit_log WHERE machine_id = $1 AND action = 'container.restart'",
+            machine_id,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.result.as_deref(), Some("denied"));
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn verb_with_connected_agent_completes_ok(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id: Uuid = sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname, status) VALUES ('verb-online', 'h', 'online') RETURNING id"
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+
+        let (state, hub) = app_state_with_hub(pool.clone());
+
+        // Fake agent: register a connection and echo a success CommandResult for any
+        // Command it receives (exactly what the real agent's session loop does).
+        let (tx, mut rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
+        hub.register(machine_id, tx);
+        let hub2 = hub.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(frame)) = rx.recv().await {
+                if let Some(server_frame::Payload::Command(cmd)) = frame.payload {
+                    hub2.complete(
+                        &cmd.command_id.clone(),
+                        machine_id,
+                        CommandResult {
+                            command_id: cmd.command_id,
+                            ok: true,
+                            exit_code: 0,
+                            message: "started".into(),
+                        },
+                    );
+                }
+            }
+        });
+
+        let resp =
+            run_container_verb(&state, machine_id, "web", "start", Duration::from_secs(5)).await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["status"], "completed");
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn verb_times_out_to_202_when_agent_never_replies(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id: Uuid = sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname, status) VALUES ('verb-silent', 'h', 'online') RETURNING id"
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+
+        let (state, hub) = app_state_with_hub(pool.clone());
+        // Register a connection whose receiver we hold but never reply on.
+        let (tx, _rx_never) = mpsc::channel::<Result<ServerFrame, Status>>(4);
+        hub.register(machine_id, tx);
+
+        let resp = run_container_verb(
+            &state,
+            machine_id,
+            "web",
+            "stop",
+            Duration::from_millis(150),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::ACCEPTED);
+        let body = to_bytes(resp.into_body(), usize::MAX).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(v["status"], "pending");
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn verb_fails_closed_when_the_dispatched_audit_write_fails(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        // A machine_id with NO `machines` row: `audit_command`'s FK to machines(id)
+        // fails, exercising the dispatched-audit-write failure path.
+        let ghost_id = Uuid::new_v4();
+        let (state, hub) = app_state_with_hub(pool);
+
+        // Register a live connection so send_command WOULD succeed if we reached it;
+        // hold its receiver to prove no Command was dispatched.
+        let (tx, mut rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
+        hub.register(ghost_id, tx);
+
+        let resp =
+            run_container_verb(&state, ghost_id, "web", "start", Duration::from_millis(200)).await;
+        assert_eq!(
+            resp.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a failed dispatched-audit write must fail closed"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "no Command frame may be dispatched when the audit write fails"
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn verb_with_unknown_action_returns_400(pool: PgPool) -> anyhow::Result<()> {
+        let (state, _hub) = app_state_with_hub(pool);
+        let resp = run_container_verb(
+            &state,
+            Uuid::new_v4(),
+            "web",
+            "obliterate",
+            Duration::from_millis(100),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
         Ok(())
     }
 }
