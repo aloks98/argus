@@ -1,18 +1,18 @@
-import { Routes, Route } from "react-router-dom";
-import FleetPage from "./FleetPage";
-import MachineDetailPage from "./MachineDetailPage";
-import ThemeToggle from "./ThemeToggle";
+import { Navigate, Route, Routes } from "react-router-dom";
+import AppShell from "./app/AppShell";
+import { ROUTES } from "./app/routes";
+import NotFoundPage from "./pages/NotFoundPage";
 
 export default function App() {
   return (
-    <>
-      <div className="fixed right-4 top-4 z-50">
-        <ThemeToggle />
-      </div>
+    <AppShell>
       <Routes>
-        <Route path="/" element={<FleetPage />} />
-        <Route path="/machines/:id" element={<MachineDetailPage />} />
+        {ROUTES.map((r) => (
+          <Route key={r.path} path={r.path} element={r.element} />
+        ))}
+        <Route path="/" element={<Navigate to="/machines" replace />} />
+        <Route path="*" element={<NotFoundPage />} />
       </Routes>
-    </>
+    </AppShell>
   );
 }

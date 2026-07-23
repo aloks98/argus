@@ -4,3 +4,173 @@
 /* Tailwind v4 does not scan node_modules by default; point it at the rnui
    library so the utility classes its compiled components use are generated. */
 @source "../node_modules/@e412/rnui-react/dist";
+
+/* Self-hosted faces (no CDN — this SPA is embedded in the Rust binary). */
+@import "@fontsource/archivo/400.css";
+@import "@fontsource/archivo/600.css";
+@import "@fontsource/archivo/700.css";
+@import "@fontsource/archivo-black/400.css";
+@import "@fontsource/ibm-plex-mono/400.css";
+@import "@fontsource/ibm-plex-mono/600.css";
+
+@theme {
+  --font-sans: "Archivo", system-ui, sans-serif;
+  --font-mono: "IBM Plex Mono", ui-monospace, monospace;
+  --font-display: "Archivo Black", "Archivo", system-ui, sans-serif;
+}
+
+/* ─── Argus identity: asset tag, hazard yellow on black ───────────────────
+   These override the rnui-themes values. Brand and status FILLS are the same
+   in both themes (that is what makes the asset tag ground-agnostic); only the
+   chrome and the *-text variants change. */
+
+:root {
+  --radius: 0rem;
+  /* Also declared unlayered so they beat rnui-themes' unlayered :root values
+     (an @theme block compiles into @layer theme, which loses the cascade). */
+  --font-sans: "Archivo", system-ui, sans-serif;
+  --font-heading: "Archivo", system-ui, sans-serif;
+
+  --background: #FFFFFF;
+  --foreground: #0A0A0B;
+  --card: #FFFFFF;
+  --card-foreground: #0A0A0B;
+  --popover: #FFFFFF;
+  --popover-foreground: #0A0A0B;
+  --muted: #F1F1F3;
+  --muted-foreground: #6B6B70;
+  --secondary: #F1F1F3;
+  --secondary-foreground: #0A0A0B;
+  --accent: #F1F1F3;
+  --accent-foreground: #0A0A0B;
+  --border: #D4D4D8;
+  --input: #D4D4D8;
+
+  --primary: #14161A;
+  --primary-foreground: #FFE600;
+  --success: #00E676;
+  --success-foreground: #000000;
+  --warning: #FF6D00;
+  --warning-foreground: #000000;
+  --destructive: #FF1744;
+  --destructive-foreground: #FFFFFF;
+  --idle: #8A8A8A;
+
+  --ring: #8A7300;
+  --focus: #8A7300;
+  --focus-foreground: #FFFFFF;
+
+  --chart-1: #8A7300;
+  --chart-2: #007A3D;
+  --chart-3: #C24E00;
+  --chart-4: #C4001D;
+  --chart-5: #6B6B70;
+
+  /* Bright fills are unreadable as TEXT on white — darkened variants. */
+  --brand-text: #8A7300;
+  --ok-text: #007A3D;
+  --warn-text: #C24E00;
+  --fail-text: #C4001D;
+
+  /* rnui Sidebar suite tokens. The sidebar is not a raised surface in this
+     design — it shares the page ground, not --card or --popover. */
+  --sidebar: #FFFFFF;
+  --sidebar-foreground: #0A0A0B;
+  --sidebar-border: #D4D4D8;
+  --sidebar-accent: #F1F1F3;
+  --sidebar-accent-foreground: #0A0A0B;
+  --sidebar-primary: #14161A;
+  --sidebar-primary-foreground: #FFE600;
+  --sidebar-ring: #8A7300;
+}
+
+.dark {
+  --background: #000000;
+  --foreground: #F5F5F5;
+  --card: #000000;
+  --card-foreground: #F5F5F5;
+  --popover: #000000;
+  --popover-foreground: #F5F5F5;
+  --muted: #121212;
+  --muted-foreground: #8A8A8A;
+  --secondary: #121212;
+  --secondary-foreground: #F5F5F5;
+  --accent: #121212;
+  --accent-foreground: #F5F5F5;
+  --border: #242424;
+  --input: #242424;
+
+  --primary: #FFE600;
+  --primary-foreground: #000000;
+  --success: #00E676;
+  --success-foreground: #000000;
+  --warning: #FF6D00;
+  --warning-foreground: #000000;
+  --destructive: #FF1744;
+  --destructive-foreground: #FFFFFF;
+  --idle: #8A8A8A;
+
+  --ring: #FFE600;
+  --focus: #FFE600;
+  --focus-foreground: #000000;
+
+  --chart-1: #FFE600;
+  --chart-2: #00E676;
+  --chart-3: #FF6D00;
+  --chart-4: #FF1744;
+  --chart-5: #8A8A8A;
+
+  /* On black the fills are already legible as text. */
+  --brand-text: #FFE600;
+  --ok-text: #00E676;
+  --warn-text: #FF6D00;
+  --fail-text: #FF1744;
+
+  /* rnui Sidebar suite tokens — see the :root block for the rationale. */
+  --sidebar: #000000;
+  --sidebar-foreground: #F5F5F5;
+  --sidebar-border: #242424;
+  --sidebar-accent: #121212;
+  --sidebar-accent-foreground: #F5F5F5;
+  --sidebar-primary: #FFE600;
+  --sidebar-primary-foreground: #000000;
+  --sidebar-ring: #FFE600;
+}
+
+/* Focus must stay visible against a black ground. */
+:where(a, button, [role="tab"], [tabindex]):focus-visible {
+  outline: 2px solid var(--focus);
+  outline-offset: 2px;
+}
+
+/* uPlot ships a hard-coded #607D8B crosshair; match its own selectors so this
+   override wins on equal specificity regardless of stylesheet emission order. */
+.u-hz .u-cursor-x,
+.u-vt .u-cursor-y {
+  border-color: var(--border);
+}
+
+/* Floating readout for uPlot charts (see components/TimeSeriesChart.tsx). */
+.u-tt {
+  position: absolute;
+  z-index: 10;
+  pointer-events: none;
+  padding: 6px 8px;
+  background: var(--popover);
+  color: var(--popover-foreground);
+  border: 1px solid var(--border);
+  font-family: var(--font-mono), monospace;
+  font-size: 11px;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.u-tt-x {
+  color: var(--muted-foreground);
+  margin-bottom: 2px;
+}
+.u-tt-sw {
+  display: inline-block;
+  width: 8px;
+  height: 8px;
+  margin-right: 5px;
+}
