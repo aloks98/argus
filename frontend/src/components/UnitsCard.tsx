@@ -2,6 +2,7 @@
 // reports far more units than containers, so this table leads with failures and
 // carries its own filter — see lib/units.ts for the (pure) ordering rules.
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import {
   Alert,
   AlertDescription,
@@ -232,6 +233,13 @@ export default function UnitsCard({
                         // it and the buttons sat left under a right-aligned
                         // header. Auto margin is what pushes a fit-width block.
                         <ButtonGroup className="ml-auto justify-end">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            render={<Link to={`?tab=units&logs=${encodeURIComponent(`journal:${u.name}`)}`} />}
+                          >
+                            Logs
+                          </Button>
                           <Button
                             size="sm"
                             variant="outline"

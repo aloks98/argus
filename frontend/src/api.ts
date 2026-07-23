@@ -151,3 +151,24 @@ export async function unitAction(
     `/api/machines/${id}/units/${encodeURIComponent(unit)}/${action}`,
   );
 }
+
+/** A log source: `journal:<unit>` or `docker:<container>`. */
+export type LogSource = string;
+
+/**
+ * The SSE URL for a tail. `LazyLog` opens the EventSource itself, so this
+ * returns a URL rather than a fetch — see components/LogViewer.tsx.
+ */
+export function logStreamUrl(
+  id: string,
+  source: LogSource,
+  tail = 200,
+  follow = true,
+): string {
+  const params = new URLSearchParams({
+    source,
+    tail: String(tail),
+    follow: String(follow),
+  });
+  return `/api/machines/${id}/logs/stream?${params.toString()}`;
+}

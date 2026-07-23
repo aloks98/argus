@@ -1,6 +1,7 @@
 // Docker container list + start/stop/restart verbs for a single machine.
 // Extracted out of MachineDetailPage so the Containers tab owns its own file;
 // keeps the mutation wiring (Task 3's useContainerAction) local to itself.
+import { Link } from "react-router-dom";
 import {
   Alert,
   AlertDescription,
@@ -156,6 +157,13 @@ export default function ContainersCard({
                         // `ml-auto` rather than the cell's `text-right` —
                         // ButtonGroup is a block-level `flex w-fit`. See UnitsCard.
                         <ButtonGroup className="ml-auto justify-end">
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            render={<Link to={`?tab=containers&logs=${encodeURIComponent(`docker:${c.id}`)}`} />}
+                          >
+                            Logs
+                          </Button>
                           <Button
                             size="sm"
                             variant="outline"

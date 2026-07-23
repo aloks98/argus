@@ -6,7 +6,10 @@
 //! re-derived on reconnect — consistent with the stateless single-replica control
 //! plane.
 
-use argus_proto::v1::{server_frame, Command, CommandResult, Container, ServerFrame, Unit, Verb};
+use argus_proto::v1::{
+    server_frame, Command, CommandResult, Container, LogChunk, LogTailRequest, LogTailStop,
+    ServerFrame, Unit, Verb,
+};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -37,6 +40,12 @@ pub struct Hub {
     docker: Mutex<HashMap<Uuid, Vec<Container>>>,
     systemd: Mutex<HashMap<Uuid, Vec<Unit>>>,
     pending: Mutex<HashMap<String, (Uuid, oneshot::Sender<CommandResult>)>>,
+    /// request_id -> the SSE sink for that tail, with the machine it belongs to.
+    /// A stream sink, unlike `pending`'s one-shot.
+    ///
+    /// Filled by `deliver_chunk` (the gRPC frame handler) and read/removed via
+    /// `open_tail`/`close_tail` (the HTTP SSE handler).
+    tails: Mutex<HashMap<String, (Uuid, mpsc::Sender<LogChunk>)>>,
     epoch_counter: AtomicU64,
 }
 
@@ -122,12 +131,7 @@ impl Hub {
     ) -> Result<(), DispatchError> {
         // Extract the channel + stream_id under the lock, then release it before
         // the async send (never hold a std Mutex guard across an await).
-        let (tx, stream_id) = {
-            let conns = self.conns.lock().unwrap();
-            let handle = conns.get(&machine_id).ok_or(DispatchError::NotConnected)?;
-            let stream_id = handle.next_stream_id.fetch_add(1, Ordering::Relaxed);
-            (handle.tx.clone(), stream_id)
-        };
+        let (tx, stream_id) = self.conn_slot(machine_id)?;
         let frame = ServerFrame {
             stream_id,
             payload: Some(server_frame::Payload::Command(Command {
@@ -173,6 +177,113 @@ impl Hub {
                 let _ = tx.send(result);
             }
         }
+    }
+
+    /// Register a new tail and return its id plus the receiving end for the SSE
+    /// response. The buffer is generous because the agent already batches; a
+    /// full buffer here means the browser is slower than the log, and dropping
+    /// is handled agent-side where the count can be reported.
+    pub fn open_tail(&self, machine_id: Uuid) -> (String, mpsc::Receiver<LogChunk>) {
+        let request_id = Uuid::new_v4().to_string();
+        let (tx, rx) = mpsc::channel(64);
+        self.tails
+            .lock()
+            .unwrap()
+            .insert(request_id.clone(), (machine_id, tx));
+        (request_id, rx)
+    }
+
+    /// Drop a tail's sink, ending the SSE stream.
+    pub fn close_tail(&self, request_id: &str) {
+        self.tails.lock().unwrap().remove(request_id);
+    }
+
+    /// Close every tail opened against this machine. Called when its agent
+    /// session ends: the agent-side tails are already aborted on teardown, so
+    /// these server-side sinks would otherwise hang their SSE streams open with
+    /// no eof, showing a frozen "live" tail in the browser forever.
+    pub fn close_tails_for(&self, machine_id: Uuid) {
+        self.tails
+            .lock()
+            .unwrap()
+            .retain(|_, (owner, _)| *owner != machine_id);
+    }
+
+    /// Deliver a chunk, but only from the machine the tail was opened against —
+    /// the same trust boundary `complete()` enforces for command results. An
+    /// `eof` chunk is delivered and then closes the sink.
+    ///
+    /// Called by the gRPC frame handler as `LogChunk` frames arrive on the
+    /// agent's Session stream.
+    pub fn deliver_chunk(&self, request_id: &str, machine_id: Uuid, chunk: LogChunk) {
+        // Extract the sender under the lock, then send after dropping the guard.
+        let sender = {
+            let tails = self.tails.lock().unwrap();
+            match tails.get(request_id) {
+                Some((owner, tx)) if *owner == machine_id => tx.clone(),
+                _ => return,
+            }
+        };
+        let eof = chunk.eof;
+        let _ = sender.try_send(chunk);
+        if eof {
+            self.close_tail(request_id);
+        }
+    }
+
+    /// Sent by the HTTP SSE handler when a tail is opened.
+    pub async fn send_log_start(
+        &self,
+        machine_id: Uuid,
+        request_id: String,
+        source: String,
+        tail_lines: u32,
+        follow: bool,
+    ) -> Result<(), DispatchError> {
+        let (tx, stream_id) = self.conn_slot(machine_id)?;
+        let frame = ServerFrame {
+            stream_id,
+            payload: Some(server_frame::Payload::LogTailStart(LogTailRequest {
+                request_id,
+                source,
+                tail_lines,
+                follow,
+            })),
+        };
+        tx.send(Ok(frame))
+            .await
+            .map_err(|_| DispatchError::NotConnected)
+    }
+
+    /// Sent by the HTTP SSE handler's `TailGuard` when the browser disconnects.
+    pub async fn send_log_stop(
+        &self,
+        machine_id: Uuid,
+        request_id: String,
+    ) -> Result<(), DispatchError> {
+        let (tx, stream_id) = self.conn_slot(machine_id)?;
+        let frame = ServerFrame {
+            stream_id,
+            payload: Some(server_frame::Payload::LogTailStop(LogTailStop {
+                request_id,
+            })),
+        };
+        tx.send(Ok(frame))
+            .await
+            .map_err(|_| DispatchError::NotConnected)
+    }
+
+    /// The outbound channel plus a fresh non-zero sub-stream id. Factored out
+    /// because three senders now need the same "extract under the lock, then
+    /// await outside it" dance.
+    fn conn_slot(
+        &self,
+        machine_id: Uuid,
+    ) -> Result<(mpsc::Sender<Result<ServerFrame, Status>>, u64), DispatchError> {
+        let conns = self.conns.lock().unwrap();
+        let handle = conns.get(&machine_id).ok_or(DispatchError::NotConnected)?;
+        let stream_id = handle.next_stream_id.fetch_add(1, Ordering::Relaxed);
+        Ok((handle.tx.clone(), stream_id))
     }
 }
 
@@ -383,5 +494,119 @@ mod tests {
             },
         );
         assert!(rx.await.expect("owner resolves").ok);
+    }
+
+    fn chunk(request_id: &str, body: &str, eof: bool) -> LogChunk {
+        LogChunk {
+            request_id: request_id.into(),
+            data: body.as_bytes().to_vec(),
+            eof,
+        }
+    }
+
+    #[tokio::test]
+    async fn open_tail_then_deliver_reaches_the_receiver() {
+        let hub = Hub::new();
+        let m = Uuid::new_v4();
+        let (rid, mut rx) = hub.open_tail(m);
+        hub.deliver_chunk(&rid, m, chunk(&rid, "hello", false));
+        let got = rx.recv().await.expect("chunk delivered");
+        assert_eq!(got.data, b"hello");
+    }
+
+    #[tokio::test]
+    async fn a_foreign_machine_cannot_deliver_into_another_machines_tail() {
+        // Same trust boundary as command results: the tail belongs to the
+        // machine it was opened against, and any other authenticated agent
+        // must not be able to inject into it.
+        let hub = Hub::new();
+        let owner = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let (rid, mut rx) = hub.open_tail(owner);
+        hub.deliver_chunk(&rid, other, chunk(&rid, "spoof", false));
+        assert!(rx.try_recv().is_err(), "foreign machine must not deliver");
+        hub.deliver_chunk(&rid, owner, chunk(&rid, "real", false));
+        assert_eq!(rx.recv().await.expect("owner delivers").data, b"real");
+    }
+
+    #[tokio::test]
+    async fn an_eof_chunk_closes_the_stream() {
+        let hub = Hub::new();
+        let m = Uuid::new_v4();
+        let (rid, mut rx) = hub.open_tail(m);
+        hub.deliver_chunk(&rid, m, chunk(&rid, "last", true));
+        assert_eq!(rx.recv().await.expect("final chunk").data, b"last");
+        assert!(rx.recv().await.is_none(), "eof must close the channel");
+    }
+
+    #[tokio::test]
+    async fn close_tail_drops_the_sink_and_ends_the_stream() {
+        let hub = Hub::new();
+        let m = Uuid::new_v4();
+        let (rid, mut rx) = hub.open_tail(m);
+        hub.close_tail(&rid);
+        assert!(rx.recv().await.is_none());
+        // Delivering after close is a no-op, not a panic.
+        hub.deliver_chunk(&rid, m, chunk(&rid, "late", false));
+    }
+
+    #[tokio::test]
+    async fn close_tails_for_closes_only_the_owning_machines_tails() {
+        let hub = Hub::new();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let (_rid_a1, mut rx_a1) = hub.open_tail(a);
+        let (_rid_a2, mut rx_a2) = hub.open_tail(a);
+        let (rid_b, mut rx_b) = hub.open_tail(b);
+
+        hub.close_tails_for(a);
+
+        assert!(rx_a1.recv().await.is_none(), "A's first tail must close");
+        assert!(rx_a2.recv().await.is_none(), "A's second tail must close");
+
+        // B's tail is untouched: still delivers.
+        hub.deliver_chunk(&rid_b, b, chunk(&rid_b, "still alive", false));
+        assert_eq!(
+            rx_b.recv().await.expect("B's tail still delivers").data,
+            b"still alive"
+        );
+    }
+
+    #[tokio::test]
+    async fn each_open_tail_gets_a_distinct_request_id() {
+        let hub = Hub::new();
+        let m = Uuid::new_v4();
+        let (a, _ra) = hub.open_tail(m);
+        let (b, _rb) = hub.open_tail(m);
+        assert_ne!(a, b, "two viewers of the same source must not share a tail");
+    }
+
+    #[tokio::test]
+    async fn send_log_start_emits_a_request_on_a_nonzero_stream() {
+        let hub = Hub::new();
+        let m = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(4);
+        hub.register(m, tx);
+        hub.send_log_start(m, "r1".into(), "journal:nginx.service".into(), 200, true)
+            .await
+            .expect("dispatch");
+        let frame = rx.recv().await.unwrap().unwrap();
+        assert_ne!(frame.stream_id, 0);
+        match frame.payload {
+            Some(server_frame::Payload::LogTailStart(r)) => {
+                assert_eq!(r.request_id, "r1");
+                assert_eq!(r.source, "journal:nginx.service");
+                assert_eq!(r.tail_lines, 200);
+                assert!(r.follow);
+            }
+            other => panic!("expected LogTailStart, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn send_log_stop_to_an_absent_machine_errors() {
+        let hub = Hub::new();
+        let res = hub.send_log_stop(Uuid::new_v4(), "r1".into()).await;
+        assert!(matches!(res, Err(DispatchError::NotConnected)));
     }
 }

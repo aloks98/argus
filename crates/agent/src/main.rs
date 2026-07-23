@@ -12,6 +12,7 @@ mod docker;
 mod enroll;
 mod identity;
 mod info;
+mod logs;
 mod metrics;
 mod session;
 mod systemd;

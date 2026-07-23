@@ -13,15 +13,21 @@ use argus_proto::v1::Verb;
 use axum::{
     extract::{Path, Query, State},
     http::{header, StatusCode, Uri},
-    response::{IntoResponse, Json, Response},
+    response::{
+        sse::{Event, KeepAlive, Sse},
+        IntoResponse, Json, Response,
+    },
     routing::{get, post},
     Router,
 };
 use sqlx::PgPool;
 use std::collections::HashMap;
+use std::convert::Infallible;
 use std::sync::Arc;
 use std::time::Duration;
 use time::OffsetDateTime;
+use tokio_stream::wrappers::ReceiverStream;
+use tokio_stream::StreamExt;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
@@ -61,9 +67,9 @@ fn router(state: AppState) -> Router {
             "/api/machines/{id}/units/{unit}/{action}",
             post(unit_action),
         )
-        // TODO: nest remaining /api routes (logs SSE, terminal WS,
-        // events SSE, audit, enroll-tokens) and /auth OIDC routes here (PRD
-        // §9.1).
+        .route("/api/machines/{id}/logs/stream", get(log_stream))
+        // TODO: nest remaining /api routes (terminal WS, events SSE, audit,
+        // enroll-tokens) and /auth OIDC routes here (PRD §9.1).
         .fallback(static_handler)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
@@ -367,6 +373,138 @@ async fn machine_systemd(
 ) -> Json<Vec<UnitDto>> {
     let units = state.hub.get_systemd(id);
     Json(units.into_iter().map(UnitDto::from).collect())
+}
+
+/// Hard ceiling on the backlog a client may ask the agent to render.
+pub const MAX_TAIL_LINES: u32 = 1000;
+
+/// Default backlog when the client doesn't ask for one.
+const DEFAULT_TAIL_LINES: u32 = 200;
+
+/// Query params for `GET /api/machines/{id}/logs/stream`.
+#[derive(serde::Deserialize)]
+struct LogStreamQuery {
+    source: String,
+    tail: Option<u32>,
+    follow: Option<bool>,
+}
+
+/// Server-side source validation. The agent validates independently — neither
+/// side trusts the other, because this value becomes a subprocess argument.
+fn source_is_valid(raw: &str) -> bool {
+    let Some((scheme, target)) = raw.split_once(':') else {
+        return false;
+    };
+    if target.is_empty() || target.len() > 256 {
+        return false;
+    }
+    match scheme {
+        "journal" => target
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ':' | '_' | '.' | '@' | '-' | '\\')),
+        "docker" => target
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')),
+        _ => false,
+    }
+}
+
+/// Sends `LogTailStop` when the SSE response is dropped — i.e. the browser
+/// navigated away, closed the tab, or lost its connection. This is the only
+/// thing that stops a `journalctl -f` from outliving the view that asked for
+/// it, so it must stay owned by the stream.
+struct TailGuard {
+    hub: Arc<Hub>,
+    machine_id: Uuid,
+    request_id: String,
+}
+
+impl Drop for TailGuard {
+    fn drop(&mut self) {
+        self.hub.close_tail(&self.request_id);
+        let hub = self.hub.clone();
+        let machine_id = self.machine_id;
+        let request_id = self.request_id.clone();
+        // Drop is sync; the stop is a send, so it needs a task.
+        tokio::spawn(async move {
+            if let Err(e) = hub.send_log_stop(machine_id, request_id).await {
+                tracing::debug!(error = ?e, "log tail: stop not delivered (agent gone)");
+            }
+        });
+    }
+}
+
+/// `GET /api/machines/{id}/logs/stream?source=&tail=&follow=` — open a tail on
+/// the agent and stream it to the browser as SSE.
+async fn log_stream(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<LogStreamQuery>,
+) -> Response {
+    if !source_is_valid(&q.source) {
+        return (StatusCode::BAD_REQUEST, "invalid source").into_response();
+    }
+    let tail = q.tail.unwrap_or(DEFAULT_TAIL_LINES).min(MAX_TAIL_LINES);
+    let follow = q.follow.unwrap_or(true);
+
+    // Open the tail and dispatch LogTailStart BEFORE auditing: an offline
+    // agent must 409 with NO `logs.open` row at all, rather than leaving a
+    // misleading `logs.open`/`ok` row behind for a read that never happened.
+    let (request_id, rx) = state.hub.open_tail(id);
+    if let Err(DispatchError::NotConnected) = state
+        .hub
+        .send_log_start(id, request_id.clone(), q.source.clone(), tail, follow)
+        .await
+    {
+        state.hub.close_tail(&request_id);
+        return (StatusCode::CONFLICT, "agent not connected").into_response();
+    }
+
+    // Reading logs is not a mutation, but it can expose secrets, so who read
+    // what is recorded — the PRD already treats terminal.open the same way.
+    // There is no result to update later, so the row is written once as `ok`,
+    // only now that the tail is actually live on the agent.
+    let command_id = Uuid::new_v4();
+    if let Err(e) = repo::audit_command(
+        &state.pool,
+        "anonymous",
+        "logs.open",
+        Some(id),
+        &q.source,
+        command_id,
+        "ok",
+    )
+    .await
+    {
+        // The tail is already live on the agent; since we can't audit it,
+        // fail closed by tearing it back down rather than leaving an
+        // unaudited stream running.
+        tracing::error!(error = %e, "log stream: audit write failed; closing tail");
+        state.hub.close_tail(&request_id);
+        if let Err(e) = state.hub.send_log_stop(id, request_id).await {
+            tracing::debug!(error = ?e, "log stream: stop not delivered (agent gone)");
+        }
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to record audit entry",
+        )
+            .into_response();
+    }
+
+    let guard = TailGuard {
+        hub: state.hub.clone(),
+        machine_id: id,
+        request_id,
+    };
+    let stream = ReceiverStream::new(rx).map(move |chunk| {
+        // The guard is owned by the closure, so it drops with the stream.
+        let _ = &guard;
+        Ok::<Event, Infallible>(Event::default().data(String::from_utf8_lossy(&chunk.data)))
+    });
+
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
 }
 
 /// The bounded wait for a dispatched verb's result.
@@ -1197,6 +1335,196 @@ mod tests {
         let rows: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
         assert_eq!(rows[0]["failed_units"], 1);
 
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn log_stream_rejects_a_bad_source(pool: PgPool) -> anyhow::Result<()> {
+        let (state, _hub) = app_state_with_hub(pool);
+        let app = router(state);
+        for bad in [
+            "syslog:foo",
+            "journal:",
+            "journal:nginx%20service",
+            "journal:..%2F..%2Fetc%2Fpasswd",
+            "docker:abc%2Fdef",
+        ] {
+            let resp = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!(
+                            "/api/machines/{}/logs/stream?source={bad}",
+                            Uuid::new_v4()
+                        ))
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(
+                resp.status(),
+                StatusCode::BAD_REQUEST,
+                "source {bad} must be rejected"
+            );
+        }
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn log_stream_returns_409_when_the_agent_is_offline(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id: Uuid = sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname, status) VALUES ('logs-offline', 'h', 'offline') RETURNING id"
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+
+        let (state, _hub) = app_state_with_hub(pool.clone());
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/machines/{machine_id}/logs/stream?source=journal:nginx.service"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // The connectivity failure must be checked BEFORE the audit write: a
+        // 409 must never leave a misleading `logs.open`/`ok` row behind for a
+        // read that never actually opened.
+        let row = sqlx::query!(
+            "SELECT count(*) AS count FROM audit_log WHERE machine_id = $1 AND action = 'logs.open' AND result = 'ok'",
+            machine_id,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            row.count,
+            Some(0),
+            "a 409 must not leave a logs.open/ok audit row"
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn log_stream_opens_audits_and_streams(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id: Uuid = sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname, status) VALUES ('logs-online', 'h', 'online') RETURNING id"
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+
+        let (state, hub) = app_state_with_hub(pool.clone());
+
+        // Fake agent: on LogTailStart, push one chunk then eof.
+        let (tx, mut agent_rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
+        hub.register(machine_id, tx);
+        let hub2 = hub.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(frame)) = agent_rx.recv().await {
+                if let Some(server_frame::Payload::LogTailStart(req)) = frame.payload {
+                    hub2.deliver_chunk(
+                        &req.request_id,
+                        machine_id,
+                        argus_proto::v1::LogChunk {
+                            request_id: req.request_id.clone(),
+                            data: b"{\"ts\":1,\"level\":6,\"ident\":null,\"msg\":\"hello\"}\n"
+                                .to_vec(),
+                            eof: false,
+                        },
+                    );
+                    let request_id = req.request_id.clone();
+                    hub2.deliver_chunk(
+                        &request_id,
+                        machine_id,
+                        argus_proto::v1::LogChunk {
+                            request_id: req.request_id,
+                            data: Vec::new(),
+                            eof: true,
+                        },
+                    );
+                }
+            }
+        });
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/machines/{machine_id}/logs/stream?source=journal:nginx.service&tail=50"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        assert_eq!(
+            resp.headers()
+                .get("content-type")
+                .and_then(|v| v.to_str().ok()),
+            Some("text/event-stream")
+        );
+
+        let body = to_bytes(resp.into_body(), usize::MAX).await?;
+        let text = String::from_utf8_lossy(&body);
+        assert!(
+            text.contains("hello"),
+            "SSE body must carry the chunk: {text}"
+        );
+
+        let row = sqlx::query!(
+            "SELECT action, target_ref, result FROM audit_log WHERE machine_id = $1",
+            machine_id,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.action, "logs.open");
+        assert_eq!(row.target_ref.as_deref(), Some("journal:nginx.service"));
+        assert_eq!(row.result.as_deref(), Some("ok"));
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn log_stream_clamps_an_oversized_tail(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id: Uuid = sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname, status) VALUES ('logs-clamp', 'h', 'online') RETURNING id"
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+
+        let (state, hub) = app_state_with_hub(pool.clone());
+        let (tx, mut agent_rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
+        hub.register(machine_id, tx);
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<u32>();
+        tokio::spawn(async move {
+            let mut seen_tx = Some(seen_tx);
+            while let Some(Ok(frame)) = agent_rx.recv().await {
+                if let Some(server_frame::Payload::LogTailStart(req)) = frame.payload {
+                    if let Some(s) = seen_tx.take() {
+                        let _ = s.send(req.tail_lines);
+                    }
+                }
+            }
+        });
+
+        let app = router(state);
+        let _ = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/machines/{machine_id}/logs/stream?source=journal:nginx.service&tail=999999"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+
+        assert_eq!(seen_rx.await?, MAX_TAIL_LINES, "tail must be clamped");
         Ok(())
     }
 }

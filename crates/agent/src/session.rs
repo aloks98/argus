@@ -7,7 +7,7 @@ use crate::systemd::SystemdClient;
 use anyhow::{Context, Result};
 use argus_proto::v1::agent_service_client::AgentServiceClient;
 use argus_proto::v1::{
-    agent_frame, server_frame, AgentFrame, CommandResult, DockerState, Heartbeat, Hello,
+    agent_frame, server_frame, AgentFrame, CommandResult, DockerState, Heartbeat, Hello, LogChunk,
     SystemdState, Verb,
 };
 use rand::Rng;
@@ -116,6 +116,15 @@ async fn connect_and_serve(
     let sender_docker = docker.clone();
     let inbound_systemd = systemd.clone();
     let sender_systemd = systemd.clone();
+
+    // request_id -> the task running that tail. A tail must be cancellable by
+    // LogTailStop and must not survive the session that requested it, so every
+    // entry is aborted when this function returns.
+    let tails: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let inbound_tails = tails.clone();
+    let inbound_docker_logs = docker.clone();
 
     // Sender task: Hello first (fresh snapshot, re-sent on every reconnect so
     // the fleet view self-heals), then a Heartbeat on every tick. It normally
@@ -280,47 +289,111 @@ async fn connect_and_serve(
         loop {
             match inbound.next().await {
                 Some(Ok(frame)) => {
-                    if let Some(server_frame::Payload::Command(cmd)) = frame.payload {
-                        // Verbs run in their own task (loss-tolerant fire-and-forget) so a
-                        // slow stop can't stall the inbound loop or heartbeats.
-                        let stream_id = frame.stream_id;
-                        let docker = inbound_docker.clone();
-                        let systemd = inbound_systemd.clone();
-                        let out = inbound_tx.clone();
-                        tokio::spawn(async move {
-                            let verb = Verb::try_from(cmd.verb).unwrap_or(Verb::Unspecified);
-                            let result = match verb {
-                                Verb::ContainerStart
-                                | Verb::ContainerStop
-                                | Verb::ContainerRestart => {
-                                    docker
-                                        .run_verb(cmd.command_id.clone(), verb, &cmd.target)
-                                        .await
+                    match frame.payload {
+                        Some(server_frame::Payload::Command(cmd)) => {
+                            // Verbs run in their own task (loss-tolerant fire-and-forget) so a
+                            // slow stop can't stall the inbound loop or heartbeats.
+                            let stream_id = frame.stream_id;
+                            let docker = inbound_docker.clone();
+                            let systemd = inbound_systemd.clone();
+                            let out = inbound_tx.clone();
+                            tokio::spawn(async move {
+                                let verb = Verb::try_from(cmd.verb).unwrap_or(Verb::Unspecified);
+                                let result = match verb {
+                                    Verb::ContainerStart
+                                    | Verb::ContainerStop
+                                    | Verb::ContainerRestart => {
+                                        docker
+                                            .run_verb(cmd.command_id.clone(), verb, &cmd.target)
+                                            .await
+                                    }
+                                    Verb::UnitStart | Verb::UnitStop | Verb::UnitRestart => {
+                                        systemd
+                                            .run_verb(cmd.command_id.clone(), verb, &cmd.target)
+                                            .await
+                                    }
+                                    // Always reply: an unanswered command leaves the
+                                    // control plane's bounded wait to time out into a
+                                    // misleading "pending" for a verb that never ran.
+                                    Verb::Unspecified => CommandResult {
+                                        command_id: cmd.command_id.clone(),
+                                        ok: false,
+                                        exit_code: 1,
+                                        message: format!("unsupported verb code {}", cmd.verb),
+                                    },
+                                };
+                                let _ = out
+                                    .send(AgentFrame {
+                                        stream_id,
+                                        payload: Some(agent_frame::Payload::CommandResult(result)),
+                                    })
+                                    .await;
+                            });
+                        }
+                        Some(server_frame::Payload::LogTailStart(req)) => {
+                            let stream_id = frame.stream_id;
+                            let out = inbound_tx.clone();
+                            let docker = inbound_docker_logs.clone();
+                            let tails = inbound_tails.clone();
+                            let request_id = req.request_id.clone();
+                            match crate::logs::parse_source(&req.source) {
+                                Ok(source) => {
+                                    let rid = request_id.clone();
+                                    let handle = tokio::spawn(async move {
+                                        crate::logs::run_tail(
+                                            source,
+                                            req.tail_lines,
+                                            req.follow,
+                                            docker,
+                                            out,
+                                            rid,
+                                            stream_id,
+                                        )
+                                        .await;
+                                    });
+                                    // Abort any tail this request_id was already
+                                    // running before overwriting it: a dropped
+                                    // AbortHandle does NOT abort its task, so a
+                                    // displaced tail would otherwise become
+                                    // unreachable by both LogTailStop and the
+                                    // teardown drain and outlive the session --
+                                    // the exact leak the registry exists to
+                                    // prevent. A correct server won't reuse a
+                                    // request_id, but the agent doesn't trust it
+                                    // to (same posture as parse_source).
+                                    if let Some(old) = tails
+                                        .lock()
+                                        .unwrap()
+                                        .insert(request_id, handle.abort_handle())
+                                    {
+                                        old.abort();
+                                    }
                                 }
-                                Verb::UnitStart | Verb::UnitStop | Verb::UnitRestart => {
-                                    systemd
-                                        .run_verb(cmd.command_id.clone(), verb, &cmd.target)
-                                        .await
+                                Err(e) => {
+                                    // The server validates too, so this is a bug
+                                    // or an attack rather than ordinary input.
+                                    tracing::warn!(source = %req.source, error = ?e, "log tail: rejected source");
+                                    let _ = inbound_tx
+                                        .try_send(AgentFrame {
+                                            stream_id,
+                                            payload: Some(agent_frame::Payload::LogChunk(LogChunk {
+                                                request_id,
+                                                data: Vec::new(),
+                                                eof: true,
+                                            })),
+                                        });
                                 }
-                                // Always reply: an unanswered command leaves the
-                                // control plane's bounded wait to time out into a
-                                // misleading "pending" for a verb that never ran.
-                                Verb::Unspecified => CommandResult {
-                                    command_id: cmd.command_id.clone(),
-                                    ok: false,
-                                    exit_code: 1,
-                                    message: format!("unsupported verb code {}", cmd.verb),
-                                },
-                            };
-                            let _ = out
-                                .send(AgentFrame {
-                                    stream_id,
-                                    payload: Some(agent_frame::Payload::CommandResult(result)),
-                                })
-                                .await;
-                        });
+                            }
+                        }
+                        Some(server_frame::Payload::LogTailStop(stop)) => {
+                            if let Some(handle) =
+                                inbound_tails.lock().unwrap().remove(&stop.request_id)
+                            {
+                                handle.abort();
+                            }
+                        }
+                        _ => {}
                     }
-                    // HelloAck / Ping / other ServerFrames remain no-ops for this slice.
                 }
                 Some(Err(status)) => {
                     return Err(anyhow::anyhow!("session stream error: {status}"));
@@ -337,6 +410,12 @@ async fn connect_and_serve(
     // all); make sure the heartbeat sender isn't left running into the next
     // reconnect attempt.
     sender.abort();
+
+    // A tail belongs to the session that asked for it. Without this an ended
+    // session would leave `journalctl -f` running until the agent restarts.
+    for (_, handle) in tails.lock().unwrap().drain() {
+        handle.abort();
+    }
 
     result
 }

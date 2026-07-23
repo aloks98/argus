@@ -83,6 +83,7 @@ dependencies = [
  "rustls",
  "rustls-pemfile",
  "serde",
+ "serde_json",
  "sysinfo",
  "tokio",
  "tokio-rustls",

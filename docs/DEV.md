@@ -333,3 +333,52 @@ the only name that could hide.
 rows is well past the 40–90 the design assumed, so the filter and failed-first sort
 carry more weight than expected; a human visual pass should confirm the table stays
 readable and the "failed only" checkbox toggles.
+
+## Log tailing slice end-to-end verification (2026-07-23)
+
+Verified live against the real system bus and Docker daemon on the dev host.
+Design of record: `docs/superpowers/specs/2026-07-23-log-tailing-design.md`. The
+agent runs **as root** — journal access for arbitrary units and the Docker
+socket both need it, the same reason the systemd slice's live tests do.
+
+- **Journal snapshot** (`?source=journal:ssh.service&tail=5&follow=false`):
+  returned NDJSON `data:` events — `{"ts","level","ident","msg"}` — followed by
+  an empty `eof` event, and the stream terminated (follow=false is a snapshot).
+- **Docker logs** (`?source=docker:<name>`): streamed the container's output with
+  `level:null` — Docker has no syslog severity, so the viewer renders those
+  lines without a severity colour, as designed.
+- **The lifecycle claim — a tail dies with its viewer.** With a `follow=true`
+  tail open, exactly one `journalctl -u ssh.service` process was running; killing
+  the client left **zero** within 3s. The chain — SSE stream drops →
+  `TailGuard::drop` sends `LogTailStop` + `close_tail` → agent aborts the tailer
+  → `kill_on_drop` SIGKILLs `journalctl` — works end to end. This is the check to
+  re-run if the disconnect handling is ever touched:
+  ```bash
+  curl -sN ".../logs/stream?source=journal:ssh.service&follow=true" & sleep 4; kill %1
+  sleep 3; pgrep -af 'journalctl.*ssh.service' || echo "no orphan — correct"
+  ```
+- **Backpressure — logs are best-effort, heartbeats are not.** A disposable unit
+  running `while true; do echo …; done` was tailed two ways:
+  - *Fast consumer:* ~34,700 lines in 12s, and the machine stayed `online` at
+    every poll with the heartbeat sender never exiting.
+  - *Slow consumer* (reading ~200 B every 0.3 s): the pipeline saturated, the
+    agent dropped batches, and the `—— N lines dropped (stream saturated) ——`
+    marker reached the client — while the machine **still** stayed `online`.
+
+    This is the design's whole justification: a flooding unit degrades to a
+    visible gap rather than starving the heartbeat into the 45s offline sweeper.
+    If a busy log ever flaps a machine offline, the agent's `try_send` path is
+    wrong.
+- **Validation** (server-side, before any tail opens): `%20` (space), a
+  `%2F`-encoded path traversal, a `%2F` in a docker ref, and an unknown scheme
+  each returned **400**. **Offline agent** returned **409**.
+- **Audit:** every open wrote a `logs.open` row with the source as `target_ref`
+  and result `ok`.
+- **Idle flush** (the one bug live testing caught in review): the `#[ignore]`d
+  `live_idle_tail_…` agent test tails a quiet unit and asserts its backlog
+  arrives without waiting for a new line. It passes under `sudo` in ~0.1s and
+  **times out at 5s if the flush ticker is reverted** — a genuine regression
+  guard. CI cannot run it (needs root), so it is part of this manual pass.
+
+The disposable `argus-flood.service` was removed and the host left with no
+`argus-*` units and no failed units.

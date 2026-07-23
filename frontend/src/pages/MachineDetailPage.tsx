@@ -25,6 +25,7 @@ import {
   EmptyState,
 } from "@e412/rnui-react";
 import ContainersCard from "../components/ContainersCard";
+import LogDialog from "../components/LogDialog";
 import SpecStrip from "../components/SpecStrip";
 import type { SpecItem } from "../components/SpecStrip";
 import StatusBadge from "../components/StatusBadge";
@@ -353,6 +354,8 @@ export default function MachineDetailPage() {
           <UnitsCard machineId={id} units={units} />
         </div>
       )}
+
+      <LogDialog />
     </>
   );
 }

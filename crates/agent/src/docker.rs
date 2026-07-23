@@ -89,6 +89,37 @@ impl DockerClient {
             Err(e) => result(command_id, false, &e.to_string()),
         }
     }
+
+    /// A log stream for one container as plain lines. `bollard` yields framed
+    /// stdout/stderr output; both are flattened, because the browser shows one
+    /// interleaved log exactly as `docker logs` does.
+    pub fn logs(
+        &self,
+        id: &str,
+        tail: u32,
+        follow: bool,
+    ) -> anyhow::Result<impl futures_util::Stream<Item = anyhow::Result<String>>> {
+        use bollard::query_parameters::LogsOptionsBuilder;
+        use futures_util::StreamExt;
+        let docker = self
+            .inner
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("docker daemon not available on this host"))?
+            .clone();
+        // `default()`, not `new()` — this is the shape bollard itself uses in
+        // its own `From<LogsOptions>` impl. `.tail` takes a `&str`.
+        let opts = LogsOptionsBuilder::default()
+            .stdout(true)
+            .stderr(true)
+            .follow(follow)
+            .tail(&tail.to_string())
+            .build();
+        // `LogOutput` implements Display, which flattens the stdout/stderr
+        // framing to the message text — the interleaved view `docker logs` gives.
+        Ok(docker
+            .logs(id, Some(opts))
+            .map(|r| r.map(|out| out.to_string()).map_err(anyhow::Error::from)))
+    }
 }
 
 fn result(command_id: String, ok: bool, message: &str) -> CommandResult {

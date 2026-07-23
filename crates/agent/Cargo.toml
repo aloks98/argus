@@ -50,3 +50,9 @@ zbus = { version = "5.12", default-features = false, features = ["tokio"] }
 zvariant = "5.8"
 futures-util = "0.3"
 serde.workspace = true
+
+# Log slice: the journal is read by spawning `journalctl -o json` (linking
+# libsystemd would break the static-musl build, and systemd exposes no stable
+# D-Bus API for journal *content*), so the agent needs a JSON parser to map
+# those records. `tokio`'s "full" features already supply `tokio::process`.
+serde_json.workspace = true
