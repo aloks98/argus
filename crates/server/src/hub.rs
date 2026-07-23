@@ -1,11 +1,12 @@
 //! In-memory session hub (Docker slice): the live agent-connection registry, the
-//! latest Docker snapshot per machine, and the command_id -> waiter correlation
-//! map for synchronous verb results. Shared as an `Arc<Hub>` between the gRPC
-//! surface (which fills it from the Session stream) and the HTTP surface (which
-//! reads snapshots and dispatches verbs). All state is in-memory and re-derived
-//! on reconnect — consistent with the stateless single-replica control plane.
+//! latest Docker and systemd snapshots per machine, and the command_id -> waiter
+//! correlation map for synchronous verb results. Shared as an `Arc<Hub>` between
+//! the gRPC surface (which fills it from the Session stream) and the HTTP surface
+//! (which reads snapshots and dispatches verbs). All state is in-memory and
+//! re-derived on reconnect — consistent with the stateless single-replica control
+//! plane.
 
-use argus_proto::v1::{server_frame, Command, CommandResult, Container, ServerFrame, Verb};
+use argus_proto::v1::{server_frame, Command, CommandResult, Container, ServerFrame, Unit, Verb};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Mutex;
@@ -34,6 +35,7 @@ pub enum DispatchError {
 pub struct Hub {
     conns: Mutex<HashMap<Uuid, ConnHandle>>,
     docker: Mutex<HashMap<Uuid, Vec<Container>>>,
+    systemd: Mutex<HashMap<Uuid, Vec<Unit>>>,
     pending: Mutex<HashMap<String, (Uuid, oneshot::Sender<CommandResult>)>>,
     epoch_counter: AtomicU64,
 }
@@ -80,6 +82,33 @@ impl Hub {
             .get(&machine_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Replace the cached unit snapshot for a machine.
+    pub fn set_systemd(&self, machine_id: Uuid, units: Vec<Unit>) {
+        self.systemd.lock().unwrap().insert(machine_id, units);
+    }
+
+    /// The latest cached unit snapshot for a machine (empty if none reported).
+    pub fn get_systemd(&self, machine_id: Uuid) -> Vec<Unit> {
+        self.systemd
+            .lock()
+            .unwrap()
+            .get(&machine_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// How many of a machine's cached units are in the `failed` state. Counted
+    /// here rather than in the handler so the fleet query stays one cheap read
+    /// under a single lock, and never clones the snapshot.
+    pub fn failed_unit_count(&self, machine_id: Uuid) -> usize {
+        self.systemd
+            .lock()
+            .unwrap()
+            .get(&machine_id)
+            .map(|units| units.iter().filter(|u| u.active_state == "failed").count())
+            .unwrap_or(0)
     }
 
     /// Send a verb down the machine's Session on a fresh non-zero stream_id.
@@ -162,6 +191,16 @@ mod tests {
         }
     }
 
+    fn unit(name: &str, active_state: &str) -> Unit {
+        Unit {
+            name: name.into(),
+            load_state: "loaded".into(),
+            active_state: active_state.into(),
+            sub_state: "dead".into(),
+            description: format!("desc {name}"),
+        }
+    }
+
     #[test]
     fn set_then_get_docker_round_trips_and_defaults_empty() {
         let hub = Hub::new();
@@ -171,6 +210,47 @@ mod tests {
         let got = hub.get_docker(m);
         assert_eq!(got.len(), 1);
         assert_eq!(got[0].id, "a");
+    }
+
+    #[test]
+    fn set_then_get_systemd_round_trips_and_defaults_empty() {
+        let hub = Hub::new();
+        let m = Uuid::new_v4();
+        assert!(hub.get_systemd(m).is_empty());
+        hub.set_systemd(m, vec![unit("nginx.service", "active")]);
+        let got = hub.get_systemd(m);
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].name, "nginx.service");
+    }
+
+    #[test]
+    fn failed_unit_count_counts_only_failed_units() {
+        let hub = Hub::new();
+        let m = Uuid::new_v4();
+        assert_eq!(hub.failed_unit_count(m), 0, "unknown machine reports zero");
+
+        hub.set_systemd(
+            m,
+            vec![
+                unit("a.service", "active"),
+                unit("b.service", "failed"),
+                unit("c.mount", "failed"),
+                unit("d.service", "inactive"),
+            ],
+        );
+        assert_eq!(hub.failed_unit_count(m), 2);
+    }
+
+    #[test]
+    fn a_later_snapshot_replaces_the_earlier_one() {
+        // The agent re-sends a full snapshot every tick and on reconnect; a
+        // resolved failure must not linger in the cache.
+        let hub = Hub::new();
+        let m = Uuid::new_v4();
+        hub.set_systemd(m, vec![unit("b.service", "failed")]);
+        assert_eq!(hub.failed_unit_count(m), 1);
+        hub.set_systemd(m, vec![unit("b.service", "active")]);
+        assert_eq!(hub.failed_unit_count(m), 0);
     }
 
     #[test]

@@ -36,6 +36,22 @@ export function containerTone(state: string): Tone {
   }
 }
 
+/** systemd ActiveState (active|failed|inactive|activating|deactivating|reloading). */
+export function unitTone(activeState: string): Tone {
+  switch (activeState) {
+    case "active":
+      return "ok";
+    case "activating":
+    case "deactivating":
+    case "reloading":
+      return "warn";
+    case "failed":
+      return "fail";
+    default:
+      return "idle";
+  }
+}
+
 /** Text-only status, using the theme-aware *-text variants (readable on white). */
 export const statusTextVariants = cva("font-mono text-xs uppercase tracking-wider", {
   variants: {

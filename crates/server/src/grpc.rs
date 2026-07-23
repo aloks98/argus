@@ -271,6 +271,10 @@ async fn handle_agent_frame(
             hub.set_docker(machine_id, ds.containers);
             repo::touch_last_seen(pool, machine_id).await?;
         }
+        Some(agent_frame::Payload::SystemdState(ss)) => {
+            hub.set_systemd(machine_id, ss.units);
+            repo::touch_last_seen(pool, machine_id).await?;
+        }
         Some(agent_frame::Payload::CommandResult(cr)) => {
             let command_id = cr.command_id.clone();
             match Uuid::parse_str(&command_id) {
@@ -918,6 +922,77 @@ mod tests {
         assert_eq!(cached.len(), 1);
         assert_eq!(cached[0].name, "nginx");
         assert_eq!(cached[0].health, "healthy");
+
+        Ok(())
+    }
+
+    /// A `SystemdState` frame must cache the reported units in the hub, keyed by
+    /// the authenticated machine_id, and refresh `last_seen_at`.
+    #[sqlx::test]
+    async fn handle_agent_frame_systemd_state_caches_snapshot(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id = repo::upsert_machine(
+            &pool,
+            &AgentInfoRow {
+                machine_id: "m-systemd-1".to_string(),
+                hostname: "systemd-host".to_string(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+            },
+        )
+        .await?;
+
+        let hub = crate::hub::Hub::new();
+        let (tx, _rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
+
+        handle_agent_frame(
+            &pool,
+            &hub,
+            machine_id,
+            AgentFrame {
+                stream_id: 0,
+                payload: Some(agent_frame::Payload::SystemdState(
+                    argus_proto::v1::SystemdState {
+                        units: vec![
+                            argus_proto::v1::Unit {
+                                name: "nginx.service".into(),
+                                load_state: "loaded".into(),
+                                active_state: "active".into(),
+                                sub_state: "running".into(),
+                                description: "A high performance web server".into(),
+                            },
+                            argus_proto::v1::Unit {
+                                name: "backup.service".into(),
+                                load_state: "loaded".into(),
+                                active_state: "failed".into(),
+                                sub_state: "failed".into(),
+                                description: "Nightly backup".into(),
+                            },
+                        ],
+                    },
+                )),
+            },
+            &tx,
+        )
+        .await?;
+
+        let cached = hub.get_systemd(machine_id);
+        assert_eq!(cached.len(), 2);
+        assert_eq!(cached[0].name, "nginx.service");
+        assert_eq!(hub.failed_unit_count(machine_id), 1);
+
+        let row = sqlx::query!(
+            "SELECT last_seen_at FROM machines WHERE id = $1",
+            machine_id,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(
+            row.last_seen_at.is_some(),
+            "a SystemdState frame must refresh last_seen_at"
+        );
 
         Ok(())
     }

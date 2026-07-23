@@ -37,6 +37,12 @@ function StatusCell({ row }: { row: FleetRow }) {
     <div className="flex flex-wrap items-center gap-2">
       <StatusBadge tone={machineTone(row.status)} label={row.status} />
       {isReconnecting(row) && <StatusBadge tone="warn" label="reconnecting…" />}
+      {row.failed_units > 0 && (
+        <StatusBadge
+          tone="fail"
+          label={`${row.failed_units} failed unit${row.failed_units === 1 ? "" : "s"}`}
+        />
+      )}
     </div>
   );
 }

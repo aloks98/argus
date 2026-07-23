@@ -9,6 +9,7 @@ import {
   Button,
   ButtonGroup,
   EmptyState,
+  Spinner,
   Table,
   TableBody,
   TableCell,
@@ -16,11 +17,24 @@ import {
   TableHeader,
   TableRow,
 } from "@e412/rnui-react";
-import type { Container } from "../api";
+import type { Container, ContainerAction } from "../api";
 import { useContainerAction } from "../lib/queries";
 import { containerTone } from "../lib/status";
 import AssetTag from "./AssetTag";
 import StatusBadge from "./StatusBadge";
+
+/** Spelled out rather than concatenated — `stop` + "ing" would read "stoping". */
+const VERB_PROGRESS: Record<ContainerAction, string> = {
+  start: "starting…",
+  stop: "stopping…",
+  restart: "restarting…",
+};
+
+const VERB_DONE: Record<ContainerAction, string> = {
+  start: "started",
+  stop: "stopped",
+  restart: "restarted",
+};
 
 export default function ContainersCard({
   machineId,
@@ -44,6 +58,9 @@ export default function ContainersCard({
         </span>
       </div>
 
+      {/* Outcome of the most recent verb — same three-state status line as
+          UnitsCard, including an explicit success, since the snapshot is
+          agent-pushed and the table usually hasn't caught up yet. */}
       {actionError != null && (
         <Alert variant="destructive" className="mb-4">
           <AlertTitle>Action failed</AlertTitle>
@@ -51,7 +68,35 @@ export default function ContainersCard({
         </Alert>
       )}
 
-      <div className="border-2 border-border">
+      {action.data?.status === "pending" && (
+        <Alert variant="warning" className="mb-4">
+          <AlertTitle>Outcome unconfirmed</AlertTitle>
+          <AlertDescription>
+            The command was dispatched, but the agent did not report a result in
+            time. The container may still be starting or stopping — this table
+            refreshes as new state arrives.
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {action.isSuccess && action.data.status !== "pending" && (
+        <Alert variant="success" className="mb-4">
+          <AlertTitle>
+            {action.variables === undefined
+              ? "Done"
+              : `Container ${VERB_DONE[action.variables.action]}`}
+          </AlertTitle>
+          <AlertDescription>
+            The daemon reported the action completed. The row below updates on
+            the next snapshot.
+          </AlertDescription>
+        </Alert>
+      )}
+
+      {/* rnui's `Table` brings its own overflow-x-auto container — see UnitsCard. */}
+      {/* Same height bound + sticky header as UnitsCard so the two tabs behave
+          alike; on a short container list the cap simply never applies. */}
+      <div className="border-2 border-border [&>[data-slot=table-container]]:max-h-[65vh]">
         {containers.length === 0 ? (
           <EmptyState
             title="No containers"
@@ -59,7 +104,7 @@ export default function ContainersCard({
           />
         ) : (
           <Table>
-            <TableHeader>
+            <TableHeader className="sticky top-0 z-10 [&_th]:bg-background">
               <TableRow>
                 <TableHead>Name</TableHead>
                 <TableHead>Image</TableHead>
@@ -92,44 +137,58 @@ export default function ContainersCard({
                     <TableCell className="font-mono text-muted-foreground">
                       {c.status}
                     </TableCell>
-                    <TableCell className="text-right">
-                      <ButtonGroup>
-                        {running ? (
-                          <>
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              disabled={rowBusy}
-                              onClick={() =>
-                                action.mutate({ container: c.id, action: "restart" })
-                              }
-                            >
-                              {rowBusy ? "…" : "Restart"}
-                            </Button>
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              disabled={rowBusy}
-                              onClick={() =>
-                                action.mutate({ container: c.id, action: "stop" })
-                              }
-                            >
-                              {rowBusy ? "…" : "Stop"}
-                            </Button>
-                          </>
-                        ) : (
+                    <TableCell className="whitespace-nowrap text-right">
+                      {/* One loading state for the row rather than a "…" on
+                          every button, and otherwise all three verbs with the
+                          inapplicable ones disabled — kept identical to
+                          UnitsCard so the two tabs behave the same way. */}
+                      {rowBusy ? (
+                        <span
+                          role="status"
+                          className="inline-flex items-center gap-2 font-mono text-[11px] uppercase tracking-widest text-muted-foreground"
+                        >
+                          <Spinner className="size-3.5" />
+                          {action.variables === undefined
+                            ? "working…"
+                            : VERB_PROGRESS[action.variables.action]}
+                        </span>
+                      ) : (
+                        // `ml-auto` rather than the cell's `text-right` —
+                        // ButtonGroup is a block-level `flex w-fit`. See UnitsCard.
+                        <ButtonGroup className="ml-auto justify-end">
                           <Button
                             size="sm"
                             variant="outline"
-                            disabled={rowBusy}
+                            disabled={running}
+                            title={running ? "Already running" : undefined}
                             onClick={() =>
                               action.mutate({ container: c.id, action: "start" })
                             }
                           >
-                            {rowBusy ? "…" : "Start"}
+                            Start
                           </Button>
-                        )}
-                      </ButtonGroup>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            disabled={!running}
+                            title={!running ? "Not running" : undefined}
+                            onClick={() =>
+                              action.mutate({ container: c.id, action: "stop" })
+                            }
+                          >
+                            Stop
+                          </Button>
+                          <Button
+                            size="sm"
+                            variant="outline"
+                            onClick={() =>
+                              action.mutate({ container: c.id, action: "restart" })
+                            }
+                          >
+                            Restart
+                          </Button>
+                        </ButtonGroup>
+                      )}
                     </TableCell>
                   </TableRow>
                 );

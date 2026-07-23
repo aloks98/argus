@@ -3,9 +3,13 @@
 use crate::config::Config;
 use crate::docker::DockerClient;
 use crate::enroll::Identity;
+use crate::systemd::SystemdClient;
 use anyhow::{Context, Result};
 use argus_proto::v1::agent_service_client::AgentServiceClient;
-use argus_proto::v1::{agent_frame, server_frame, AgentFrame, DockerState, Heartbeat, Hello, Verb};
+use argus_proto::v1::{
+    agent_frame, server_frame, AgentFrame, CommandResult, DockerState, Heartbeat, Hello,
+    SystemdState, Verb,
+};
 use rand::Rng;
 use std::time::Duration;
 use tokio::sync::mpsc;
@@ -39,8 +43,16 @@ pub async fn run(cfg: &Config, identity: Identity) -> Result<()> {
     let docker = DockerClient::connect();
     let mut attempt = 0u32;
     loop {
+        // Re-dialed fresh on every attempt (unlike `docker`, which is dialed
+        // once above): a `zbus::Connection` does not self-heal. If dbus-daemon
+        // restarts, a client dialed before this loop would keep `inner: Some`
+        // while every call quietly errors, so `list_units()` would report an
+        // empty list forever -- rendering in the UI as "nothing is wrong on
+        // this host". Bollard doesn't share this failure mode: it re-dials its
+        // unix socket per request, so `docker` is safe to hold across attempts.
+        let systemd = SystemdClient::connect().await;
         let started = tokio::time::Instant::now();
-        let outcome = connect_and_serve(cfg, &identity, &docker).await;
+        let outcome = connect_and_serve(cfg, &identity, &docker, &systemd).await;
         let lasted = started.elapsed();
 
         // A session that stayed up a while was healthy -> reset. A fast
@@ -74,7 +86,12 @@ fn should_reset_backoff(outcome_ok: bool, lasted: Duration) -> bool {
 /// off accordingly. `Ok(())` means the session was established and later
 /// ended cleanly (server closed its side); `Err` means the connect itself
 /// failed or the stream errored.
-async fn connect_and_serve(cfg: &Config, identity: &Identity, docker: &DockerClient) -> Result<()> {
+async fn connect_and_serve(
+    cfg: &Config,
+    identity: &Identity,
+    docker: &DockerClient,
+    systemd: &SystemdClient,
+) -> Result<()> {
     let tls = ClientTlsConfig::new()
         .ca_certificate(Certificate::from_pem(&identity.ca_cert_pem))
         .identity(tonic::transport::Identity::from_pem(
@@ -97,6 +114,8 @@ async fn connect_and_serve(cfg: &Config, identity: &Identity, docker: &DockerCli
     let inbound_tx = tx.clone();
     let inbound_docker = docker.clone();
     let sender_docker = docker.clone();
+    let inbound_systemd = systemd.clone();
+    let sender_systemd = systemd.clone();
 
     // Sender task: Hello first (fresh snapshot, re-sent on every reconnect so
     // the fleet view self-heals), then a Heartbeat on every tick. It normally
@@ -140,6 +159,24 @@ async fn connect_and_serve(cfg: &Config, identity: &Identity, docker: &DockerCli
             .is_err()
         {
             return;
+        }
+
+        // Initial systemd snapshot alongside the Docker one, so the Units tab
+        // populates promptly rather than a full tick later. `None` means
+        // collection failed (no bus, a query error, or a timeout); skip the
+        // send so the control plane keeps whatever snapshot it already has
+        // instead of being told the host has no units at all.
+        if let Some(units) = sender_systemd.list_units().await {
+            if tx
+                .send(AgentFrame {
+                    stream_id: argus_common::CONTROL_STREAM_ID,
+                    payload: Some(agent_frame::Payload::SystemdState(SystemdState { units })),
+                })
+                .await
+                .is_err()
+            {
+                return;
+            }
         }
 
         let start = tokio::time::Instant::now();
@@ -211,6 +248,20 @@ async fn connect_and_serve(cfg: &Config, identity: &Identity, docker: &DockerCli
                 tracing::debug!(agent_id = %sender_agent_id, "session: docker sender exiting, channel closed");
                 return;
             }
+
+            if let Some(units) = sender_systemd.list_units().await {
+                if tx
+                    .send(AgentFrame {
+                        stream_id: argus_common::CONTROL_STREAM_ID,
+                        payload: Some(agent_frame::Payload::SystemdState(SystemdState { units })),
+                    })
+                    .await
+                    .is_err()
+                {
+                    tracing::debug!(agent_id = %sender_agent_id, "session: systemd sender exiting, channel closed");
+                    return;
+                }
+            }
         }
     });
 
@@ -234,12 +285,33 @@ async fn connect_and_serve(cfg: &Config, identity: &Identity, docker: &DockerCli
                         // slow stop can't stall the inbound loop or heartbeats.
                         let stream_id = frame.stream_id;
                         let docker = inbound_docker.clone();
+                        let systemd = inbound_systemd.clone();
                         let out = inbound_tx.clone();
                         tokio::spawn(async move {
                             let verb = Verb::try_from(cmd.verb).unwrap_or(Verb::Unspecified);
-                            let result = docker
-                                .run_verb(cmd.command_id.clone(), verb, &cmd.target)
-                                .await;
+                            let result = match verb {
+                                Verb::ContainerStart
+                                | Verb::ContainerStop
+                                | Verb::ContainerRestart => {
+                                    docker
+                                        .run_verb(cmd.command_id.clone(), verb, &cmd.target)
+                                        .await
+                                }
+                                Verb::UnitStart | Verb::UnitStop | Verb::UnitRestart => {
+                                    systemd
+                                        .run_verb(cmd.command_id.clone(), verb, &cmd.target)
+                                        .await
+                                }
+                                // Always reply: an unanswered command leaves the
+                                // control plane's bounded wait to time out into a
+                                // misleading "pending" for a verb that never ran.
+                                Verb::Unspecified => CommandResult {
+                                    command_id: cmd.command_id.clone(),
+                                    ok: false,
+                                    exit_code: 1,
+                                    message: format!("unsupported verb code {}", cmd.verb),
+                                },
+                            };
                             let _ = out
                                 .send(AgentFrame {
                                     stream_id,

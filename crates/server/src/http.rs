@@ -56,6 +56,11 @@ fn router(state: AppState) -> Router {
             "/api/machines/{id}/docker/{container}/{action}",
             post(container_action),
         )
+        .route("/api/machines/{id}/systemd", get(machine_systemd))
+        .route(
+            "/api/machines/{id}/units/{unit}/{action}",
+            post(unit_action),
+        )
         // TODO: nest remaining /api routes (logs SSE, terminal WS,
         // events SSE, audit, enroll-tokens) and /auth OIDC routes here (PRD
         // §9.1).
@@ -83,6 +88,16 @@ struct FleetRow {
     tags: Vec<String>,
     cpu_pct: Option<f32>,
     mem_pct: Option<f64>,
+    /// Count of units in the `failed` state in the machine's **last reported**
+    /// Hub snapshot. `0` when nothing has ever been reported.
+    ///
+    /// Snapshots are NOT evicted when an agent disconnects (`Hub::unregister`
+    /// only clears the connection registry), so for an offline machine this is
+    /// the last known value and may be arbitrarily stale — a machine that goes
+    /// offline with 3 failed units keeps reporting 3. The row pairs it with the
+    /// machine's own `status`, so the staleness is visible rather than implied,
+    /// but do not read this as a live count for a machine that isn't `online`.
+    failed_units: usize,
     spark_cpu: Vec<f32>,
     spark_mem: Vec<f64>,
 }
@@ -139,6 +154,7 @@ async fn fleet(State(state): State<AppState>) -> Result<Json<Vec<FleetRow>>, Sta
             };
             let cpu_pct = spark_cpu.last().copied();
             let mem_pct = spark_mem.last().copied();
+            let failed_units = state.hub.failed_unit_count(r.id);
 
             FleetRow {
                 id: r.id,
@@ -150,6 +166,7 @@ async fn fleet(State(state): State<AppState>) -> Result<Json<Vec<FleetRow>>, Sta
                 tags: r.tags,
                 cpu_pct,
                 mem_pct,
+                failed_units,
                 spark_cpu,
                 spark_mem,
             }
@@ -319,6 +336,39 @@ async fn machine_docker(
     Json(containers.into_iter().map(ContainerDto::from).collect())
 }
 
+/// One unit row for the detail page's units panel, mirroring the proto `Unit`
+/// (which isn't `Serialize`).
+#[derive(serde::Serialize)]
+struct UnitDto {
+    name: String,
+    load_state: String,
+    active_state: String,
+    sub_state: String,
+    description: String,
+}
+
+impl From<argus_proto::v1::Unit> for UnitDto {
+    fn from(u: argus_proto::v1::Unit) -> Self {
+        UnitDto {
+            name: u.name,
+            load_state: u.load_state,
+            active_state: u.active_state,
+            sub_state: u.sub_state,
+            description: u.description,
+        }
+    }
+}
+
+/// `GET /api/machines/{id}/systemd` — the machine's latest cached unit list
+/// (empty when the agent hasn't reported / has no systemd).
+async fn machine_systemd(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+) -> Json<Vec<UnitDto>> {
+    let units = state.hub.get_systemd(id);
+    Json(units.into_iter().map(UnitDto::from).collect())
+}
+
 /// The bounded wait for a dispatched verb's result.
 const VERB_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -338,25 +388,65 @@ async fn container_action(
     State(state): State<AppState>,
     Path((id, container, action)): Path<(Uuid, String, String)>,
 ) -> Response {
-    run_container_verb(&state, id, &container, &action, VERB_TIMEOUT).await
-}
-
-/// Testable core (timeout injected so tests don't wait the full 10s).
-async fn run_container_verb(
-    state: &AppState,
-    id: Uuid,
-    container: &str,
-    action: &str,
-    timeout: Duration,
-) -> Response {
-    let verb = match action {
+    let verb = match action.as_str() {
         "start" => Verb::ContainerStart,
         "stop" => Verb::ContainerStop,
         "restart" => Verb::ContainerRestart,
         _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),
     };
+    run_verb(
+        &state,
+        id,
+        verb,
+        &container,
+        &format!("container.{action}"),
+        VERB_TIMEOUT,
+    )
+    .await
+}
+
+/// `POST /api/machines/{id}/units/{unit}/{action}` — dispatch a systemd unit
+/// verb and wait up to `VERB_TIMEOUT` for the agent's result.
+async fn unit_action(
+    State(state): State<AppState>,
+    Path((id, unit, action)): Path<(Uuid, String, String)>,
+) -> Response {
+    let verb = match action.as_str() {
+        "start" => Verb::UnitStart,
+        "stop" => Verb::UnitStop,
+        "restart" => Verb::UnitRestart,
+        _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),
+    };
+    // A systemd unit name is never empty and never contains '/'. Reject rather
+    // than forward something an agent would only fail on anyway. (The empty case
+    // is unreachable through the router — matchit won't bind an empty path
+    // segment — but is kept so the guard holds for any direct caller.)
+    if unit.is_empty() || unit.contains('/') {
+        return (StatusCode::BAD_REQUEST, "invalid unit name").into_response();
+    }
+    run_verb(
+        &state,
+        id,
+        verb,
+        &unit,
+        &format!("unit.{action}"),
+        VERB_TIMEOUT,
+    )
+    .await
+}
+
+/// The shared verb pipeline for every verb family: audit-before-dispatch (fail
+/// closed), dispatch, then a bounded wait for the agent's result. `timeout` is
+/// injected so tests don't wait the full 10s.
+async fn run_verb(
+    state: &AppState,
+    id: Uuid,
+    verb: Verb,
+    target: &str,
+    audit_action: &str,
+    timeout: Duration,
+) -> Response {
     let actor = "anonymous";
-    let audit_action = format!("container.{action}");
     let command_id = Uuid::new_v4();
     let cid = command_id.to_string();
 
@@ -365,13 +455,22 @@ async fn run_container_verb(
     // CommandResult -- whose grpc-side UPDATE (repo::update_command_result) is
     // keyed by command_id and would otherwise silently no-op against a
     // not-yet-inserted row, freezing it at "dispatched" forever.
+    //
+    // NOTE: "dispatched" is NOT a guaranteed-terminal state. The agent runs a
+    // verb in a spawned task holding a clone of the *current* session's sender;
+    // if that session ends before the job finishes -- and a unit verb may now
+    // take up to 90s -- the CommandResult send is dropped and nothing ever
+    // resolves this row. Reconciling stale `dispatched` rows to `unknown` is a
+    // scheduled, survives-restart job, which CLAUDE.md gates behind the
+    // apalis-vs-pgmq validation, so it is deliberately deferred rather than
+    // hand-rolled here. Do not assume a row's result is final.
     let rx = state.hub.register_pending(cid.clone(), id);
     if let Err(e) = repo::audit_command(
         &state.pool,
         actor,
-        &audit_action,
+        audit_action,
         Some(id),
-        container,
+        target,
         command_id,
         "dispatched",
     )
@@ -380,7 +479,7 @@ async fn run_container_verb(
         // Fail closed: a verb must never execute unaudited (CLAUDE.md). If the
         // dispatched audit write fails, abandon the waiter and do NOT dispatch.
         state.hub.abandon_pending(&cid);
-        tracing::error!(error = %e, "container verb: dispatched audit write failed; not dispatching");
+        tracing::error!(error = %e, action = audit_action, "verb: dispatched audit write failed; not dispatching");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
             "failed to record audit entry",
@@ -390,13 +489,7 @@ async fn run_container_verb(
 
     if let Err(DispatchError::NotConnected) = state
         .hub
-        .send_command(
-            id,
-            cid.clone(),
-            verb,
-            container.to_string(),
-            actor.to_string(),
-        )
+        .send_command(id, cid.clone(), verb, target.to_string(), actor.to_string())
         .await
     {
         state.hub.abandon_pending(&cid);
@@ -406,7 +499,7 @@ async fn run_container_verb(
         // delivered), so it does not conflict with that arm being the sole
         // writer of a real ok/error result.
         if let Err(e) = repo::update_command_result(&state.pool, command_id, id, "denied").await {
-            tracing::error!(error = %e, "container verb: denied audit update failed");
+            tracing::error!(error = %e, "verb: denied audit update failed");
         }
         return (StatusCode::CONFLICT, "agent not connected").into_response();
     }
@@ -705,11 +798,12 @@ mod tests {
         .id;
 
         let (state, _hub) = app_state_with_hub(pool.clone());
-        let resp = run_container_verb(
+        let resp = run_verb(
             &state,
             machine_id,
+            Verb::ContainerRestart,
             "web",
-            "restart",
+            "container.restart",
             Duration::from_millis(200),
         )
         .await;
@@ -759,8 +853,15 @@ mod tests {
             }
         });
 
-        let resp =
-            run_container_verb(&state, machine_id, "web", "start", Duration::from_secs(5)).await;
+        let resp = run_verb(
+            &state,
+            machine_id,
+            Verb::ContainerStart,
+            "web",
+            "container.start",
+            Duration::from_secs(5),
+        )
+        .await;
         assert_eq!(resp.status(), StatusCode::OK);
         let body = to_bytes(resp.into_body(), usize::MAX).await?;
         let v: serde_json::Value = serde_json::from_slice(&body)?;
@@ -784,11 +885,12 @@ mod tests {
         let (tx, _rx_never) = mpsc::channel::<Result<ServerFrame, Status>>(4);
         hub.register(machine_id, tx);
 
-        let resp = run_container_verb(
+        let resp = run_verb(
             &state,
             machine_id,
+            Verb::ContainerStop,
             "web",
-            "stop",
+            "container.stop",
             Duration::from_millis(150),
         )
         .await;
@@ -814,8 +916,15 @@ mod tests {
         let (tx, mut rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
         hub.register(ghost_id, tx);
 
-        let resp =
-            run_container_verb(&state, ghost_id, "web", "start", Duration::from_millis(200)).await;
+        let resp = run_verb(
+            &state,
+            ghost_id,
+            Verb::ContainerStart,
+            "web",
+            "container.start",
+            Duration::from_millis(200),
+        )
+        .await;
         assert_eq!(
             resp.status(),
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -830,17 +939,264 @@ mod tests {
     }
 
     #[sqlx::test]
-    async fn verb_with_unknown_action_returns_400(pool: PgPool) -> anyhow::Result<()> {
+    async fn container_action_with_unknown_action_returns_400(pool: PgPool) -> anyhow::Result<()> {
         let (state, _hub) = app_state_with_hub(pool);
-        let resp = run_container_verb(
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/machines/{}/docker/web/obliterate",
+                        Uuid::new_v4()
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn get_systemd_returns_cached_snapshot(pool: PgPool) -> anyhow::Result<()> {
+        let (state, hub) = app_state_with_hub(pool);
+        let id = Uuid::new_v4();
+
+        // empty before any report
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/machines/{id}/systemd"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await?;
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+        assert!(rows.is_empty());
+
+        // populate the cache, then it shows up
+        hub.set_systemd(
+            id,
+            vec![argus_proto::v1::Unit {
+                name: "nginx.service".into(),
+                load_state: "loaded".into(),
+                active_state: "failed".into(),
+                sub_state: "failed".into(),
+                description: "A high performance web server".into(),
+            }],
+        );
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!("/api/machines/{id}/systemd"))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let body = to_bytes(resp.into_body(), usize::MAX).await?;
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["name"], "nginx.service");
+        assert_eq!(rows[0]["active_state"], "failed");
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn unit_verb_on_offline_agent_returns_409_and_audits_denied(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let machine_id: Uuid = sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname, status) VALUES ('unit-offline', 'h', 'offline') RETURNING id"
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+
+        let (state, _hub) = app_state_with_hub(pool.clone());
+        let resp = run_verb(
             &state,
-            Uuid::new_v4(),
-            "web",
-            "obliterate",
-            Duration::from_millis(100),
+            machine_id,
+            Verb::UnitRestart,
+            "nginx.service",
+            "unit.restart",
+            Duration::from_millis(200),
         )
         .await;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        let row = sqlx::query!(
+            "SELECT result, target_ref FROM audit_log WHERE machine_id = $1 AND action = 'unit.restart'",
+            machine_id,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.result.as_deref(), Some("denied"));
+        assert_eq!(row.target_ref.as_deref(), Some("nginx.service"));
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn unit_verb_with_connected_agent_completes_ok(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id: Uuid = sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname, status) VALUES ('unit-online', 'h', 'online') RETURNING id"
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+
+        let (state, hub) = app_state_with_hub(pool.clone());
+
+        // Fake agent: echo a success CommandResult, and record the verb it saw so
+        // we can assert a UNIT verb (not a container one) went down the wire.
+        let (tx, mut rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
+        hub.register(machine_id, tx);
+        let hub2 = hub.clone();
+        let (seen_tx, seen_rx) = tokio::sync::oneshot::channel::<i32>();
+        tokio::spawn(async move {
+            let mut seen_tx = Some(seen_tx);
+            while let Some(Ok(frame)) = rx.recv().await {
+                if let Some(server_frame::Payload::Command(cmd)) = frame.payload {
+                    if let Some(s) = seen_tx.take() {
+                        let _ = s.send(cmd.verb);
+                    }
+                    hub2.complete(
+                        &cmd.command_id.clone(),
+                        machine_id,
+                        CommandResult {
+                            command_id: cmd.command_id,
+                            ok: true,
+                            exit_code: 0,
+                            message: "done".into(),
+                        },
+                    );
+                }
+            }
+        });
+
+        let resp = run_verb(
+            &state,
+            machine_id,
+            Verb::UnitStart,
+            "nginx.service",
+            "unit.start",
+            Duration::from_secs(5),
+        )
+        .await;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(v["ok"], true);
+        assert_eq!(v["status"], "completed");
+
+        let seen = seen_rx.await?;
+        assert_eq!(
+            seen,
+            Verb::UnitStart as i32,
+            "a UNIT verb must ride the wire"
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn unit_action_rejects_a_malformed_unit_name(pool: PgPool) -> anyhow::Result<()> {
+        let (state, _hub) = app_state_with_hub(pool);
+        let app = router(state);
+
+        // A unit name is never empty and never contains '/'. `%2F` decodes to a
+        // slash inside the path segment, which must not be forwarded to an agent.
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/machines/{}/units/{}/start",
+                        Uuid::new_v4(),
+                        "..%2Fetc%2Fpasswd"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        // Assert on the body too: axum's own Path-extractor rejection is also a
+        // 400, so the status alone wouldn't prove OUR validation is what fired.
+        let body = to_bytes(resp.into_body(), usize::MAX).await?;
+        assert_eq!(&body[..], b"invalid unit name");
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn unit_action_with_unknown_action_returns_400(pool: PgPool) -> anyhow::Result<()> {
+        let (state, _hub) = app_state_with_hub(pool);
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!(
+                        "/api/machines/{}/units/nginx.service/obliterate",
+                        Uuid::new_v4()
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn fleet_reports_failed_unit_counts_from_the_hub(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id: Uuid = sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname, status) VALUES ('fleet-failed', 'fh', 'online') RETURNING id"
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+
+        let (state, hub) = app_state_with_hub(pool);
+
+        // No snapshot yet -> 0, never null.
+        let app = router(state.clone());
+        let resp = app
+            .oneshot(Request::builder().uri("/api/fleet").body(Body::empty())?)
+            .await?;
+        let body = to_bytes(resp.into_body(), usize::MAX).await?;
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+        assert_eq!(rows[0]["failed_units"], 0);
+
+        hub.set_systemd(
+            machine_id,
+            vec![
+                argus_proto::v1::Unit {
+                    name: "ok.service".into(),
+                    load_state: "loaded".into(),
+                    active_state: "active".into(),
+                    sub_state: "running".into(),
+                    description: String::new(),
+                },
+                argus_proto::v1::Unit {
+                    name: "bad.service".into(),
+                    load_state: "loaded".into(),
+                    active_state: "failed".into(),
+                    sub_state: "failed".into(),
+                    description: String::new(),
+                },
+            ],
+        );
+
+        let app = router(state);
+        let resp = app
+            .oneshot(Request::builder().uri("/api/fleet").body(Body::empty())?)
+            .await?;
+        let body = to_bytes(resp.into_body(), usize::MAX).await?;
+        let rows: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
+        assert_eq!(rows[0]["failed_units"], 1);
+
         Ok(())
     }
 }

@@ -14,6 +14,7 @@ mod identity;
 mod info;
 mod metrics;
 mod session;
+mod systemd;
 
 use anyhow::Result;
 

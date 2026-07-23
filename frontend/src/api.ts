@@ -11,6 +11,7 @@ export type FleetRow = {
   tags: string[];
   cpu_pct: number | null;
   mem_pct: number | null;
+  failed_units: number;
   spark_cpu: number[];
   spark_mem: number[];
 };
@@ -89,17 +90,64 @@ export type VerbResult = {
   status: string;
 };
 
+/**
+ * POST a verb and resolve only if it actually succeeded.
+ *
+ * The failure of a verb that *reached* the agent lives in the body, not the
+ * status line: the control plane answers HTTP 200 with `ok:false` (e.g.
+ * `"systemd job result: failed"` for a unit whose ExecStart died). Checking
+ * only `r.ok` would render that identically to a success — which would throw
+ * away the whole reason the agent waits for the real job outcome instead of
+ * reporting that systemd merely accepted the request.
+ *
+ * So: reject on `ok:false` (the message is the agent's own), and leave
+ * `ok:null` — the 202 "pending" case, where the agent hasn't answered within
+ * the control plane's wait — resolved, so callers can render it as the
+ * distinct *unknown* it is rather than as either outcome.
+ */
+async function postVerb(url: string): Promise<VerbResult> {
+  const r = await fetch(url, { method: "POST" });
+  // 4xx/5xx (e.g. 409 agent offline) carry no VerbResult body.
+  if (!r.ok) throw new Error(`action failed: ${r.status}`);
+  const result: VerbResult = await r.json();
+  if (result.ok === false) {
+    throw new Error(result.message ?? "the verb failed on the agent");
+  }
+  return result;
+}
+
 export async function containerAction(
   id: string,
   container: string,
   action: ContainerAction,
 ): Promise<VerbResult> {
-  const r = await fetch(
+  return postVerb(
     `/api/machines/${id}/docker/${encodeURIComponent(container)}/${action}`,
-    { method: "POST" },
   );
-  // 200 (completed) and 202 (pending) both carry a VerbResult body; 4xx/5xx
-  // (e.g. 409 agent offline) are surfaced as errors.
-  if (!r.ok) throw new Error(`action failed: ${r.status}`);
+}
+
+export type Unit = {
+  name: string;
+  load_state: string;
+  active_state: string;
+  sub_state: string;
+  description: string;
+};
+
+export async function getSystemd(id: string): Promise<Unit[]> {
+  const r = await fetch(`/api/machines/${id}/systemd`);
+  if (!r.ok) throw new Error(`systemd ${r.status}`);
   return r.json();
+}
+
+export type UnitAction = "start" | "stop" | "restart";
+
+export async function unitAction(
+  id: string,
+  unit: string,
+  action: UnitAction,
+): Promise<VerbResult> {
+  return postVerb(
+    `/api/machines/${id}/units/${encodeURIComponent(unit)}/${action}`,
+  );
 }

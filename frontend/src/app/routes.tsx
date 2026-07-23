@@ -1,4 +1,5 @@
 import type { ReactElement } from "react";
+import { Server, type LucideIcon } from "lucide-react";
 import FleetPage from "../pages/FleetPage";
 import MachineDetailPage from "../pages/MachineDetailPage";
 
@@ -17,6 +18,12 @@ export type AppRoute = {
     label: string;
     /** Sidebar group heading; entries sharing a section render under one heading. */
     section: string;
+    /**
+     * Shown beside the label, and it is ALL that shows when the sidebar is
+     * collapsed to its icon rail — so every nav entry needs one or it collapses
+     * to a blank square. Required, not optional, for exactly that reason.
+     */
+    icon: LucideIcon;
   };
 };
 
@@ -24,7 +31,7 @@ export const ROUTES: AppRoute[] = [
   {
     path: "/machines",
     element: <FleetPage />,
-    nav: { label: "Machines", section: "Fleet" },
+    nav: { label: "Machines", section: "Fleet", icon: Server },
   },
   { path: "/machines/:id", element: <MachineDetailPage /> },
 ];

@@ -230,3 +230,106 @@ by colour, so a text carrier has to survive on that page).
 **Not yet verified:** fleet-page density at a realistic ~40-guest fleet (≈80 uPlot
 sparkline instances) — the dev fleet has one machine, so there is no evidence
 either way; measure it when the fleet grows.
+
+## Systemd slice end-to-end verification (2026-07-23)
+
+Verified manually against the live system bus on the dev host (Task 12 of the
+systemd slice). The agent was run **as root** so polkit permits unit verbs — as
+an unprivileged user the bus returns `InteractiveAuthorizationRequired`, which is
+also why the `#[ignore]`d live-bus tests in `crates/agent/src/systemd.rs` need
+`sudo`. Two throwaway units were the *only* verb targets; no real host unit was
+started, stopped, or restarted at any point.
+
+```bash
+# The two disposable targets (removed again afterwards):
+sudo tee /etc/systemd/system/argus-verify-test.service <<'UNIT'
+[Unit]
+Description=Argus systemd slice verification target
+[Service]
+Type=simple
+ExecStart=/bin/sleep infinity
+UNIT
+sudo tee /etc/systemd/system/argus-verify-fail.service <<'UNIT'
+[Unit]
+Description=Argus systemd slice failure-path target
+[Service]
+Type=oneshot
+ExecStart=/bin/false
+UNIT
+sudo systemctl daemon-reload
+```
+
+- **State:** with the agent connected (`machine_id=56c5ab05-…`, `hostname=fatman`,
+  `online`), `GET /api/machines/:id/systemd` returned **127 units**, every one a
+  `*.service`, none `failed` on a healthy host. The failed-unit query contributes
+  nothing extra until something actually fails, which is the intended shape.
+- **Verbs (only against `argus-verify-test.service`):** each POST returned HTTP 200
+  with `{"ok":true,"message":"done","status":"completed"}` and flipped the *real*
+  unit state:
+  - `…/start`   → `systemctl is-active` = `active`.
+  - `…/restart` → `active` (fresh).
+  - `…/stop`    → `inactive`.
+- **The failure path — the assertion this slice exists for.** `argus-verify-fail.service`
+  has `ExecStart=/bin/false`, so systemd *accepts* the start job and the unit then
+  fails. `…/start` returned `{"ok":false,"message":"systemd job result: failed"}`.
+  A naive enqueue-and-return implementation would have reported `ok:true` here.
+  This is the check to re-run if the `JobRemoved` correlation is ever touched.
+- **Self-preservation guard.** Verified in two halves, because the obvious direct
+  test is destructive:
+  - *The refusal path fires.* Before the `GetUnitByPID` fix below — when
+    `self_unit` was the hard-coded `argus-agent.service` fallback — both
+    `…/units/argus-agent.service/stop` and the bare `…/units/argus-agent/stop`
+    returned
+    `{"ok":false,"message":"refusing to operate on the unit hosting this agent"}`,
+    and the agent stayed `online`. That exercises the live guard code path
+    including bare-name normalisation.
+  - *It consumes the discovered value, not the fallback.* After the fix,
+    `self_unit` resolves to `session-9.scope` and that same
+    `…/units/argus-agent.service/stop` is **no longer** refused — it reaches
+    systemd and returns `NoSuchUnit`.
+  - **Not tested:** a `stop` against the real discovered unit while the agent is
+    running under it. On this host that unit is the shell session scope, so the
+    test would kill the agent and the session — and if the guard were broken,
+    that is precisely what would happen. The positive case rests on the two
+    observations above plus the `is_self_unit` unit tests (exact normalised
+    equality, including the `argus-agent-proxy.service` lookalike). Re-check it
+    on a host where the agent runs under a disposable unit if you want the
+    direct proof.
+- **Validation:** a `%2F`-encoded unit name → HTTP 400 (`invalid unit name`); an
+  unknown action → HTTP 400.
+- **Audit trail:** `audit_log` gained six `unit.*` rows — `unit.start` /
+  `unit.restart` / `unit.stop` with `result = ok`, and `result = error` for the
+  failing unit and both refused self-guard attempts — each `actor = anonymous`
+  with `target_ref` = the unit name.
+- **Fleet rollup:** once `argus-verify-fail.service` was left in `failed`, the next
+  15s snapshot moved `/api/fleet`'s `failed_units` from `0` to `1`, and
+  `/api/machines/:id/systemd` listed the unit as `failed/failed`.
+- **Offline path:** with the agent stopped, a `…/restart` POST returned **HTTP 409**
+  (`agent not connected`) and wrote a `unit.restart` row with `result = denied` —
+  the verb was never dispatched.
+
+### One bug this pass caught that nothing static could
+
+`#[proxy] fn get_unit_by_pid` makes zbus derive the D-Bus method name
+`GetUnitByPid`, but systemd's method is **`GetUnitByPID`**. Every call failed with
+`UnknownMethod`, so `discover_self_unit` fell back to the compiled-in
+`argus-agent.service` on *every* host — silently reinstating exactly the
+hard-coded assumption the runtime discovery was added to remove. It looked like it
+worked, because the guard still refused *something*.
+
+It was invisible to `cargo test`, `clippy`, and the type system: the unit tests
+inject `self_unit` directly, and the fallback made failure indistinguishable from
+success apart from one `warn!` line. Fixed with `#[zbus(name = "GetUnitByPID")]`.
+After the fix `self_unit` resolves to the true hosting unit (`session-9.scope`
+when the agent is run from a shell), and `argus-agent.service` — previously
+guard-refused via the fallback — reaches systemd and returns `NoSuchUnit`.
+
+**Lesson worth keeping:** zbus's snake_case → CamelCase derivation is wrong for any
+D-Bus method with non-standard capitalisation. Every *other* proxy method here was
+exercised live (unit listing, all three verbs, `JobRemoved`), so `GetUnitByPID` was
+the only name that could hide.
+
+**Not yet verified:** the Units tab at a realistic unit count in a browser — 127
+rows is well past the 40–90 the design assumed, so the filter and failed-first sort
+carry more weight than expected; a human visual pass should confirm the table stays
+readable and the "failed only" checkbox toggles.

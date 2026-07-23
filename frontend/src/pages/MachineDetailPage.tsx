@@ -4,7 +4,7 @@
 // for the selected time range, tabbed against the container list. Mirrors
 // FleetPage's polling idioms.
 import { useState } from "react";
-import { Link, useParams } from "react-router-dom";
+import { Link, useParams, useSearchParams } from "react-router-dom";
 import {
   Alert,
   AlertDescription,
@@ -31,6 +31,7 @@ import StatusBadge from "../components/StatusBadge";
 import Tabs from "../components/Tabs";
 import TimeSeriesChart from "../components/TimeSeriesChart";
 import type { ChartSeries } from "../components/TimeSeriesChart";
+import UnitsCard from "../components/UnitsCard";
 import { formatBytesPerSec, formatRelative } from "../lib/format";
 import {
   buildCpuSeries,
@@ -38,11 +39,19 @@ import {
   buildMemSeries,
   buildNetRateSeries,
 } from "../lib/metrics";
-import { useDocker, useMachine, useMetrics } from "../lib/queries";
+import { useDocker, useMachine, useMetrics, useSystemd } from "../lib/queries";
 import type { Range } from "../lib/queries";
 import { machineTone } from "../lib/status";
 
 const RANGES: readonly Range[] = ["1h", "6h", "24h"];
+
+/** Declared once so the tab strip and the `?tab=` URL guard can't drift apart. */
+const TABS: { key: string; label: string }[] = [
+  { key: "overview", label: "Overview" },
+  { key: "containers", label: "Containers" },
+  { key: "units", label: "Units" },
+];
+const TAB_KEYS: readonly string[] = TABS.map((t) => t.key);
 
 // uPlot wants numeric x values in seconds, not ms and not date strings.
 const toSecs = (points: { ts: string }[]) => points.map((p) => Date.parse(p.ts) / 1000);
@@ -91,18 +100,37 @@ function MetricChartCard({
 export default function MachineDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [range, setRange] = useState<Range>("1h");
-  const [tab, setTab] = useState("overview");
+
+  // The active tab lives in the URL (`?tab=units`) rather than component state,
+  // so a reload keeps the tab and a link to "the units on this box" is
+  // shareable. `replace` because switching tabs isn't a navigation step worth
+  // stacking — Back should return to wherever you came from, not walk you back
+  // through each tab you looked at.
+  const [searchParams, setSearchParams] = useSearchParams();
+  // Fall back for an unknown value too, not just a missing one: `?tab=typo`
+  // would otherwise select no tab and render no panel — a blank page from a
+  // hand-edited URL.
+  const requestedTab = searchParams.get("tab");
+  const tab = TAB_KEYS.includes(requestedTab ?? "") ? (requestedTab as string) : "overview";
+  const setTab = (key: string) => {
+    const next = new URLSearchParams(searchParams);
+    next.set("tab", key);
+    setSearchParams(next, { replace: true });
+  };
 
   const machineQuery = useMachine(id as string);
   const metricsQuery = useMetrics(id as string, range);
   const dockerQuery = useDocker(id as string);
+  const systemdQuery = useSystemd(id as string);
 
   const machine = machineQuery.data ?? null;
   const metrics = metricsQuery.data ?? [];
   const containers = dockerQuery.data ?? [];
+  const units = systemdQuery.data ?? [];
   const isPending = machineQuery.isPending;
   const notFound = machineQuery.error?.message === "machine 404";
-  const error = machineQuery.error ?? metricsQuery.error ?? dockerQuery.error;
+  const error =
+    machineQuery.error ?? metricsQuery.error ?? dockerQuery.error ?? systemdQuery.error;
 
   const backLink = (
     <Link to="/machines" className="text-sm text-muted-foreground hover:underline">
@@ -210,14 +238,7 @@ export default function MachineDetailPage() {
         <SpecStrip items={specItems} />
       </div>
 
-      <Tabs
-        tabs={[
-          { key: "overview", label: "Overview" },
-          { key: "containers", label: "Containers" },
-        ]}
-        active={tab}
-        onChange={setTab}
-      />
+      <Tabs tabs={TABS} active={tab} onChange={setTab} />
 
       {tab === "overview" && (
         <div
@@ -318,6 +339,18 @@ export default function MachineDetailPage() {
           className="mt-4"
         >
           <ContainersCard machineId={id} containers={containers} />
+        </div>
+      )}
+
+      {tab === "units" && (
+        <div
+          role="tabpanel"
+          id="panel-units"
+          aria-labelledby="tab-units"
+          tabIndex={0}
+          className="mt-4"
+        >
+          <UnitsCard machineId={id} units={units} />
         </div>
       )}
     </>

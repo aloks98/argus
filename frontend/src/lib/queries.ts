@@ -12,8 +12,10 @@ import {
   getFleet,
   getMachine,
   getMetrics,
+  getSystemd,
+  unitAction,
 } from "../api";
-import type { ContainerAction } from "../api";
+import type { ContainerAction, UnitAction } from "../api";
 
 /** Polling cadences (ms). Fleet is the scan view, so it refreshes faster. */
 const FLEET_INTERVAL = 5_000;
@@ -27,6 +29,7 @@ export const qk = {
   machine: (id: string) => ["machine", id] as const,
   metrics: (id: string, range: Range) => ["metrics", id, range] as const,
   docker: (id: string) => ["docker", id] as const,
+  systemd: (id: string) => ["systemd", id] as const,
 };
 
 export function useFleet() {
@@ -62,18 +65,47 @@ export function useDocker(id: string) {
 }
 
 /**
- * Container verbs. On success the docker snapshot is invalidated so the panel
- * reflects the new state without waiting for the next poll — this replaces the
- * manual refetchDocker(). Per-row in-flight state comes from `variables`, which
- * replaces the hand-rolled busy Set.
+ * Container verbs. The snapshot is invalidated on `onSettled`, not `onSuccess`:
+ * a verb that failed on the agent still very likely changed the container's
+ * state (a restart that died leaves it stopped), so the failure path is exactly
+ * when a refetch matters most. Per-row in-flight state comes from `variables`,
+ * which replaces the hand-rolled busy Set.
  */
 export function useContainerAction(id: string) {
   const qc = useQueryClient();
   return useMutation({
     mutationFn: (vars: { container: string; action: ContainerAction }) =>
       containerAction(id, vars.container, vars.action),
-    onSuccess: () => {
+    onSettled: () => {
       void qc.invalidateQueries({ queryKey: qk.docker(id) });
+    },
+  });
+}
+
+export function useSystemd(id: string) {
+  return useQuery({
+    queryKey: qk.systemd(id),
+    queryFn: () => getSystemd(id),
+    refetchInterval: MACHINE_INTERVAL,
+  });
+}
+
+/**
+ * Unit verbs. Mirrors useContainerAction, including invalidating on `onSettled`
+ * rather than `onSuccess` — a unit whose ExecStart failed has still moved to
+ * `failed`, and that is precisely the transition the operator needs to see.
+ *
+ * Note the snapshot is agent-*pushed* on a 15s cadence, so this refetch often
+ * returns the pre-verb state; the mutation's own error/pending result is what
+ * actually tells the operator what happened, not the table.
+ */
+export function useUnitAction(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (vars: { unit: string; action: UnitAction }) =>
+      unitAction(id, vars.unit, vars.action),
+    onSettled: () => {
+      void qc.invalidateQueries({ queryKey: qk.systemd(id) });
     },
   });
 }
