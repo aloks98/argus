@@ -6,7 +6,7 @@
 
 use crate::config::Config;
 use crate::embed::Assets;
-use crate::hub::{DispatchError, Hub};
+use crate::hub::{DispatchError, Hub, LogFilters};
 use crate::repo;
 use anyhow::Result;
 use argus_proto::v1::Verb;
@@ -388,6 +388,8 @@ struct LogStreamQuery {
     source: String,
     tail: Option<u32>,
     follow: Option<bool>,
+    priority: Option<u32>,
+    window: Option<String>,
 }
 
 /// Query params for `GET /api/machines/{id}/logs/page`.
@@ -396,6 +398,8 @@ struct LogPageQuery {
     source: String,
     before: Option<String>,
     limit: Option<u32>,
+    priority: Option<u32>,
+    window: Option<String>,
 }
 
 /// One page of older journal entries plus the anchor for the next page.
@@ -424,6 +428,74 @@ fn source_is_valid(raw: &str) -> bool {
             .all(|c| c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')),
         _ => false,
     }
+}
+
+/// Resolve the UI's single `window` value plus `priority` into concrete filters.
+/// `window` is one of `boot | 1h | 24h | all`; `boot` and a relative window are
+/// alternative answers to the same question and are never combined.
+///
+/// `since_ms` is resolved to an ABSOLUTE epoch here, but freshly — from `now`
+/// at the moment THIS request is handled, not anchored to when the view was
+/// first opened. This function is called independently for the tail request
+/// and for every later page request of the same view, so each read is
+/// self-consistent with the window as of THAT request, but the window itself
+/// creeps forward across the view's lifetime rather than staying pinned. A
+/// view left open across a window boundary — e.g. `window=24h` held open for
+/// more than a day — can therefore end up holding lines older than its own
+/// (current) window. Returns `None` when the input is invalid, which the
+/// caller turns into a 400.
+fn resolve_log_filters(priority: Option<u32>, window: Option<&str>) -> Option<LogFilters> {
+    let max_priority = match priority {
+        None => 0,
+        Some(p) if p <= 7 => p,
+        Some(_) => return None,
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as u64;
+    let (since_ms, current_boot) = match window.unwrap_or("all") {
+        "all" => (0, false),
+        "boot" => (0, true),
+        "1h" => (now_ms.saturating_sub(3_600_000), false),
+        "24h" => (now_ms.saturating_sub(86_400_000), false),
+        _ => return None,
+    };
+    Some(LogFilters {
+        max_priority,
+        since_ms,
+        current_boot,
+    })
+}
+
+/// Filters only apply to journal reads — `run_docker` ignores them entirely,
+/// so a docker source has no priority or window concept. Zero them for any
+/// non-journal source before they're forwarded to the agent or recorded in the
+/// audit target, so what's dispatched (and what's audited) matches what the
+/// agent actually does with the read rather than asserting a filter that was
+/// silently ignored.
+fn filters_for_source(source: &str, filters: LogFilters) -> LogFilters {
+    if source.starts_with("journal:") {
+        filters
+    } else {
+        LogFilters::default()
+    }
+}
+
+/// The audit `target` for a log read: the source plus whatever narrowed it. A
+/// filtered read and a full read are different disclosures, so the trail records
+/// what was actually read.
+fn audit_target(source: &str, f: &LogFilters) -> String {
+    let mut s = source.to_string();
+    if f.max_priority > 0 {
+        s.push_str(&format!(" p<={}", f.max_priority));
+    }
+    if f.current_boot {
+        s.push_str(" boot");
+    } else if f.since_ms > 0 {
+        s.push_str(&format!(" since={}", f.since_ms));
+    }
+    s
 }
 
 /// Sends `LogTailStop` when the SSE response is dropped — i.e. the browser
@@ -461,6 +533,12 @@ async fn log_stream(
     if !source_is_valid(&q.source) {
         return (StatusCode::BAD_REQUEST, "invalid source").into_response();
     }
+    let Some(filters) = resolve_log_filters(q.priority, q.window.as_deref()) else {
+        return (StatusCode::BAD_REQUEST, "invalid priority or window").into_response();
+    };
+    // Docker ignores filters entirely; zero them before dispatch and audit so
+    // neither claims a narrowing that never happened.
+    let filters = filters_for_source(&q.source, filters);
     let tail = q.tail.unwrap_or(DEFAULT_TAIL_LINES).min(MAX_TAIL_LINES);
     let follow = q.follow.unwrap_or(true);
 
@@ -477,6 +555,7 @@ async fn log_stream(
             tail,
             follow,
             String::new(),
+            filters,
         )
         .await
     {
@@ -494,7 +573,7 @@ async fn log_stream(
         "anonymous",
         "logs.open",
         Some(id),
-        &q.source,
+        &audit_target(&q.source, &filters),
         command_id,
         "ok",
     )
@@ -551,6 +630,13 @@ async fn logs_page(
     let Some(before) = q.before.filter(|b| !b.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "missing `before` cursor").into_response();
     };
+    let Some(filters) = resolve_log_filters(q.priority, q.window.as_deref()) else {
+        return (StatusCode::BAD_REQUEST, "invalid priority or window").into_response();
+    };
+    // Always a no-op today (the check above already rejects non-journal
+    // sources), kept for defense-in-depth so this handler can never dispatch
+    // or audit a filter a source doesn't support.
+    let filters = filters_for_source(&q.source, filters);
     let limit = q.limit.unwrap_or(DEFAULT_TAIL_LINES).min(MAX_TAIL_LINES);
 
     // Open the tail and dispatch BEFORE auditing, mirroring log_stream: an
@@ -566,6 +652,7 @@ async fn logs_page(
             limit,
             false,
             before,
+            filters,
         )
         .await
     {
@@ -582,7 +669,7 @@ async fn logs_page(
         "anonymous",
         "logs.page",
         Some(id),
-        &q.source,
+        &audit_target(&q.source, &filters),
         command_id,
         "ok",
     )
@@ -1805,5 +1892,253 @@ mod tests {
         assert_eq!(row.result.as_deref(), Some("ok"));
 
         Ok(())
+    }
+
+    #[sqlx::test]
+    async fn logs_page_rejects_an_out_of_range_priority(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id: Uuid = sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname, status) VALUES ('page-prio', 'h', 'online') RETURNING id"
+        )
+        .fetch_one(&pool).await?.id;
+        let (state, _hub) = app_state_with_hub(pool.clone());
+        let resp = router(state)
+            .oneshot(Request::builder()
+                .uri(format!("/api/machines/{machine_id}/logs/page?source=journal:ssh.service&before=s%3Dx&priority=9"))
+                .body(Body::empty())?)
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn log_stream_rejects_an_out_of_range_priority(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id: Uuid = sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname, status) VALUES ('stream-prio', 'h', 'online') RETURNING id"
+        )
+        .fetch_one(&pool).await?.id;
+        let (state, _hub) = app_state_with_hub(pool.clone());
+        let resp = router(state)
+            .oneshot(Request::builder()
+                .uri(format!("/api/machines/{machine_id}/logs/stream?source=journal:ssh.service&priority=8"))
+                .body(Body::empty())?)
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn logs_page_forwards_filters_and_audits_them(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id: Uuid = sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname, status) VALUES ('page-filt', 'h', 'online') RETURNING id"
+        )
+        .fetch_one(&pool).await?.id;
+        let (state, hub) = app_state_with_hub(pool.clone());
+        let (tx, mut agent_rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
+        hub.register(machine_id, tx);
+        let hub2 = hub.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(frame)) = agent_rx.recv().await {
+                if let Some(server_frame::Payload::LogTailStart(req)) = frame.payload {
+                    assert_eq!(req.max_priority, 4, "priority reaches the agent");
+                    assert!(req.current_boot, "boot window reaches the agent");
+                    assert_eq!(req.since_ms, 0, "boot and since are never both set");
+                    let request_id = req.request_id.clone();
+                    hub2.deliver_chunk(
+                        &request_id,
+                        machine_id,
+                        argus_proto::v1::LogChunk {
+                            request_id: req.request_id,
+                            data: Vec::new(),
+                            eof: true,
+                        },
+                    );
+                }
+            }
+        });
+        let resp = router(state)
+            .oneshot(Request::builder()
+                .uri(format!("/api/machines/{machine_id}/logs/page?source=journal:ssh.service&before=s%3Dx&priority=4&window=boot"))
+                .body(Body::empty())?)
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let row = sqlx::query!(
+            "SELECT target_ref FROM audit_log WHERE machine_id = $1 AND action = 'logs.page'",
+            machine_id,
+        )
+        .fetch_one(&pool)
+        .await?;
+        let target = row.target_ref.unwrap_or_default();
+        assert!(
+            target.contains("journal:ssh.service"),
+            "source in the audit target"
+        );
+        assert!(target.contains("p<=4"), "priority recorded: {target}");
+        assert!(target.contains("boot"), "window recorded: {target}");
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn log_stream_docker_source_ignores_filters_end_to_end(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let machine_id: Uuid = sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname, status) VALUES ('logs-docker-filt', 'h', 'online') RETURNING id"
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+
+        let (state, hub) = app_state_with_hub(pool.clone());
+        let (tx, mut agent_rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
+        hub.register(machine_id, tx);
+        let hub2 = hub.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(frame)) = agent_rx.recv().await {
+                if let Some(server_frame::Payload::LogTailStart(req)) = frame.payload {
+                    // A docker read carries no filters, whatever the query
+                    // string asked for: `run_docker` ignores them entirely.
+                    assert_eq!(
+                        req.max_priority, 0,
+                        "docker reads must not carry a priority filter"
+                    );
+                    assert!(
+                        !req.current_boot,
+                        "docker reads must not carry a boot filter"
+                    );
+                    assert_eq!(
+                        req.since_ms, 0,
+                        "docker reads must not carry a since filter"
+                    );
+                    let request_id = req.request_id.clone();
+                    hub2.deliver_chunk(
+                        &request_id,
+                        machine_id,
+                        argus_proto::v1::LogChunk {
+                            request_id: req.request_id,
+                            data: Vec::new(),
+                            eof: true,
+                        },
+                    );
+                }
+            }
+        });
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/machines/{machine_id}/logs/stream?source=docker:abc&priority=4&window=boot"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+
+        let row = sqlx::query!(
+            "SELECT target_ref FROM audit_log WHERE machine_id = $1 AND action = 'logs.open'",
+            machine_id,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            row.target_ref.as_deref(),
+            Some("docker:abc"),
+            "a docker read's audit target must be bare, with no filter suffix the read never honoured"
+        );
+
+        Ok(())
+    }
+
+    // --- resolve_log_filters: the ONLY definition of the `window` -> proto
+    // mapping (see the doc comment on the function). Direct, DB-free coverage
+    // so swapping the 3_600_000 / 86_400_000 constants can't slip past every
+    // other gate silently.
+
+    #[test]
+    fn resolve_log_filters_boot_sets_current_boot_and_no_since() {
+        let f = resolve_log_filters(None, Some("boot")).expect("boot is a valid window");
+        assert!(f.current_boot);
+        assert_eq!(f.since_ms, 0);
+    }
+
+    #[test]
+    fn resolve_log_filters_all_sets_neither_boot_nor_since() {
+        let f = resolve_log_filters(None, Some("all")).expect("all is a valid window");
+        assert!(!f.current_boot);
+        assert_eq!(f.since_ms, 0);
+    }
+
+    #[test]
+    fn resolve_log_filters_1h_cutoff_is_about_an_hour_before_now() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let f = resolve_log_filters(None, Some("1h")).expect("1h is a valid window");
+        assert!(!f.current_boot);
+        let expected = now_ms.saturating_sub(3_600_000);
+        // Tolerance for the time elapsed between computing `now_ms` here and
+        // the function computing its own `now` internally -- not an exact
+        // equality against a freshly-taken timestamp.
+        let delta = expected.abs_diff(f.since_ms);
+        assert!(
+            delta < 5_000,
+            "since_ms should be ~now - 1h, delta={delta}ms"
+        );
+    }
+
+    #[test]
+    fn resolve_log_filters_24h_cutoff_is_strictly_older_than_1h_and_about_a_day_before_now() {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as u64;
+        let f24 = resolve_log_filters(None, Some("24h")).expect("24h is a valid window");
+        let f1 = resolve_log_filters(None, Some("1h")).expect("1h is a valid window");
+        assert!(!f24.current_boot);
+        let expected = now_ms.saturating_sub(86_400_000);
+        let delta = expected.abs_diff(f24.since_ms);
+        assert!(
+            delta < 5_000,
+            "since_ms should be ~now - 24h, delta={delta}ms"
+        );
+        assert!(
+            f24.since_ms < f1.since_ms,
+            "the 24h cutoff must be strictly older than the 1h cutoff"
+        );
+    }
+
+    #[test]
+    fn resolve_log_filters_rejects_an_unknown_or_empty_window() {
+        assert!(resolve_log_filters(None, Some("bogus")).is_none());
+        assert!(resolve_log_filters(None, Some("")).is_none());
+    }
+
+    #[test]
+    fn resolve_log_filters_priority_boundaries() {
+        assert_eq!(
+            resolve_log_filters(Some(0), Some("all"))
+                .expect("0 is valid")
+                .max_priority,
+            0
+        );
+        assert_eq!(
+            resolve_log_filters(Some(7), Some("all"))
+                .expect("7 is valid")
+                .max_priority,
+            7
+        );
+        assert!(
+            resolve_log_filters(Some(8), Some("all")).is_none(),
+            "8 is out of the 0-7 syslog range"
+        );
+        assert_eq!(
+            resolve_log_filters(None, Some("all"))
+                .expect("absent priority is valid")
+                .max_priority,
+            0,
+            "an absent priority defaults to 0 (unset), not rejected"
+        );
     }
 }

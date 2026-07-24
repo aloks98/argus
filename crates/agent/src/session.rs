@@ -339,12 +339,18 @@ async fn connect_and_serve(
                             match crate::logs::parse_source(&req.source) {
                                 Ok(source) => {
                                     let rid = request_id.clone();
+                                    let filters = crate::logs::JournalFilters {
+                                        max_priority: req.max_priority,
+                                        since_ms: req.since_ms,
+                                        current_boot: req.current_boot,
+                                    };
                                     let handle = tokio::spawn(async move {
                                         crate::logs::run_tail(
                                             source,
                                             req.tail_lines,
                                             req.follow,
                                             req.before_cursor,
+                                            filters,
                                             docker,
                                             out,
                                             rid,

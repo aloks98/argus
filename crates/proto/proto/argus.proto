@@ -154,12 +154,21 @@ message CommandResult {
 
 message LogTailRequest {
   string request_id = 1;
-  string source = 2;       // "docker:<container-id>" | "journal:<unit>"
+  string source = 2;       // "docker:<id>" | "journal:<unit>" | "journal:@system"
   uint32 tail_lines = 3;
   bool follow = 4;
   // Journal pagination: read the page of entries BEFORE this journald cursor.
   // Empty = a normal tail from the end. Only meaningful with follow=false.
   string before_cursor = 5;
+  // Severity ceiling in syslog numbering (lower = more severe): becomes
+  // `journalctl -p <n>`, returning entries with priority <= n. 0 = unset.
+  uint32 max_priority = 6;
+  // Absolute unix-ms cutoff, resolved by the server. 0 = unset. NOTE: journalctl
+  // rejects --since together with --cursor, so on a page read this is applied as
+  // a timestamp cutoff by the agent instead of as an argv flag.
+  uint64 since_ms = 7;
+  // `journalctl -b` — current boot only. Composes with --cursor.
+  bool current_boot = 8;
 }
 message LogTailStop { string request_id = 1; }
 message LogChunk {

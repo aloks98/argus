@@ -26,6 +26,8 @@ import {
 } from "@e412/rnui-react";
 import ContainersCard from "../components/ContainersCard";
 import LogDialog from "../components/LogDialog";
+import LogFilterBar from "../components/LogFilterBar";
+import LogViewer from "../components/LogViewer";
 import SpecStrip from "../components/SpecStrip";
 import type { SpecItem } from "../components/SpecStrip";
 import StatusBadge from "../components/StatusBadge";
@@ -33,6 +35,8 @@ import Tabs from "../components/Tabs";
 import TimeSeriesChart from "../components/TimeSeriesChart";
 import type { ChartSeries } from "../components/TimeSeriesChart";
 import UnitsCard from "../components/UnitsCard";
+import { BOOT_LOGS, SYSTEM_JOURNAL } from "../api";
+import { useLogFilters } from "../lib/logFilters";
 import { formatBytesPerSec, formatRelative } from "../lib/format";
 import {
   buildCpuSeries,
@@ -51,6 +55,7 @@ const TABS: { key: string; label: string }[] = [
   { key: "overview", label: "Overview" },
   { key: "containers", label: "Containers" },
   { key: "units", label: "Units" },
+  { key: "logs", label: "Logs" },
 ];
 const TAB_KEYS: readonly string[] = TABS.map((t) => t.key);
 
@@ -118,6 +123,10 @@ export default function MachineDetailPage() {
     next.set("tab", key);
     setSearchParams(next, { replace: true });
   };
+
+  // The whole journal defaults to the current boot — the cheapest and most
+  // relevant read for "what has this box been doing since it came up".
+  const [logFilters, setLogFilters] = useLogFilters(BOOT_LOGS);
 
   const machineQuery = useMachine(id as string);
   const metricsQuery = useMetrics(id as string, range);
@@ -352,6 +361,25 @@ export default function MachineDetailPage() {
           className="mt-4"
         >
           <UnitsCard machineId={id} units={units} />
+        </div>
+      )}
+
+      {tab === "logs" && (
+        <div
+          role="tabpanel"
+          id="panel-logs"
+          aria-labelledby="tab-logs"
+          tabIndex={0}
+          className="mt-4 flex h-[70vh] min-h-0 flex-col"
+        >
+          <LogFilterBar value={logFilters} onChange={setLogFilters} />
+          <div className="min-h-0 flex-1">
+            <LogViewer
+              machineId={id}
+              source={SYSTEM_JOURNAL}
+              filters={logFilters}
+            />
+          </div>
         </div>
       )}
 

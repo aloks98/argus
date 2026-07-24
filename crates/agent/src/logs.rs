@@ -16,7 +16,10 @@ use tokio::sync::mpsc;
 /// as on the server.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
+    /// One systemd unit: `journalctl -u <unit>`.
     Journal(String),
+    /// The whole system journal: no `-u` at all.
+    JournalAll,
     Docker(String),
 }
 
@@ -73,6 +76,17 @@ pub fn parse_source(raw: &str) -> Result<Source, SourceError> {
     }
     match scheme {
         "journal" => {
+            // The whole-journal sentinel, matched HERE, before the unit-charset
+            // check below — so it does not depend on systemd's unit-naming rules
+            // at all. A real unit name always carries a `.<type>` suffix
+            // (`.service`, `.socket`, `.timer`, ...); "@system" has none, so this
+            // exact-match check can never collide with a real unit regardless of
+            // what characters systemd does or doesn't allow around '@' (template
+            // units are `name@instance.type`, with the '@' after a non-empty
+            // template name and before a suffix).
+            if target == "@system" {
+                return Ok(Source::JournalAll);
+            }
             if !target.chars().all(is_unit_char) {
                 return Err(SourceError::IllegalCharacter);
             }
@@ -286,15 +300,17 @@ fn try_emit(
 /// journal child is killed on drop because `Command` is configured with
 /// `kill_on_drop`.
 ///
-/// `before_cursor` pushed this to 8 params (from 7, same reasoning as
-/// `run_docker` below): splitting into a context struct would obscure the
-/// straight-line handoff to `run_journal`/`run_docker` for no benefit.
+/// `before_cursor` and `filters` pushed this to 9 params (from 7, same
+/// reasoning as `run_docker` below): splitting into a context struct would
+/// obscure the straight-line handoff to `run_journal`/`run_docker` for no
+/// benefit.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tail(
     source: Source,
     tail_lines: u32,
     follow: bool,
     before_cursor: String,
+    filters: JournalFilters,
     docker: crate::docker::DockerClient,
     out: mpsc::Sender<AgentFrame>,
     request_id: String,
@@ -309,10 +325,25 @@ pub async fn run_tail(
     let result = match source {
         Source::Journal(unit) => {
             run_journal(
-                &unit,
+                Some(&unit),
                 tail_lines,
                 follow,
                 &before_cursor,
+                &filters,
+                &mut batcher,
+                &out,
+                &request_id,
+                stream_id,
+            )
+            .await
+        }
+        Source::JournalAll => {
+            run_journal(
+                None,
+                tail_lines,
+                follow,
+                &before_cursor,
+                &filters,
                 &mut batcher,
                 &out,
                 &request_id,
@@ -370,13 +401,35 @@ pub async fn run_tail(
     tracing::warn!(request_id = %request_id, "log tail: gave up sending eof");
 }
 
-// Same 8-param shape as run_tail above, for the same reason.
+/// A missing journalctl (a non-systemd guest, e.g. Alpine) fails at spawn.
+/// Before this marker existed that already propagated as an `Err` out of
+/// `run_journal`/`run_journal_page` into `run_tail`'s error arm, which pushes
+/// its own generic `log tail ended: <error>` line — so the operator was never
+/// looking at a blank view. This marker only improves the DIAGNOSTIC: a
+/// specific "journalctl could not be started" line instead of the generic
+/// wrapper text. Both `run_journal` and `run_journal_page` hit this on
+/// `cmd.spawn()` failure and need the identical marker, so it's built once
+/// here.
+fn spawn_failure_marker(e: &std::io::Error) -> LogLine {
+    LogLine {
+        ts: now_ms(),
+        level: Some(3),
+        ident: None,
+        msg: format!("journalctl could not be started: {e}"),
+        marker: true,
+        cursor: None,
+    }
+}
+
+// Same 9-param shape as run_tail above (the `filters` struct, not more
+// scalars), for the same reason.
 #[allow(clippy::too_many_arguments)]
 async fn run_journal(
-    unit: &str,
+    unit: Option<&str>,
     tail_lines: u32,
     follow: bool,
     before_cursor: &str,
+    filters: &JournalFilters,
     batcher: &mut Batcher,
     out: &mpsc::Sender<AgentFrame>,
     request_id: &str,
@@ -387,6 +440,7 @@ async fn run_journal(
             unit,
             before_cursor,
             tail_lines,
+            filters,
             batcher,
             out,
             request_id,
@@ -396,18 +450,19 @@ async fn run_journal(
     }
     let mut cmd = Command::new("journalctl");
     // argv only — nothing is ever interpolated into a shell command line.
-    cmd.arg("-u")
-        .arg(unit)
-        .arg("-n")
-        .arg(tail_lines.to_string())
-        .arg("-o")
-        .arg("json");
-    if follow {
-        cmd.arg("-f");
+    for arg in journal_tail_argv(unit, tail_lines, follow, filters) {
+        cmd.arg(arg);
     }
     // Without this an aborted task would leave `journalctl -f` running forever.
     cmd.kill_on_drop(true);
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            batcher.push(spawn_failure_marker(&e));
+            flush_ready(batcher, out, request_id, stream_id);
+            return Ok(());
+        }
+    };
     let stdout = child.stdout.take().expect("stdout piped above");
     let mut lines = BufReader::new(stdout).lines();
 
@@ -458,21 +513,33 @@ async fn run_journal(
 /// the whole (bounded) page, drop the anchor, re-order oldest-first, and push it
 /// to the batcher. No follow, no ticker — the process exits on its own and the
 /// caller's final flush + eof close the request.
+///
+/// `filters` (the struct, not more scalars) pushed this over clippy's argument
+/// threshold, same reasoning as `run_journal` above.
+#[allow(clippy::too_many_arguments)]
 async fn run_journal_page(
-    unit: &str,
+    unit: Option<&str>,
     before_cursor: &str,
     limit: u32,
+    filters: &JournalFilters,
     batcher: &mut Batcher,
     out: &mpsc::Sender<AgentFrame>,
     request_id: &str,
     stream_id: u64,
 ) -> anyhow::Result<()> {
     let mut cmd = Command::new("journalctl");
-    for arg in journal_page_argv(unit, before_cursor, limit) {
+    for arg in journal_page_argv(unit, before_cursor, limit, filters) {
         cmd.arg(arg);
     }
     cmd.kill_on_drop(true);
-    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    let mut child = match cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn() {
+        Ok(c) => c,
+        Err(e) => {
+            batcher.push(spawn_failure_marker(&e));
+            flush_ready(batcher, out, request_id, stream_id);
+            return Ok(());
+        }
+    };
     let stdout = child.stdout.take().expect("stdout piped above");
     let mut lines = BufReader::new(stdout).lines();
 
@@ -482,7 +549,7 @@ async fn run_journal_page(
             records.push(line);
         }
     }
-    for line in finalize_page(records, before_cursor) {
+    for line in finalize_page(records, before_cursor, filters.since_ms) {
         batcher.push(line);
         flush_ready(batcher, out, request_id, stream_id);
     }
@@ -568,15 +635,88 @@ fn flush_ready(
     }
 }
 
+/// The journal filters carried on a `LogTailRequest`. Zero means unset for every
+/// field, so a default-valued request reproduces the unfiltered behaviour.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct JournalFilters {
+    /// Severity ceiling in syslog numbering, LOWER IS MORE SEVERE: becomes
+    /// `-p <n>`, returning entries with priority <= n. 0 = unset.
+    pub max_priority: u32,
+    /// Absolute unix-ms cutoff. 0 = unset.
+    pub since_ms: u64,
+    /// `-b`, current boot only.
+    pub current_boot: bool,
+}
+
+impl JournalFilters {
+    /// The filter flags that are legal on ANY read. `--since` is deliberately
+    /// absent: it is rejected alongside `--cursor`, so it is added only by
+    /// `journal_tail_argv`, never by `journal_page_argv`.
+    fn common_flags(&self) -> Vec<String> {
+        let mut argv = Vec::new();
+        if self.max_priority > 0 {
+            argv.push("-p".into());
+            argv.push(self.max_priority.to_string());
+        }
+        if self.current_boot {
+            argv.push("-b".into());
+        }
+        argv
+    }
+}
+
+/// The argv for a live/backlog tail: newest `tail_lines` entries, optionally
+/// following. `unit` is `None` for the whole system journal (no `-u`).
+pub fn journal_tail_argv(
+    unit: Option<&str>,
+    tail_lines: u32,
+    follow: bool,
+    f: &JournalFilters,
+) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    if let Some(u) = unit {
+        argv.push("-u".into());
+        argv.push(u.into());
+    }
+    argv.extend([
+        "-n".into(),
+        tail_lines.to_string(),
+        "-o".into(),
+        "json".into(),
+    ]);
+    if follow {
+        argv.push("-f".into());
+    }
+    argv.extend(f.common_flags());
+    // Only a tail may use --since: it is mutually exclusive with --cursor.
+    if f.since_ms > 0 {
+        argv.push("--since".into());
+        argv.push(format!("@{}", f.since_ms / 1000));
+    }
+    argv
+}
+
 /// The argv for a backward page read: the `limit` entries *before*
 /// `before_cursor`, newest-first (`finalize_page` re-orders them). `--cursor` is
 /// inclusive of the anchor entry and `-n limit+1` fetches it so it can be
 /// dropped, so a page never duplicates the boundary line the client already
-/// holds. Never follows. Called by `run_journal_page`.
-pub fn journal_page_argv(unit: &str, before_cursor: &str, limit: u32) -> Vec<String> {
-    vec![
-        "-u".into(),
-        unit.into(),
+/// holds. Never follows. `unit` is `None` for the whole system journal.
+///
+/// Emits `-p`/`-b` but NEVER `--since` — journalctl exits with "Please specify
+/// only one of --since=, --cursor=, ..." if both are given. The time window is
+/// applied to a page by `finalize_page` instead.
+pub fn journal_page_argv(
+    unit: Option<&str>,
+    before_cursor: &str,
+    limit: u32,
+    f: &JournalFilters,
+) -> Vec<String> {
+    let mut argv: Vec<String> = Vec::new();
+    if let Some(u) = unit {
+        argv.push("-u".into());
+        argv.push(u.into());
+    }
+    argv.extend([
         "--cursor".into(),
         before_cursor.into(),
         "--reverse".into(),
@@ -584,16 +724,47 @@ pub fn journal_page_argv(unit: &str, before_cursor: &str, limit: u32) -> Vec<Str
         (limit.saturating_add(1)).to_string(),
         "-o".into(),
         "json".into(),
-    ]
+    ]);
+    argv.extend(f.common_flags());
+    argv
+}
+
+/// `--since @<epoch>` (used by `journal_tail_argv`) only has second
+/// resolution — `since_ms / 1000` truncates. The page-side cutoff below has to
+/// floor to the same second, or a page read is up to 999ms stricter than the
+/// tail that produced the cursor it's paging from, and `reached_start` could
+/// fire up to a second before the tail's own window actually ends.
+fn floor_to_epoch_second(since_ms: u64) -> i64 {
+    ((since_ms / 1000) * 1000) as i64
 }
 
 /// Turn a raw `--reverse` page (newest-first, starting at the anchor) into the
-/// display page: drop the anchor entry the client already has, and re-order
-/// oldest-first so lines arrive in reading order. Called by `run_journal_page`.
-pub fn finalize_page(records: Vec<LogLine>, before_cursor: &str) -> Vec<LogLine> {
+/// display page: drop the anchor entry the client already has, drop
+/// everything from where the descending scan first crosses below `since_ms`
+/// onward, and re-order oldest-first so lines arrive in reading order. Called
+/// by `run_journal_page`.
+///
+/// The `since_ms` cutoff lives here rather than in the argv because journalctl
+/// rejects `--since` alongside `--cursor`.
+///
+/// It is a `take_while`, not a per-record `filter`: dropped entries must be a
+/// structural SUFFIX of the descending page, because the server's existing
+/// `reached_start = lines.len() < limit` rule assumes exactly that and fires
+/// unchanged, meaning "start of the window". `__REALTIME_TIMESTAMP` is not
+/// guaranteed monotonic within a page (a backward clock step, or reading
+/// across merged journal files spanning a clock adjustment) — a per-record
+/// filter would excise just that one out-of-order entry from the middle of the
+/// page and silently resume past it, shortening the page by exactly one and
+/// permanently latching `reached_start` on the client for a page that never
+/// actually reached the window's edge. `take_while` makes the cut
+/// deterministic: once the descending scan drops below the cutoff, everything
+/// from that point on is dropped too, exactly like genuinely reaching the end
+/// of the window would.
+pub fn finalize_page(records: Vec<LogLine>, before_cursor: &str, since_ms: u64) -> Vec<LogLine> {
     let mut kept: Vec<LogLine> = records
         .into_iter()
         .filter(|l| l.cursor.as_deref() != Some(before_cursor))
+        .take_while(|l| since_ms == 0 || l.ts >= floor_to_epoch_second(since_ms))
         .collect();
     kept.reverse();
     kept
@@ -662,6 +833,25 @@ mod tests {
     }
 
     #[test]
+    fn parse_source_maps_the_system_sentinel_to_journal_all() {
+        assert_eq!(parse_source("journal:@system"), Ok(Source::JournalAll));
+    }
+
+    #[test]
+    fn parse_source_still_treats_a_normal_unit_as_a_unit() {
+        // The sentinel must not swallow ordinary units, including template
+        // units which legitimately contain '@' after the template name.
+        assert_eq!(
+            parse_source("journal:nginx.service"),
+            Ok(Source::Journal("nginx.service".into()))
+        );
+        assert_eq!(
+            parse_source("journal:systemd-fsck@dev-sda1.service"),
+            Ok(Source::Journal("systemd-fsck@dev-sda1.service".into()))
+        );
+    }
+
+    #[test]
     fn journal_record_maps_the_four_fields() {
         let raw = r#"{"PRIORITY":"3","__REALTIME_TIMESTAMP":"1784812931123456","SYSLOG_IDENTIFIER":"nginx","MESSAGE":"connect() failed"}"#;
         let line = journal_record_to_line(raw).expect("parses");
@@ -696,6 +886,24 @@ mod tests {
         assert!(journal_record_to_line("").is_none());
         // Valid JSON but no MESSAGE is not a log line.
         assert!(journal_record_to_line(r#"{"PRIORITY":"3"}"#).is_none());
+    }
+
+    #[test]
+    fn spawn_failure_marker_surfaces_a_visible_marker_with_the_error_text() {
+        let err = std::io::Error::new(std::io::ErrorKind::NotFound, "No such file or directory");
+        let line = spawn_failure_marker(&err);
+        assert!(line.marker, "spawn failure must be a marker line");
+        assert_eq!(line.cursor, None, "a marker is never a paging anchor");
+        assert_eq!(line.level, Some(3));
+        assert!(
+            line.msg.contains("No such file or directory"),
+            "message must surface the underlying error: {}",
+            line.msg
+        );
+        assert_eq!(
+            line.msg,
+            "journalctl could not be started: No such file or directory"
+        );
     }
 
     #[test]
@@ -860,6 +1068,7 @@ mod tests {
                 20,
                 true, // follow: the unit is quiet, so nothing new will arrive
                 String::new(),
+                JournalFilters::default(),
                 docker,
                 tx,
                 "req-idle".into(),
@@ -912,9 +1121,93 @@ mod tests {
         assert_eq!(v["cursor"], "s=abc");
     }
 
+    fn no_filters() -> JournalFilters {
+        JournalFilters {
+            max_priority: 0,
+            since_ms: 0,
+            current_boot: false,
+        }
+    }
+
+    #[test]
+    fn tail_argv_omits_unit_for_the_whole_journal() {
+        let argv = journal_tail_argv(None, 200, true, &no_filters());
+        assert!(!argv.iter().any(|a| a == "-u"), "whole journal has no -u");
+        assert_eq!(argv, vec!["-n", "200", "-o", "json", "-f"]);
+    }
+
+    #[test]
+    fn tail_argv_emits_every_filter() {
+        let f = JournalFilters {
+            max_priority: 4,
+            since_ms: 1_600_000_000_000,
+            current_boot: true,
+        };
+        let argv = journal_tail_argv(Some("nginx.service"), 200, false, &f);
+        assert_eq!(
+            argv,
+            vec![
+                "-u",
+                "nginx.service",
+                "-n",
+                "200",
+                "-o",
+                "json",
+                "-p",
+                "4",
+                "-b",
+                "--since",
+                "@1600000000",
+            ]
+        );
+    }
+
+    #[test]
+    fn page_argv_keeps_priority_and_boot_but_never_since() {
+        // journalctl rejects --since together with --cursor. -p and -b compose.
+        let f = JournalFilters {
+            max_priority: 3,
+            since_ms: 1_600_000_000_000,
+            current_boot: true,
+        };
+        let argv = journal_page_argv(Some("nginx.service"), "s=abc;i=9", 500, &f);
+        assert!(
+            !argv.iter().any(|a| a == "--since"),
+            "--since must never ride a cursor-anchored read"
+        );
+        assert!(argv.iter().any(|a| a == "-p"), "priority still applies");
+        assert!(argv.iter().any(|a| a == "-b"), "boot still applies");
+        assert_eq!(
+            argv,
+            vec![
+                "-u",
+                "nginx.service",
+                "--cursor",
+                "s=abc;i=9",
+                "--reverse",
+                "-n",
+                "501",
+                "-o",
+                "json",
+                "-p",
+                "3",
+                "-b",
+            ]
+        );
+    }
+
+    #[test]
+    fn zero_valued_filters_emit_nothing() {
+        let argv = journal_page_argv(None, "s=abc", 10, &no_filters());
+        assert_eq!(
+            argv,
+            vec!["--cursor", "s=abc", "--reverse", "-n", "11", "-o", "json"]
+        );
+    }
+
     #[test]
     fn journal_page_argv_reads_backward_from_the_cursor() {
-        let argv = journal_page_argv("nginx.service", "s=abc;i=9", 500);
+        let argv = journal_page_argv(Some("nginx.service"), "s=abc;i=9", 500, &no_filters());
         // -u <unit> --cursor <c> --reverse -n <limit+1> -o json ; no -f
         assert_eq!(
             argv,
@@ -953,7 +1246,7 @@ mod tests {
             line_with_cursor("s=b", 20),
             line_with_cursor("s=a", 10),
         ];
-        let page = finalize_page(records, "s=anchor");
+        let page = finalize_page(records, "s=anchor", 0);
         // anchor removed, re-ordered oldest-first
         let ts: Vec<i64> = page.iter().map(|l| l.ts).collect();
         assert_eq!(ts, vec![10, 20], "anchor dropped, chronological order");
@@ -968,7 +1261,90 @@ mod tests {
         // Near the start there is no older entry than the anchor: only the
         // anchor comes back, so the page is empty.
         let records = vec![line_with_cursor("s=anchor", 30)];
-        assert!(finalize_page(records, "s=anchor").is_empty());
+        assert!(finalize_page(records, "s=anchor", 0).is_empty());
+    }
+
+    #[test]
+    fn finalize_page_drops_entries_older_than_the_window() {
+        // --since cannot ride a cursor read, so the window is enforced here.
+        // Values are whole seconds apart (not sub-second offsets) so the
+        // floor-to-the-second cutoff (see `floor_to_epoch_second`) doesn't
+        // collapse them all into the same bucket.
+        let records = vec![
+            line_with_cursor("s=anchor", 1_600_000_300_000),
+            line_with_cursor("s=c", 1_600_000_250_000),
+            line_with_cursor("s=b", 1_600_000_150_000), // older than the cutoff
+            line_with_cursor("s=a", 1_600_000_100_000), // older than the cutoff
+        ];
+        let page = finalize_page(records, "s=anchor", 1_600_000_200_000);
+        let ts: Vec<i64> = page.iter().map(|l| l.ts).collect();
+        assert_eq!(
+            ts,
+            vec![1_600_000_250_000],
+            "only entries at/after the cutoff survive"
+        );
+    }
+
+    #[test]
+    fn finalize_page_with_no_window_keeps_everything() {
+        let records = vec![
+            line_with_cursor("s=anchor", 300),
+            line_with_cursor("s=b", 150),
+            line_with_cursor("s=a", 100),
+        ];
+        let page = finalize_page(records, "s=anchor", 0);
+        let ts: Vec<i64> = page.iter().map(|l| l.ts).collect();
+        assert_eq!(ts, vec![100, 150], "since_ms = 0 means unset");
+    }
+
+    #[test]
+    fn finalize_page_a_non_monotonic_dip_forms_a_clean_structural_cutoff() {
+        // journalctl --reverse walks JOURNAL SEQUENCE order, not timestamp
+        // order: a backward clock step (or reading across merged journal
+        // files) can put an entry with an anomalously low
+        // __REALTIME_TIMESTAMP in the middle of an otherwise-descending page.
+        // `take_while` must stop AT that entry and drop everything after it
+        // too — even records whose own timestamp would individually still
+        // pass — rather than a per-record `filter` excising just the one
+        // anomaly and silently resuming past it.
+        let records = vec![
+            line_with_cursor("s=anchor", 1_600_000_500_000),
+            line_with_cursor("s=d", 1_600_000_400_000),
+            line_with_cursor("s=c", 1_600_000_050_000), // backward clock step
+            line_with_cursor("s=b", 1_600_000_300_000), // individually still >= cutoff
+            line_with_cursor("s=a", 1_600_000_200_000), // individually still >= cutoff
+        ];
+        let page = finalize_page(records, "s=anchor", 1_600_000_100_000);
+        let ts: Vec<i64> = page.iter().map(|l| l.ts).collect();
+        assert_eq!(
+            ts,
+            vec![1_600_000_400_000],
+            "the cutoff fires once, at the first crossing, and holds for the rest of the page"
+        );
+    }
+
+    #[test]
+    fn finalize_page_floors_the_cutoff_to_the_second_like_the_tail_does() {
+        // journal_tail_argv's `--since @<epoch>` divides by 1000 (integer,
+        // floors to the second); the page cutoff must floor the same way or a
+        // page read is up to 999ms stricter than the tail that produced its
+        // anchor, and `reached_start` could fire up to a second early.
+        let since_ms = 1_600_000_000_500; // 500ms into the second
+        let records = vec![
+            line_with_cursor("s=anchor", 1_600_000_001_000),
+            // Before `since_ms` in exact-ms terms, but within the same
+            // (floored) second the tail's `--since @1600000000` would include.
+            line_with_cursor("s=b", 1_600_000_000_300),
+            // A full second earlier: outside the window under either scheme.
+            line_with_cursor("s=a", 1_599_999_999_500),
+        ];
+        let page = finalize_page(records, "s=anchor", since_ms);
+        let ts: Vec<i64> = page.iter().map(|l| l.ts).collect();
+        assert_eq!(
+            ts,
+            vec![1_600_000_000_300],
+            "a record within the floored second must survive even though its raw ms value is before since_ms"
+        );
     }
 
     /// Live page read against the local journal. Ignored like the repo's other
@@ -999,7 +1375,7 @@ mod tests {
             .expect("a cursor from the tail");
 
         // Now read the page before it.
-        let argv = journal_page_argv("ssh.service", &newest_cursor, 10);
+        let argv = journal_page_argv(Some("ssh.service"), &newest_cursor, 10, &no_filters());
         let page_out = tokio::process::Command::new("journalctl")
             .args(&argv)
             .output()
@@ -1009,7 +1385,7 @@ mod tests {
             .lines()
             .filter_map(journal_record_to_line)
             .collect();
-        let page = finalize_page(records, &newest_cursor);
+        let page = finalize_page(records, &newest_cursor, 0);
         assert!(
             page.iter()
                 .all(|l| l.cursor.as_deref() != Some(newest_cursor.as_str())),
@@ -1019,5 +1395,51 @@ mod tests {
         if page.len() >= 2 {
             assert!(page[0].ts <= page[page.len() - 1].ts, "chronological order");
         }
+    }
+
+    /// A filtered whole-journal page read against the local journal.
+    #[tokio::test]
+    #[ignore = "needs a live journal; run under sudo"]
+    async fn live_filtered_whole_journal_page_reads_older_than_a_cursor() {
+        let f = JournalFilters {
+            max_priority: 6,
+            since_ms: 0,
+            current_boot: true,
+        };
+        let out = tokio::process::Command::new("journalctl")
+            .args(journal_tail_argv(None, 5, false, &f))
+            .output()
+            .await
+            .expect("journalctl");
+        let newest_cursor = String::from_utf8_lossy(&out.stdout)
+            .lines()
+            .filter_map(journal_record_to_line)
+            .next_back()
+            .and_then(|l| l.cursor)
+            .expect("a cursor from the whole-journal tail");
+
+        let page_out = tokio::process::Command::new("journalctl")
+            .args(journal_page_argv(None, &newest_cursor, 10, &f))
+            .output()
+            .await
+            .expect("journalctl page");
+        assert!(
+            page_out.status.success(),
+            "-p and -b must compose with --cursor"
+        );
+        let records: Vec<LogLine> = String::from_utf8_lossy(&page_out.stdout)
+            .lines()
+            .filter_map(journal_record_to_line)
+            .collect();
+        let page = finalize_page(records, &newest_cursor, 0);
+        assert!(
+            page.iter()
+                .all(|l| l.cursor.as_deref() != Some(newest_cursor.as_str())),
+            "the anchor is never in its own page"
+        );
+        assert!(
+            page.iter().all(|l| l.level.is_none_or(|p| p <= 6)),
+            "priority ceiling honoured"
+        );
     }
 }

@@ -49,6 +49,18 @@ pub struct Hub {
     epoch_counter: AtomicU64,
 }
 
+/// Journal filters carried on a log request. Zero means unset for every field,
+/// so a default value reproduces the unfiltered behaviour.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct LogFilters {
+    /// Severity ceiling, syslog numbering (lower = more severe). 0 = unset.
+    pub max_priority: u32,
+    /// Absolute unix-ms cutoff. 0 = unset.
+    pub since_ms: u64,
+    /// Current boot only.
+    pub current_boot: bool,
+}
+
 impl Hub {
     pub fn new() -> Hub {
         Hub::default()
@@ -232,6 +244,7 @@ impl Hub {
     }
 
     /// Sent by the HTTP SSE handler when a tail is opened.
+    #[allow(clippy::too_many_arguments)]
     pub async fn send_log_start(
         &self,
         machine_id: Uuid,
@@ -240,6 +253,7 @@ impl Hub {
         tail_lines: u32,
         follow: bool,
         before_cursor: String,
+        filters: LogFilters,
     ) -> Result<(), DispatchError> {
         let (tx, stream_id) = self.conn_slot(machine_id)?;
         let frame = ServerFrame {
@@ -250,6 +264,9 @@ impl Hub {
                 tail_lines,
                 follow,
                 before_cursor,
+                max_priority: filters.max_priority,
+                since_ms: filters.since_ms,
+                current_boot: filters.current_boot,
             })),
         };
         tx.send(Ok(frame))
@@ -596,6 +613,7 @@ mod tests {
             200,
             true,
             String::new(),
+            LogFilters::default(),
         )
         .await
         .expect("dispatch");
@@ -608,6 +626,9 @@ mod tests {
                 assert_eq!(r.tail_lines, 200);
                 assert!(r.follow);
                 assert_eq!(r.before_cursor, "");
+                assert_eq!(r.max_priority, 0);
+                assert_eq!(r.since_ms, 0);
+                assert!(!r.current_boot);
             }
             other => panic!("expected LogTailStart, got {other:?}"),
         }

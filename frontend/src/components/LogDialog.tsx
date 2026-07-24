@@ -15,6 +15,9 @@ import {
   DialogHeader,
   DialogTitle,
 } from "@e412/rnui-react";
+import { ALL_LOGS } from "../api";
+import { useLogFilters } from "../lib/logFilters";
+import LogFilterBar from "./LogFilterBar";
 import LogViewer from "./LogViewer";
 
 export default function LogDialog() {
@@ -23,9 +26,14 @@ export default function LogDialog() {
   const source = searchParams.get("logs");
   const open = source !== null && id !== undefined;
 
+  // Unfiltered by default so the per-unit view behaves exactly as it always has.
+  const [filters, setFilters] = useLogFilters(ALL_LOGS);
+
   function close() {
     const next = new URLSearchParams(searchParams);
     next.delete("logs");
+    next.delete("priority");
+    next.delete("window");
     setSearchParams(next, { replace: true });
   }
 
@@ -42,9 +50,14 @@ export default function LogDialog() {
             Live tail — closing this stops it on the agent. Drag to select and copy.
           </DialogDescription>
         </DialogHeader>
-        <div className="min-h-0 flex-1 p-4">
+        <div className="flex min-h-0 flex-1 flex-col p-4">
+          {source?.startsWith("journal:") && (
+            <LogFilterBar value={filters} onChange={setFilters} />
+          )}
           {open && id !== undefined && source !== null && (
-            <LogViewer machineId={id} source={source} />
+            <div className="min-h-0 flex-1">
+              <LogViewer machineId={id} source={source} filters={filters} />
+            </div>
           )}
         </div>
       </DialogContent>

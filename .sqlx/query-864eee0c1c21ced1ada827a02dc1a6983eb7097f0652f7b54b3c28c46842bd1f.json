@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT target_ref FROM audit_log WHERE machine_id = $1 AND action = 'logs.page'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "target_ref",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "target_ref"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "864eee0c1c21ced1ada827a02dc1a6983eb7097f0652f7b54b3c28c46842bd1f"
+}

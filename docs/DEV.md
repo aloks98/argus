@@ -457,3 +457,68 @@ does not do EventSource framing or scroll):** open a unit's logs, then:
 4. Follow **pauses** while scrolled up (new live lines don't yank you down);
    scrolling back to the bottom **resumes** it.
 5. Text stays selectable/copyable; a **docker** source shows no "load older" row.
+
+## Full system journal + log filters — manual verification (2026-07-24)
+
+Whole-journal source (`journal:@system`) plus a priority ceiling and a time
+window, applied to per-unit journal reads too. Design of record:
+`docs/superpowers/specs/2026-07-24-full-journal-design.md`. Agent runs as root
+(journal access), same as the earlier log slices.
+
+**The constraint that shapes the whole design** (verified against the live
+journal, and the reason the window is not simply an argv flag):
+
+| Combination | Result |
+|---|---|
+| `-p <n>` + `--cursor` | composes |
+| `-b` + `--cursor` | composes; paging past the boot start returns only the inclusive anchor |
+| `--since` + `--cursor` | **rejected** — "Please specify only one of --since=, --cursor=, --cursor-file=, and --after-cursor=" |
+| `--since @<epoch>` (no cursor) | works |
+
+So a relative window rides the live tail as `--since`, but a cursor-anchored page
+read applies it as a **timestamp cutoff in `finalize_page`** instead. The cutoff
+is a `take_while` over the descending records, not a `filter`, so the drop is
+structurally a *suffix* — that is what makes the server's existing
+`reached_start = lines.len() < limit` rule still mean "start of the window" even
+if the journal contains a non-monotonic timestamp.
+
+**Endpoint checks (curl), against the live journal:**
+- `journal:@system` streams end-to-end — 8 records, each carrying a cursor.
+- **Priority:** `priority=4` returned only levels `{3,4}`; zero entries above the
+  ceiling. (Lower is more severe: `-p 4` returns 4,3,2,1,0.)
+- **Window, as an A/B on the same cursor and limit:** `window=1h` returned 20
+  lines, all within the hour, `reached_start:true`; `window=all` returned a full
+  200 with `reached_start:false` and 180 of them older than an hour. This is the
+  proof the cutoff works *and* that `reached_start` means "start of the window".
+- **Validation:** `priority=9`, `priority=abc`, `window=nonsense` and a `docker:`
+  source each returned **400**.
+- **Audit:** `audit_log.target_ref` records the filters —
+  `journal:@system p<=4 boot`, `journal:@system since=<ms>`, and a bare source
+  when unfiltered. A docker read never carries filters (the server zeroes them,
+  since `run_docker` ignores them and the row would otherwise assert something
+  false).
+- **Offline:** with the agent stopped, a page request returned **409** and wrote
+  **no** `logs.page` row — the fail-closed dispatch→audit→collect ordering holds
+  on the filtered path too.
+
+**Browser checks:**
+1. Logs tab streams the whole journal and defaults to current boot.
+2. Changing priority or window resets the buffer and re-streams.
+3. Per-unit dialog still defaults to unfiltered and pages back past a reboot.
+4. A docker source shows no filter bar.
+
+**Two defects only a browser caught** — worth remembering, because both passed
+every static gate:
+- The filter selects rendered the **raw value** (`5`, `all`) instead of the
+  label. base-ui's `SelectValue` shows the raw value unless `Select` (Root) is
+  given an `items` prop; a `{value, label}` array is then used automatically.
+  A compile-only probe cannot catch this — it typechecks either way.
+- The Logs tabpanel was the only one missing `mt-4`, so the filter bar sat flush
+  against the tab strip.
+
+**Known limitation (deferred):** the window is re-resolved on every request, so a
+view left open longer than its own window (e.g. `window=24h` for over a day) will
+find every page read fully truncated and report "beginning of window" while still
+displaying a longer span. Each read is self-consistent with the current window;
+the fix is for the server to return the resolved `since_ms` on stream open and
+the client to echo it on page requests.

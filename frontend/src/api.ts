@@ -157,6 +157,47 @@ export async function unitAction(
 /** A log source: `journal:<unit>` or `docker:<container>`. */
 export type LogSource = string;
 
+/** Time window for a journal read. Maps to journalctl `-b` / `--since`. */
+export type LogWindow = "boot" | "1h" | "24h" | "all";
+
+/** `priority` is a severity ceiling (lower = more severe); 0 means no filter. */
+export type LogFilters = { priority: number; window: LogWindow };
+
+/** Per-unit default: unfiltered, so behaviour is unchanged from before filters. */
+export const ALL_LOGS: LogFilters = { priority: 0, window: "all" };
+/** Whole-journal default: current boot, the cheapest and most relevant read. */
+export const BOOT_LOGS: LogFilters = { priority: 0, window: "boot" };
+
+/** The whole system journal — no `-u`. */
+export const SYSTEM_JOURNAL = "journal:@system";
+
+/**
+ * Read filters out of the URL, falling back to `fallback` for anything missing
+ * or invalid — the same forgiving guard `?tab=typo` gets, so a bad link renders
+ * the default view instead of nothing.
+ */
+export function filtersFromParams(
+  params: URLSearchParams,
+  fallback: LogFilters,
+): LogFilters {
+  const rawPStr = params.get("priority");
+  const rawP = rawPStr === null ? NaN : Number(rawPStr);
+  const priority = Number.isInteger(rawP) && rawP >= 0 && rawP <= 7 ? rawP : fallback.priority;
+  const rawW = params.get("window");
+  const window: LogWindow =
+    rawW === "boot" || rawW === "1h" || rawW === "24h" || rawW === "all"
+      ? rawW
+      : fallback.window;
+  return { priority, window };
+}
+
+/** Shared query params for both log endpoints. */
+function filterParams(f: LogFilters): Record<string, string> {
+  const p: Record<string, string> = { window: f.window };
+  if (f.priority > 0) p.priority = String(f.priority);
+  return p;
+}
+
 /**
  * The SSE URL for a tail. `LazyLog` opens the EventSource itself, so this
  * returns a URL rather than a fetch — see components/LogViewer.tsx.
@@ -164,6 +205,7 @@ export type LogSource = string;
 export function logStreamUrl(
   id: string,
   source: LogSource,
+  filters: LogFilters = ALL_LOGS,
   tail = 200,
   follow = true,
 ): string {
@@ -171,6 +213,7 @@ export function logStreamUrl(
     source,
     tail: String(tail),
     follow: String(follow),
+    ...filterParams(filters),
   });
   return `/api/machines/${id}/logs/stream?${params.toString()}`;
 }
@@ -191,10 +234,16 @@ export async function fetchLogPage(
   id: string,
   source: string,
   before: string,
+  filters: LogFilters = ALL_LOGS,
   limit = 500,
 ): Promise<LogPage> {
-  const params = new URLSearchParams({ source, before, limit: String(limit) });
+  const params = new URLSearchParams({
+    source,
+    before,
+    limit: String(limit),
+    ...filterParams(filters),
+  });
   const r = await fetch(`/api/machines/${id}/logs/page?${params.toString()}`);
   if (!r.ok) throw new Error(`log page ${r.status}`);
-  return r.json();
+  return (await r.json()) as LogPage;
 }

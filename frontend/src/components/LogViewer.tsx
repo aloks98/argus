@@ -1,10 +1,11 @@
 // The shared log view. Drives LazyLog in controlled `text` mode: we own the
 // EventSource and the line buffer, because the library's `eventsource` mode is
-// append-only and Task 7 needs to PREPEND older pages. Behaviour of the live
-// tail is unchanged — stream, follow, search, select.
+// append-only and loading older pages needs to PREPEND to the buffer.
+// Behaviour of the live tail is unchanged — stream, follow, search, select.
 import { useEffect, useMemo, useRef, useState, type WheelEvent } from "react";
 import { LazyLog } from "@melloware/react-logviewer";
-import { fetchLogPage, logStreamUrl } from "../api";
+import { fetchLogPage, logStreamUrl, ALL_LOGS } from "../api";
+import type { LogFilters } from "../api";
 import type { LogLine } from "../lib/logs";
 import { formatLogLine, levelTone, parseLogParts, parseNdjsonBatch } from "../lib/logs";
 import type { Tone } from "../lib/status";
@@ -22,10 +23,12 @@ const MAX_LINES = 50_000;
 export default function LogViewer({
   machineId,
   source,
+  filters = ALL_LOGS,
   height,
 }: {
   machineId: string;
   source: string;
+  filters?: LogFilters;
   height?: number;
 }) {
   const [lines, setLines] = useState<LogLine[]>([]);
@@ -41,6 +44,12 @@ export default function LogViewer({
   // Pending rAF handles for the deferred post-prepend anchor (cancelled on unmount).
   const anchorRaf1 = useRef(0);
   const anchorRaf2 = useRef(0);
+  // Bumped every time the reset effect below rebuilds the stream (source or
+  // filter change). `loadOlder` captures the value before its `await` and
+  // discards a response that resolves after the generation has moved on, so a
+  // stale in-flight page can never prepend into a freshly-reset, differently
+  // filtered buffer.
+  const runIdRef = useRef(0);
 
   const isJournal = source.startsWith("journal:");
 
@@ -53,14 +62,18 @@ export default function LogViewer({
     [],
   );
 
-  // Own the EventSource so the buffer is ours to append to (and, in Task 7,
-  // prepend to). Re-created when machine or source changes.
+  // Own the EventSource so the buffer is ours to append to and to prepend
+  // older pages into. Re-created when machine, source, or filters change.
   useEffect(() => {
+    // A new generation: any `loadOlder` call still in flight from the
+    // previous machine/source/filters must not touch the buffer being reset
+    // here once its response arrives.
+    runIdRef.current += 1;
     setLines([]);
     setReachedStart(false);
     setFollowing(true);
     setAnchorLine(undefined);
-    const es = new EventSource(logStreamUrl(machineId, source));
+    const es = new EventSource(logStreamUrl(machineId, source, filters));
     es.onmessage = (e) => {
       const batch = parseNdjsonBatch(e.data);
       if (batch.length === 0) return;
@@ -71,7 +84,7 @@ export default function LogViewer({
     };
     // The browser's EventSource auto-reconnects; nothing to do on error.
     return () => es.close();
-  }, [machineId, source]);
+  }, [machineId, source, filters.priority, filters.window]);
 
   const text = useMemo(() => lines.map(formatLogLine).join("\n"), [lines]);
 
@@ -88,8 +101,13 @@ export default function LogViewer({
     // no-op. Clear it first so every load transitions through a distinct
     // (undefined) value before landing on the real target below.
     setAnchorLine(undefined);
+    // Captured before the `await`: if a filter/source change bumps this while
+    // the request is in flight, the reset effect has already cleared `lines`
+    // and reopened the stream, so this response is stale and must be dropped.
+    const runId = runIdRef.current;
     try {
-      const page = await fetchLogPage(machineId, source, oldest);
+      const page = await fetchLogPage(machineId, source, oldest, filters);
+      if (runId !== runIdRef.current) return;
       if (page.lines.length > 0) {
         const seam = page.lines.length + 1;
         setLines((prev) => {
@@ -148,7 +166,9 @@ export default function LogViewer({
       {isJournal && (
         <div className="pb-1 text-center font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
           {reachedStart
-            ? "— beginning of journal —"
+            ? filters.window === "all"
+              ? "— beginning of journal —"
+              : "— beginning of window —"
             : loadingOlder
               ? "loading older…"
               : "scroll up to load older"}
