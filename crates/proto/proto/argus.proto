@@ -157,6 +157,9 @@ message LogTailRequest {
   string source = 2;       // "docker:<container-id>" | "journal:<unit>"
   uint32 tail_lines = 3;
   bool follow = 4;
+  // Journal pagination: read the page of entries BEFORE this journald cursor.
+  // Empty = a normal tail from the end. Only meaningful with follow=false.
+  string before_cursor = 5;
 }
 message LogTailStop { string request_id = 1; }
 message LogChunk {

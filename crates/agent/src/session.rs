@@ -344,6 +344,7 @@ async fn connect_and_serve(
                                             source,
                                             req.tail_lines,
                                             req.follow,
+                                            req.before_cursor,
                                             docker,
                                             out,
                                             rid,

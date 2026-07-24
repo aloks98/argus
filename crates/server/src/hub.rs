@@ -239,6 +239,7 @@ impl Hub {
         source: String,
         tail_lines: u32,
         follow: bool,
+        before_cursor: String,
     ) -> Result<(), DispatchError> {
         let (tx, stream_id) = self.conn_slot(machine_id)?;
         let frame = ServerFrame {
@@ -248,6 +249,7 @@ impl Hub {
                 source,
                 tail_lines,
                 follow,
+                before_cursor,
             })),
         };
         tx.send(Ok(frame))
@@ -587,9 +589,16 @@ mod tests {
         let m = Uuid::new_v4();
         let (tx, mut rx) = mpsc::channel(4);
         hub.register(m, tx);
-        hub.send_log_start(m, "r1".into(), "journal:nginx.service".into(), 200, true)
-            .await
-            .expect("dispatch");
+        hub.send_log_start(
+            m,
+            "r1".into(),
+            "journal:nginx.service".into(),
+            200,
+            true,
+            String::new(),
+        )
+        .await
+        .expect("dispatch");
         let frame = rx.recv().await.unwrap().unwrap();
         assert_ne!(frame.stream_id, 0);
         match frame.payload {
@@ -598,6 +607,7 @@ mod tests {
                 assert_eq!(r.source, "journal:nginx.service");
                 assert_eq!(r.tail_lines, 200);
                 assert!(r.follow);
+                assert_eq!(r.before_cursor, "");
             }
             other => panic!("expected LogTailStart, got {other:?}"),
         }

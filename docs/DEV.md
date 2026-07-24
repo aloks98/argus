@@ -39,6 +39,35 @@ with `ARGUS_FIELD_KEY`); on later boots it *loads* it. The browser surface is on
 > A `.cargo/config.toml` `[env]` block is a convenient place to pin the dev values so
 > every `cargo run`/`test` sees them (git-ignored).
 
+## Running the `#[ignore]`d live agent tests
+
+The agent's `live_*` tests talk to the real journal and D-Bus system bus, so they
+are `#[ignore]`d by default. They need **root**: `journalctl` returns nothing
+unless you're in `systemd-journal`/`adm`, and polkit denies the unit-verb test
+with `InteractiveAuthorizationRequired`. Build unprivileged, then run the test
+binary as root — `sudo cargo test` would use a different `CARGO_HOME`/target and
+rebuild the world:
+
+```bash
+cargo test -p argus-agent --no-run          # prints the test binary path
+sudo -n ./target/debug/deps/argus_agent-<hash> --ignored --test-threads=1
+```
+
+Do **not** "fix" a failure here by adding your user to `systemd-journal` or
+editing sudoers — the tests are ignored precisely because they need privilege the
+normal test run shouldn't have.
+
+**CI does not run these.** The act_runner is a container with no D-Bus system
+bus, no journal, and no root-for-polkit, so `.forgejo/workflows/ci.yml` runs
+`cargo test --workspace -- --ignored --skip live_`. Every other ignored test
+(the server's, which only need the Postgres the job provisions) still runs
+workspace-wide; only the host-dependent `live_*` set is excluded, and it is a
+manual real-host gate instead.
+
+> Name any test that needs a real systemd host `live_*`. That prefix is what CI
+> filters on — a host-dependent test called anything else will run in the
+> container and fail.
+
 ## Enroll an agent
 ```bash
 # 1. Grab the CA cert the agent needs to verify the server:
@@ -382,3 +411,49 @@ socket both need it, the same reason the systemd slice's live tests do.
 
 The disposable `argus-flood.service` was removed and the host left with no
 `argus-*` units and no failed units.
+
+## Log pagination — manual verification (2026-07-24)
+
+Journal-only "load older" pagination on top of the live SSE tail. Design of
+record: `docs/superpowers/specs/2026-07-24-log-pagination-design.md`. Agent runs
+as root (journal access), same as the log slice.
+
+**Endpoint checks (curl), against the live journal:**
+- Grab an oldest cursor from a tail (`…/logs/stream?…&follow=false`), then
+  `GET …/logs/page?source=journal:<unit>&before=<cursor>&limit=N` returns up to N
+  older lines, each carrying a `cursor`, plus `oldest_cursor` and `reached_start`.
+- **Exact chaining, no duplicate boundary:** paging before page 1's
+  `oldest_cursor` returned page 2 whose lines did **not** include page 1's oldest
+  cursor — the agent drops the inclusive anchor entry (`finalize_page`), so the
+  seam never repeats a line.
+- **`reached_start`:** paging a low-volume unit (`systemd-journald.service`) with
+  `limit=1000` returned 411 lines (< limit) and `reached_start:true`.
+- **Validation:** `source=docker:…` → **400** (docker has no cursor, unsupported);
+  missing `before` → **400**; agent offline → **409**.
+- **Audit:** a *successful* page fetch writes a `logs.page`/`ok` row. The row is
+  written only after the tail is dispatched (mirroring `logs.open`), so a **409**
+  (offline) or **504** (wedged) leaves **no** row for a read that never happened.
+- **Agent hygiene:** the endpoint sends a `LogTailStop` once the page is
+  collected, so a page read doesn't leak a dead `AbortHandle` on the agent; a
+  non-zero `journalctl` exit (e.g. a rejected cursor) surfaces as a marker line
+  rather than a silent empty page reported as `reached_start`.
+
+**Browser checks (the behaviours static gates and curl cannot confirm — curl
+does not do EventSource framing or scroll):** open a unit's logs, then:
+1. Live tail streams and follows at the bottom (unchanged).
+2. Scroll up → "loading older…" → older lines prepend and **the viewport holds**
+   (the line you were reading stays put). Crucially, keep scrolling up so **two+
+   consecutive pages** load — the trigger must re-fire on every load. Two library
+   traps made this fail: a fixed-500 page size made the naïve `scrollToLine` skip
+   re-anchoring on the 2nd+ load (fixed by clearing the anchor to `undefined`
+   before each fetch); and `LazyLog`'s `onScroll` only fires on an offset *change*
+   while its `align:"nearest"` anchor often left the viewport pinned at offset 0,
+   so once parked at the top no scroll event could re-fire the load. Fixed by
+   deferring the anchor two frames (so it lands off the top) plus an `onWheel`
+   handler that fires the load on an upward wheel at the top even when no scroll
+   event is produced.
+3. At the journal start, "— beginning of journal —" shows and no further fetches
+   fire.
+4. Follow **pauses** while scrolled up (new live lines don't yank you down);
+   scrolling back to the bottom **resumes** it.
+5. Text stays selectable/copyable; a **docker** source shows no "load older" row.

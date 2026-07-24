@@ -67,7 +67,16 @@ jobs:
       - name: Test (unit + sqlx::test + live-DB integration)
         run: |
           cargo test --workspace
-          cargo test --workspace -- --ignored
+          # `--skip live_` is load-bearing — do not drop it. Most #[ignore]d tests
+          # only need the live Postgres this job already provisions, so they must
+          # still run here. The exception is the `live_*` tests, which need a real
+          # systemd host: a D-Bus system bus, a readable journal, and root for the
+          # polkit-guarded unit verb. This runner is a container with none of
+          # those, so without the skip they fail every run. Skipping by name (not
+          # by package) keeps workspace-wide coverage, so a new ignored test in
+          # any crate is still picked up. The live_* set is a manual real-host
+          # gate instead — see docs/DEV.md.
+          cargo test --workspace -- --ignored --skip live_
 
   # The agent must ship as a fully static binary for Flatcar (CLAUDE.md standing
   # convention). This builds it for the musl target and asserts it's static, so a

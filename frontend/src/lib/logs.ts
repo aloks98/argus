@@ -1,9 +1,10 @@
 // The two halves of the LazyLog seam, kept pure and out of the component.
 //
-// `formatMessage` must return a string and `formatPart` receives only that
-// string — never the original object — so severity has to survive as text.
-// These two functions are the encoder and decoder of that hop; they must agree
-// on the prefix, which is why they live together.
+// LazyLog's controlled `text` mode stores one string per line and `formatPart`
+// receives only that string — never the original object — so severity has to
+// survive as text. `formatLogLine` encodes a `LogLine` into that string and
+// `parseLogParts` decodes it back out; they must agree on the prefix, which is
+// why they live together.
 import type { Tone } from "./status";
 
 export type LogLine = {
@@ -12,49 +13,34 @@ export type LogLine = {
   ident: string | null;
   msg: string;
   marker?: boolean;
+  cursor?: string | null;
 };
 
 /** Width of the encoded level field, so the decoder can split by index. */
 const LEVEL_WIDTH = 1;
 
-/**
- * NDJSON batch -> the display lines LazyLog stores.
- *
- * The agent batches many NDJSON records into one `LogChunk`; after the SSE
- * hop, `EventSource` rejoins them into a single `message` event whose `.data`
- * is every record joined by `\n`, and `@melloware/react-logviewer` calls
- * `formatMessage` exactly ONCE with that whole multi-line blob. So this must
- * split the blob back into records, format each to exactly one display line,
- * and rejoin with `\n` — LazyLog then re-splits our return value into one
- * visual row per record and calls `formatPart` on each.
- */
-export function formatLogMessage(raw: unknown): string {
-  return String(raw)
-    .split("\n")
-    .filter((record) => record.length > 0)
-    .map(formatOneRecord)
-    .join("\n");
+/** Parse one SSE/page NDJSON blob into structured lines, dropping blanks and
+ *  anything unparseable (a malformed record must not break the batch). */
+export function parseNdjsonBatch(blob: string): LogLine[] {
+  const out: LogLine[] = [];
+  for (const record of String(blob).split("\n")) {
+    if (record.length === 0) continue;
+    try {
+      out.push(JSON.parse(record) as LogLine);
+    } catch {
+      out.push({ ts: 0, level: null, ident: null, msg: record });
+    }
+  }
+  return out;
 }
 
-/**
- * One NDJSON record -> the single display line LazyLog stores.
- * Layout: `<level><ts-iso> <ident>\t<msg>` where level is one char (`0`-`7`,
- * or `-` when the source has no severity).
- */
-function formatOneRecord(record: string): string {
-  let line: LogLine;
-  try {
-    line = JSON.parse(record) as LogLine;
-  } catch {
-    return `-       \t${record}`;
-  }
+/** A LogLine -> the single display line LazyLog stores in `text` mode.
+ *  Layout: `<level><ts-iso> <ident>\t<msg>`; level is one char (`0`-`7` or `-`). */
+export function formatLogLine(line: LogLine): string {
   const level = line.level === null || line.level === undefined ? "-" : String(line.level);
   const time = new Date(line.ts).toISOString().slice(11, 19);
   const ident = line.ident ?? "";
-  // Collapse any newline INSIDE one record's message: a multi-line MESSAGE
-  // (e.g. a stack trace) is one NDJSON record and must stay one display line,
-  // or its continuation rows would lose the level/ts/ident prefix and misparse
-  // in formatPart.
+  // A multi-line MESSAGE is one record and must stay one display row.
   const msg = line.msg.replace(/\r?\n/g, " ⏎ ");
   return `${level}${time} ${ident}\t${msg}`;
 }

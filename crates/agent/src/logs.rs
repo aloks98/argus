@@ -37,6 +37,11 @@ pub struct LogLine {
     pub msg: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub marker: bool,
+    /// journald's opaque `__CURSOR` — the exact backward-paging anchor. `None`
+    /// for docker lines and markers, which are never a paging anchor. Omitted
+    /// from the wire when `None` so those lines stay byte-unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
 }
 
 /// Longest accepted unit name / container reference.
@@ -116,12 +121,17 @@ pub fn journal_record_to_line(json: &str) -> Option<LogLine> {
         .get("SYSLOG_IDENTIFIER")
         .and_then(|i| i.as_str())
         .map(|i| i.to_string());
+    let cursor = v
+        .get("__CURSOR")
+        .and_then(|c| c.as_str())
+        .map(|c| c.to_string());
     Some(LogLine {
         ts,
         level,
         ident,
         msg,
         marker: false,
+        cursor,
     })
 }
 
@@ -149,6 +159,7 @@ pub fn docker_line(raw: &str, ident: &str) -> LogLine {
         ident: Some(ident.to_string()),
         msg: raw.trim_end_matches(['\n', '\r']).to_string(),
         marker: false,
+        cursor: None,
     }
 }
 
@@ -161,6 +172,7 @@ pub fn drop_marker(dropped: u64, now_ms: i64) -> LogLine {
         ident: None,
         msg: format!("—— {dropped} lines dropped (stream saturated) ——"),
         marker: true,
+        cursor: None,
     }
 }
 
@@ -273,10 +285,16 @@ fn try_emit(
 /// or the task is cancelled. Cancellation happens by aborting this task; the
 /// journal child is killed on drop because `Command` is configured with
 /// `kill_on_drop`.
+///
+/// `before_cursor` pushed this to 8 params (from 7, same reasoning as
+/// `run_docker` below): splitting into a context struct would obscure the
+/// straight-line handoff to `run_journal`/`run_docker` for no benefit.
+#[allow(clippy::too_many_arguments)]
 pub async fn run_tail(
     source: Source,
     tail_lines: u32,
     follow: bool,
+    before_cursor: String,
     docker: crate::docker::DockerClient,
     out: mpsc::Sender<AgentFrame>,
     request_id: String,
@@ -294,6 +312,7 @@ pub async fn run_tail(
                 &unit,
                 tail_lines,
                 follow,
+                &before_cursor,
                 &mut batcher,
                 &out,
                 &request_id,
@@ -322,6 +341,7 @@ pub async fn run_tail(
             ident: None,
             msg: format!("log tail ended: {e}"),
             marker: true,
+            cursor: None,
         };
         batcher.push(err);
     }
@@ -350,15 +370,30 @@ pub async fn run_tail(
     tracing::warn!(request_id = %request_id, "log tail: gave up sending eof");
 }
 
+// Same 8-param shape as run_tail above, for the same reason.
+#[allow(clippy::too_many_arguments)]
 async fn run_journal(
     unit: &str,
     tail_lines: u32,
     follow: bool,
+    before_cursor: &str,
     batcher: &mut Batcher,
     out: &mpsc::Sender<AgentFrame>,
     request_id: &str,
     stream_id: u64,
 ) -> anyhow::Result<()> {
+    if !before_cursor.is_empty() {
+        return run_journal_page(
+            unit,
+            before_cursor,
+            tail_lines,
+            batcher,
+            out,
+            request_id,
+            stream_id,
+        )
+        .await;
+    }
     let mut cmd = Command::new("journalctl");
     // argv only — nothing is ever interpolated into a shell command line.
     cmd.arg("-u")
@@ -413,7 +448,60 @@ async fn run_journal(
             ident: None,
             msg: format!("journalctl exited with {status}"),
             marker: true,
+            cursor: None,
         });
+    }
+    Ok(())
+}
+
+/// A one-shot backward page read: spawn `journalctl --cursor --reverse`, collect
+/// the whole (bounded) page, drop the anchor, re-order oldest-first, and push it
+/// to the batcher. No follow, no ticker — the process exits on its own and the
+/// caller's final flush + eof close the request.
+async fn run_journal_page(
+    unit: &str,
+    before_cursor: &str,
+    limit: u32,
+    batcher: &mut Batcher,
+    out: &mpsc::Sender<AgentFrame>,
+    request_id: &str,
+    stream_id: u64,
+) -> anyhow::Result<()> {
+    let mut cmd = Command::new("journalctl");
+    for arg in journal_page_argv(unit, before_cursor, limit) {
+        cmd.arg(arg);
+    }
+    cmd.kill_on_drop(true);
+    let mut child = cmd.stdout(Stdio::piped()).stderr(Stdio::null()).spawn()?;
+    let stdout = child.stdout.take().expect("stdout piped above");
+    let mut lines = BufReader::new(stdout).lines();
+
+    let mut records = Vec::new();
+    while let Some(raw) = lines.next_line().await? {
+        if let Some(line) = journal_record_to_line(&raw) {
+            records.push(line);
+        }
+    }
+    for line in finalize_page(records, before_cursor) {
+        batcher.push(line);
+        flush_ready(batcher, out, request_id, stream_id);
+    }
+
+    // Same as the live path: a non-zero exit (a cursor journalctl rejects, an
+    // EACCES, an out-of-range `-n`) otherwise yields an empty page that the
+    // server reports as `reached_start` — indistinguishable from the real start
+    // of the journal. Surface it as a visible marker instead.
+    let status = child.wait().await?;
+    if !status.success() {
+        batcher.push(LogLine {
+            ts: now_ms(),
+            level: Some(3),
+            ident: None,
+            msg: format!("journalctl exited with {status}"),
+            marker: true,
+            cursor: None,
+        });
+        flush_ready(batcher, out, request_id, stream_id);
     }
     Ok(())
 }
@@ -478,6 +566,37 @@ fn flush_ready(
             batcher.note_dropped(lines);
         }
     }
+}
+
+/// The argv for a backward page read: the `limit` entries *before*
+/// `before_cursor`, newest-first (`finalize_page` re-orders them). `--cursor` is
+/// inclusive of the anchor entry and `-n limit+1` fetches it so it can be
+/// dropped, so a page never duplicates the boundary line the client already
+/// holds. Never follows. Called by `run_journal_page`.
+pub fn journal_page_argv(unit: &str, before_cursor: &str, limit: u32) -> Vec<String> {
+    vec![
+        "-u".into(),
+        unit.into(),
+        "--cursor".into(),
+        before_cursor.into(),
+        "--reverse".into(),
+        "-n".into(),
+        (limit.saturating_add(1)).to_string(),
+        "-o".into(),
+        "json".into(),
+    ]
+}
+
+/// Turn a raw `--reverse` page (newest-first, starting at the anchor) into the
+/// display page: drop the anchor entry the client already has, and re-order
+/// oldest-first so lines arrive in reading order. Called by `run_journal_page`.
+pub fn finalize_page(records: Vec<LogLine>, before_cursor: &str) -> Vec<LogLine> {
+    let mut kept: Vec<LogLine> = records
+        .into_iter()
+        .filter(|l| l.cursor.as_deref() != Some(before_cursor))
+        .collect();
+    kept.reverse();
+    kept
 }
 
 #[cfg(test)]
@@ -587,6 +706,7 @@ mod tests {
             ident: Some("nginx".into()),
             msg: "up".into(),
             marker: false,
+            cursor: None,
         };
         let s = line_to_ndjson(&line);
         assert!(!s.contains('\n'), "must not embed a newline: {s}");
@@ -607,6 +727,7 @@ mod tests {
             ident: None,
             msg: "line one\nline two".into(),
             marker: false,
+            cursor: None,
         };
         let s = line_to_ndjson(&line);
         assert_eq!(s.matches('\n').count(), 0);
@@ -643,6 +764,7 @@ mod tests {
             ident: None,
             msg: msg.to_string(),
             marker: false,
+            cursor: None,
         }
     }
 
@@ -728,7 +850,7 @@ mod tests {
     /// flush timer has to fire on its own, not only when the next line
     /// arrives. Reverting the ticker makes this hang until the timeout.
     #[tokio::test]
-    #[ignore = "spawns journalctl; run with --ignored on a systemd host"]
+    #[ignore = "spawns journalctl; needs a live journal, run under sudo"]
     async fn live_idle_tail_flushes_its_backlog_without_waiting_for_a_new_line() {
         let (tx, mut rx) = tokio::sync::mpsc::channel(16);
         let docker = crate::docker::DockerClient::connect();
@@ -737,6 +859,7 @@ mod tests {
                 Source::Journal("systemd-journald.service".into()),
                 20,
                 true, // follow: the unit is quiet, so nothing new will arrive
+                String::new(),
                 docker,
                 tx,
                 "req-idle".into(),
@@ -749,5 +872,152 @@ mod tests {
             .expect("a quiet tail must still flush its backlog");
         assert!(got.is_some(), "expected a LogChunk frame");
         task.abort();
+    }
+
+    #[test]
+    fn journal_record_reads_the_cursor() {
+        let raw = r#"{"__CURSOR":"s=abc;i=1;b=xyz","PRIORITY":"6","__REALTIME_TIMESTAMP":"1784812931123456","SYSLOG_IDENTIFIER":"nginx","MESSAGE":"up"}"#;
+        let line = journal_record_to_line(raw).expect("parses");
+        assert_eq!(line.cursor.as_deref(), Some("s=abc;i=1;b=xyz"));
+    }
+
+    #[test]
+    fn a_record_without_a_cursor_still_parses_with_none() {
+        let raw = r#"{"MESSAGE":"no cursor here"}"#;
+        let line = journal_record_to_line(raw).expect("parses");
+        assert_eq!(line.cursor, None);
+    }
+
+    #[test]
+    fn ndjson_omits_cursor_when_absent_but_includes_it_when_present() {
+        let bare = LogLine {
+            ts: 1,
+            level: Some(6),
+            ident: None,
+            msg: "x".into(),
+            marker: false,
+            cursor: None,
+        };
+        assert!(
+            !line_to_ndjson(&bare).contains("cursor"),
+            "docker/marker lines stay cursor-free"
+        );
+
+        let with = LogLine {
+            cursor: Some("s=abc".into()),
+            ..bare
+        };
+        let s = line_to_ndjson(&with);
+        let v: serde_json::Value = serde_json::from_str(&s).unwrap();
+        assert_eq!(v["cursor"], "s=abc");
+    }
+
+    #[test]
+    fn journal_page_argv_reads_backward_from_the_cursor() {
+        let argv = journal_page_argv("nginx.service", "s=abc;i=9", 500);
+        // -u <unit> --cursor <c> --reverse -n <limit+1> -o json ; no -f
+        assert_eq!(
+            argv,
+            vec![
+                "-u",
+                "nginx.service",
+                "--cursor",
+                "s=abc;i=9",
+                "--reverse",
+                "-n",
+                "501",
+                "-o",
+                "json",
+            ]
+        );
+        assert!(!argv.iter().any(|a| a == "-f"), "a page read never follows");
+    }
+
+    fn line_with_cursor(cursor: &str, ts: i64) -> LogLine {
+        LogLine {
+            ts,
+            level: Some(6),
+            ident: None,
+            msg: format!("line {ts}"),
+            marker: false,
+            cursor: Some(cursor.into()),
+        }
+    }
+
+    #[test]
+    fn finalize_page_drops_the_anchor_and_orders_oldest_first() {
+        // journalctl --reverse returns newest-first, starting AT the anchor.
+        // Records as received: [anchor(t=30), t=20, t=10].
+        let records = vec![
+            line_with_cursor("s=anchor", 30),
+            line_with_cursor("s=b", 20),
+            line_with_cursor("s=a", 10),
+        ];
+        let page = finalize_page(records, "s=anchor");
+        // anchor removed, re-ordered oldest-first
+        let ts: Vec<i64> = page.iter().map(|l| l.ts).collect();
+        assert_eq!(ts, vec![10, 20], "anchor dropped, chronological order");
+        assert!(
+            !page.iter().any(|l| l.cursor.as_deref() == Some("s=anchor")),
+            "the boundary line the client already has is never duplicated"
+        );
+    }
+
+    #[test]
+    fn finalize_page_handles_a_start_of_journal_short_read() {
+        // Near the start there is no older entry than the anchor: only the
+        // anchor comes back, so the page is empty.
+        let records = vec![line_with_cursor("s=anchor", 30)];
+        assert!(finalize_page(records, "s=anchor").is_empty());
+    }
+
+    /// Live page read against the local journal. Ignored like the repo's other
+    /// live-journal tests; run with --ignored under sudo on a systemd host.
+    #[tokio::test]
+    #[ignore = "needs a live journal; run under sudo"]
+    async fn live_journal_page_reads_older_than_a_cursor() {
+        // Get a recent cursor from a normal tail first.
+        let out = tokio::process::Command::new("journalctl")
+            .args([
+                "-u",
+                "ssh.service",
+                "-n",
+                "5",
+                "-o",
+                "json",
+                "--show-cursor",
+            ])
+            .output()
+            .await
+            .expect("journalctl");
+        let text = String::from_utf8_lossy(&out.stdout);
+        let newest_cursor = text
+            .lines()
+            .filter_map(journal_record_to_line)
+            .next_back()
+            .and_then(|l| l.cursor)
+            .expect("a cursor from the tail");
+
+        // Now read the page before it.
+        let argv = journal_page_argv("ssh.service", &newest_cursor, 10);
+        let page_out = tokio::process::Command::new("journalctl")
+            .args(&argv)
+            .output()
+            .await
+            .expect("journalctl page");
+        let records: Vec<LogLine> = String::from_utf8_lossy(&page_out.stdout)
+            .lines()
+            .filter_map(journal_record_to_line)
+            .collect();
+        let page = finalize_page(records, &newest_cursor);
+        assert!(
+            page.iter()
+                .all(|l| l.cursor.as_deref() != Some(newest_cursor.as_str())),
+            "the anchor is never in its own page"
+        );
+        // Page is oldest-first.
+        if page.len() >= 2 {
+            assert!(page[0].ts <= page[page.len() - 1].ts, "chronological order");
+        }
     }
 }

@@ -68,6 +68,7 @@ fn router(state: AppState) -> Router {
             post(unit_action),
         )
         .route("/api/machines/{id}/logs/stream", get(log_stream))
+        .route("/api/machines/{id}/logs/page", get(logs_page))
         // TODO: nest remaining /api routes (terminal WS, events SSE, audit,
         // enroll-tokens) and /auth OIDC routes here (PRD §9.1).
         .fallback(static_handler)
@@ -389,6 +390,22 @@ struct LogStreamQuery {
     follow: Option<bool>,
 }
 
+/// Query params for `GET /api/machines/{id}/logs/page`.
+#[derive(serde::Deserialize)]
+struct LogPageQuery {
+    source: String,
+    before: Option<String>,
+    limit: Option<u32>,
+}
+
+/// One page of older journal entries plus the anchor for the next page.
+#[derive(serde::Serialize)]
+struct LogPage {
+    lines: Vec<serde_json::Value>,
+    oldest_cursor: Option<String>,
+    reached_start: bool,
+}
+
 /// Server-side source validation. The agent validates independently — neither
 /// side trusts the other, because this value becomes a subprocess argument.
 fn source_is_valid(raw: &str) -> bool {
@@ -453,7 +470,14 @@ async fn log_stream(
     let (request_id, rx) = state.hub.open_tail(id);
     if let Err(DispatchError::NotConnected) = state
         .hub
-        .send_log_start(id, request_id.clone(), q.source.clone(), tail, follow)
+        .send_log_start(
+            id,
+            request_id.clone(),
+            q.source.clone(),
+            tail,
+            follow,
+            String::new(),
+        )
         .await
     {
         state.hub.close_tail(&request_id);
@@ -505,6 +529,124 @@ async fn log_stream(
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
+}
+
+/// A page read is a one-shot; bound the collection so a wedged agent can't hang
+/// the request. journalctl returns a bounded page quickly.
+const PAGE_TIMEOUT: Duration = Duration::from_secs(15);
+
+/// `GET /api/machines/{id}/logs/page?source=&before=&limit=` — one backward page
+/// of a unit's journal, collected from a short-lived non-follow tail. Journal
+/// only; docker has no cursor.
+async fn logs_page(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    Query(q): Query<LogPageQuery>,
+) -> Response {
+    // Journal only: reuse the shared validator, then reject anything but a
+    // journal source (docker paging is unsupported).
+    if !source_is_valid(&q.source) || !q.source.starts_with("journal:") {
+        return (StatusCode::BAD_REQUEST, "invalid or non-journal source").into_response();
+    }
+    let Some(before) = q.before.filter(|b| !b.is_empty()) else {
+        return (StatusCode::BAD_REQUEST, "missing `before` cursor").into_response();
+    };
+    let limit = q.limit.unwrap_or(DEFAULT_TAIL_LINES).min(MAX_TAIL_LINES);
+
+    // Open the tail and dispatch BEFORE auditing, mirroring log_stream: an
+    // offline agent must 409 with NO `logs.page` row at all, and a later
+    // timeout must not leave an `ok` row for a read that never returned.
+    let (request_id, mut rx) = state.hub.open_tail(id);
+    if let Err(DispatchError::NotConnected) = state
+        .hub
+        .send_log_start(
+            id,
+            request_id.clone(),
+            q.source.clone(),
+            limit,
+            false,
+            before,
+        )
+        .await
+    {
+        state.hub.close_tail(&request_id);
+        return (StatusCode::CONFLICT, "agent not connected").into_response();
+    }
+
+    // Reading logs is not a mutation but can expose secrets, so record who read
+    // what — only now that the page read is actually live on the agent. Same
+    // posture as logs.open; fail closed if the row can't be written.
+    let command_id = Uuid::new_v4();
+    if let Err(e) = repo::audit_command(
+        &state.pool,
+        "anonymous",
+        "logs.page",
+        Some(id),
+        &q.source,
+        command_id,
+        "ok",
+    )
+    .await
+    {
+        tracing::error!(error = %e, "logs page: audit write failed; closing tail");
+        state.hub.close_tail(&request_id);
+        if let Err(e) = state.hub.send_log_stop(id, request_id).await {
+            tracing::debug!(error = ?e, "logs page: stop not delivered (agent gone)");
+        }
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to record audit entry",
+        )
+            .into_response();
+    }
+
+    // Collect chunks until eof (or timeout). The agent sends the whole page then
+    // an eof chunk.
+    let mut buf: Vec<u8> = Vec::new();
+    let collected = tokio::time::timeout(PAGE_TIMEOUT, async {
+        while let Some(chunk) = rx.recv().await {
+            buf.extend_from_slice(&chunk.data);
+            if chunk.eof {
+                break;
+            }
+        }
+    })
+    .await;
+    // Tear the short-lived tail down on the agent too. The page read is a
+    // non-follow process that exits on its own, but the agent only drops its
+    // AbortHandle map entry on LogTailStop, so without this each page fetch
+    // would leak a dead handle for the session's lifetime.
+    state.hub.close_tail(&request_id);
+    if let Err(e) = state.hub.send_log_stop(id, request_id).await {
+        tracing::debug!(error = ?e, "logs page: stop not delivered (agent gone)");
+    }
+    if collected.is_err() {
+        return (
+            StatusCode::GATEWAY_TIMEOUT,
+            "agent did not return a page in time",
+        )
+            .into_response();
+    }
+
+    // Parse the NDJSON page. Lines are already oldest-first from the agent.
+    let lines: Vec<serde_json::Value> = String::from_utf8_lossy(&buf)
+        .lines()
+        .filter(|l| !l.is_empty())
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .collect();
+    let oldest_cursor = lines.iter().find_map(|l| {
+        l.get("cursor")
+            .and_then(|c| c.as_str())
+            .map(|c| c.to_string())
+    });
+    let reached_start = (lines.len() as u32) < limit;
+
+    Json(LogPage {
+        lines,
+        oldest_cursor,
+        reached_start,
+    })
+    .into_response()
 }
 
 /// The bounded wait for a dispatched verb's result.
@@ -1525,6 +1667,143 @@ mod tests {
             .await?;
 
         assert_eq!(seen_rx.await?, MAX_TAIL_LINES, "tail must be clamped");
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn logs_page_rejects_a_docker_source(pool: PgPool) -> anyhow::Result<()> {
+        let (state, _hub) = app_state_with_hub(pool);
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/machines/{}/logs/page?source=docker:abc&before=s%3Dx",
+                        Uuid::new_v4()
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn logs_page_requires_a_before_cursor(pool: PgPool) -> anyhow::Result<()> {
+        let (state, _hub) = app_state_with_hub(pool);
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/machines/{}/logs/page?source=journal:ssh.service",
+                        Uuid::new_v4()
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn logs_page_returns_409_when_offline(pool: PgPool) -> anyhow::Result<()> {
+        let machine_id: Uuid = sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname, status) VALUES ('page-offline', 'h', 'offline') RETURNING id"
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+        let (state, _hub) = app_state_with_hub(pool.clone());
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/machines/{machine_id}/logs/page?source=journal:ssh.service&before=s%3Dx"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn logs_page_collects_a_page_audits_and_reports_reached_start(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let machine_id: Uuid = sqlx::query!(
+            "INSERT INTO machines (machine_id, hostname, status) VALUES ('page-online', 'h', 'online') RETURNING id"
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+        let (state, hub) = app_state_with_hub(pool.clone());
+
+        // Fake agent: on a LogTailStart with a before_cursor, stream two page
+        // lines then eof.
+        let (tx, mut agent_rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
+        hub.register(machine_id, tx);
+        let hub2 = hub.clone();
+        tokio::spawn(async move {
+            while let Some(Ok(frame)) = agent_rx.recv().await {
+                if let Some(server_frame::Payload::LogTailStart(req)) = frame.payload {
+                    assert_eq!(req.before_cursor, "s=x", "the cursor must reach the agent");
+                    assert!(!req.follow, "a page read never follows");
+                    let body = b"{\"ts\":1,\"level\":6,\"ident\":null,\"msg\":\"older-a\",\"cursor\":\"s=a\"}\n{\"ts\":2,\"level\":6,\"ident\":null,\"msg\":\"older-b\",\"cursor\":\"s=b\"}\n".to_vec();
+                    let request_id = req.request_id.clone();
+                    hub2.deliver_chunk(
+                        &request_id,
+                        machine_id,
+                        argus_proto::v1::LogChunk {
+                            request_id: req.request_id.clone(),
+                            data: body,
+                            eof: false,
+                        },
+                    );
+                    hub2.deliver_chunk(
+                        &request_id,
+                        machine_id,
+                        argus_proto::v1::LogChunk {
+                            request_id: req.request_id,
+                            data: Vec::new(),
+                            eof: true,
+                        },
+                    );
+                }
+            }
+        });
+
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/machines/{machine_id}/logs/page?source=journal:ssh.service&before=s%3Dx&limit=500"
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = to_bytes(resp.into_body(), usize::MAX).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(v["lines"].as_array().unwrap().len(), 2);
+        assert_eq!(v["lines"][0]["msg"], "older-a");
+        assert_eq!(v["oldest_cursor"], "s=a");
+        assert_eq!(
+            v["reached_start"], true,
+            "a short page means the journal start"
+        );
+
+        let row = sqlx::query!(
+            "SELECT action, result FROM audit_log WHERE machine_id = $1 AND action = 'logs.page'",
+            machine_id,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.result.as_deref(), Some("ok"));
+
         Ok(())
     }
 }

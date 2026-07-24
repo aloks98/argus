@@ -1,6 +1,8 @@
 // Thin fetch wrapper around the control plane's read-only fleet endpoint
 // (crates/server, Task 9). Kept dependency-free — no client library needed
 // for a single GET.
+import type { LogLine } from "./lib/logs";
+
 export type FleetRow = {
   id: string;
   hostname: string;
@@ -171,4 +173,28 @@ export function logStreamUrl(
     follow: String(follow),
   });
   return `/api/machines/${id}/logs/stream?${params.toString()}`;
+}
+
+/** One backward page of journal entries plus the next anchor. */
+export type LogPage = {
+  lines: LogLine[];
+  oldest_cursor: string | null;
+  reached_start: boolean;
+};
+
+/**
+ * Fetch the page of journal entries older than `before`. Journal only — the
+ * server rejects docker sources. `before` is the oldest cursor the viewer
+ * currently holds.
+ */
+export async function fetchLogPage(
+  id: string,
+  source: string,
+  before: string,
+  limit = 500,
+): Promise<LogPage> {
+  const params = new URLSearchParams({ source, before, limit: String(limit) });
+  const r = await fetch(`/api/machines/${id}/logs/page?${params.toString()}`);
+  if (!r.ok) throw new Error(`log page ${r.status}`);
+  return r.json();
 }

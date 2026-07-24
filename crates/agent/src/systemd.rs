@@ -587,7 +587,7 @@ mod tests {
     /// starting it is a no-op for the host, but systemd still creates a real job
     /// that completes with result "done".
     #[tokio::test]
-    #[ignore = "needs a live D-Bus system bus"]
+    #[ignore = "needs a live D-Bus system bus + root; polkit denies the verb otherwise"]
     async fn live_bus_run_verb_reports_a_real_job_result() {
         let client = SystemdClient::connect().await;
         let r = client
