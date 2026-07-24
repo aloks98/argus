@@ -198,6 +198,14 @@ pub struct SystemdClient {
 }
 
 impl SystemdClient {
+    /// Whether a system-bus connection was established for this session.
+    ///
+    /// Consumed by `capabilities::probe()`, called once per session from
+    /// `session::connect_and_serve` immediately before `Hello`.
+    pub fn is_available(&self) -> bool {
+        self.inner.is_some()
+    }
+
     /// Best-effort connect to the system bus. Never fails.
     ///
     /// Every bus round-trip here is bounded by `OP_TIMEOUT`. This is called

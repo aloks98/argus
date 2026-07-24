@@ -26,6 +26,9 @@ pub struct AgentInfoRow {
     pub arch: Option<String>,
     pub primary_ip: Option<String>,
     pub agent_version: Option<String>,
+    /// `None` = the agent never reported (stored as NULL, gates nothing).
+    /// `Some(vec![])` = reported and this host has none (gates everything).
+    pub capabilities: Option<Vec<String>>,
 }
 
 /// Hash `token_plain` with sha256 and atomically check-and-consume the
@@ -74,8 +77,8 @@ pub async fn upsert_machine(
     // pulling in the `ipnetwork` sqlx feature just for this one column.
     let row = sqlx::query!(
         r#"
-        INSERT INTO machines (machine_id, hostname, os, kernel, arch, primary_ip, agent_version)
-        VALUES ($1, $2, $3, $4, $5, $6::text::inet, $7)
+        INSERT INTO machines (machine_id, hostname, os, kernel, arch, primary_ip, agent_version, capabilities)
+        VALUES ($1, $2, $3, $4, $5, $6::text::inet, $7, $8)
         ON CONFLICT (machine_id) DO UPDATE SET
             hostname      = EXCLUDED.hostname,
             os            = EXCLUDED.os,
@@ -83,6 +86,7 @@ pub async fn upsert_machine(
             arch          = EXCLUDED.arch,
             primary_ip    = EXCLUDED.primary_ip,
             agent_version = EXCLUDED.agent_version,
+            capabilities  = coalesce(EXCLUDED.capabilities, machines.capabilities),
             updated_at    = now()
         RETURNING id
         "#,
@@ -93,6 +97,7 @@ pub async fn upsert_machine(
         info.arch,
         info.primary_ip,
         info.agent_version,
+        info.capabilities.as_deref(),
     )
     .fetch_one(executor)
     .await?;
@@ -127,6 +132,7 @@ pub async fn update_machine_inventory(
             arch          = $5,
             primary_ip    = $6::text::inet,
             agent_version = $7,
+            capabilities  = coalesce($8, machines.capabilities),
             updated_at    = now()
         WHERE id = $1
         "#,
@@ -137,6 +143,7 @@ pub async fn update_machine_inventory(
         info.arch,
         info.primary_ip,
         info.agent_version,
+        info.capabilities.as_deref(),
     )
     .execute(executor)
     .await?;
@@ -476,6 +483,8 @@ pub struct MachineDetail {
     pub enrolled_at: OffsetDateTime,
     pub tags: Vec<String>,
     pub notes: Option<String>,
+    /// `None` = never reported; the client must gate nothing in that case.
+    pub capabilities: Option<Vec<String>>,
 }
 
 /// Look up one machine's full inventory row for the detail page, or `None`
@@ -489,7 +498,7 @@ pub async fn machine_detail(
         r#"
         SELECT id, machine_id, hostname, os, kernel, arch,
                host(primary_ip) as "primary_ip?", agent_version, status,
-               last_seen_at, enrolled_at, tags, notes
+               last_seen_at, enrolled_at, tags, notes, capabilities
         FROM machines
         WHERE id = $1
         "#,
@@ -624,6 +633,7 @@ mod tests {
             arch: Some("x86_64".into()),
             primary_ip: Some("10.0.0.5".into()),
             agent_version: Some("0.1.0".into()),
+            capabilities: None,
         };
         let id1 = upsert_machine(&pool, &info_v1).await.expect("first upsert");
 
@@ -667,6 +677,7 @@ mod tests {
                 arch: None,
                 primary_ip: None,
                 agent_version: None,
+                capabilities: None,
             },
         )
         .await
@@ -726,6 +737,7 @@ mod tests {
                 arch: None,
                 primary_ip: None,
                 agent_version: None,
+                capabilities: None,
             },
         )
         .await
@@ -1005,6 +1017,272 @@ mod tests {
         .count;
         assert_eq!(remaining, 1, "expected the fresh row to remain");
 
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn capabilities_round_trip_and_none_stays_distinct_from_empty(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        // Reported set survives a round trip.
+        let id = upsert_machine(
+            &pool,
+            &AgentInfoRow {
+                machine_id: "caps-1".into(),
+                hostname: "h".into(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+                capabilities: Some(vec!["systemd".into(), "journal".into()]),
+            },
+        )
+        .await?;
+        let got: Option<Vec<String>> =
+            sqlx::query_scalar!("SELECT capabilities FROM machines WHERE id = $1", id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            got,
+            Some(vec!["systemd".to_string(), "journal".to_string()])
+        );
+
+        // An EMPTY reported set is stored as `{}` and must NOT collapse to NULL:
+        // it means "this host has none", which gates everything.
+        let empty_id = upsert_machine(
+            &pool,
+            &AgentInfoRow {
+                machine_id: "caps-2".into(),
+                hostname: "h".into(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+                capabilities: Some(vec![]),
+            },
+        )
+        .await?;
+        let empty: Option<Vec<String>> =
+            sqlx::query_scalar!("SELECT capabilities FROM machines WHERE id = $1", empty_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            empty,
+            Some(vec![]),
+            "empty must stay empty, not become NULL"
+        );
+
+        // A pre-capability agent reports nothing at all -> NULL -> gate nothing.
+        let null_id = upsert_machine(
+            &pool,
+            &AgentInfoRow {
+                machine_id: "caps-3".into(),
+                hostname: "h".into(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+                capabilities: None,
+            },
+        )
+        .await?;
+        let null_caps: Option<Vec<String>> =
+            sqlx::query_scalar!("SELECT capabilities FROM machines WHERE id = $1", null_id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(null_caps, None, "unreported must stay NULL");
+        Ok(())
+    }
+
+    /// The property above (`capabilities_round_trip_and_none_stays_distinct_from_empty`)
+    /// only ever inserts fresh rows, so it never reaches `upsert_machine`'s
+    /// `ON CONFLICT` branch -- the one place `coalesce(EXCLUDED.capabilities,
+    /// machines.capabilities)` actually runs. This test calls `upsert_machine`
+    /// TWICE on the SAME `machine_id`: the second call (a silent, pre-capability
+    /// agent reporting `None`) must not erase what the first call established.
+    #[sqlx::test]
+    async fn upsert_machine_on_conflict_none_does_not_erase_capabilities(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let machine_id = "caps-conflict-none".to_string();
+
+        let id1 = upsert_machine(
+            &pool,
+            &AgentInfoRow {
+                machine_id: machine_id.clone(),
+                hostname: "h".into(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+                capabilities: Some(vec!["systemd".into()]),
+            },
+        )
+        .await?;
+
+        // Same machine_id -> hits ON CONFLICT this time. A None report must not
+        // clobber the capabilities established by the first upsert.
+        let id2 = upsert_machine(
+            &pool,
+            &AgentInfoRow {
+                machine_id: machine_id.clone(),
+                hostname: "h".into(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+                capabilities: None,
+            },
+        )
+        .await?;
+        assert_eq!(id1, id2, "same machine_id must resolve to the same row");
+
+        let got: Option<Vec<String>> =
+            sqlx::query_scalar!("SELECT capabilities FROM machines WHERE id = $1", id1)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            got,
+            Some(vec!["systemd".to_string()]),
+            "a silent (None) report on ON CONFLICT must not erase previously-established capabilities"
+        );
+        Ok(())
+    }
+
+    /// Companion to the above: an INTENTIONAL empty report (`Some(vec![])`, not
+    /// `None`) on the SAME `machine_id` must still overwrite -- proving
+    /// `coalesce` isn't just silently ignoring every update on conflict.
+    #[sqlx::test]
+    async fn upsert_machine_on_conflict_explicit_empty_overwrites_capabilities(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let machine_id = "caps-conflict-empty".to_string();
+
+        let id1 = upsert_machine(
+            &pool,
+            &AgentInfoRow {
+                machine_id: machine_id.clone(),
+                hostname: "h".into(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+                capabilities: Some(vec!["systemd".into()]),
+            },
+        )
+        .await?;
+
+        let id2 = upsert_machine(
+            &pool,
+            &AgentInfoRow {
+                machine_id: machine_id.clone(),
+                hostname: "h".into(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+                capabilities: Some(vec![]),
+            },
+        )
+        .await?;
+        assert_eq!(id1, id2, "same machine_id must resolve to the same row");
+
+        let got: Option<Vec<String>> =
+            sqlx::query_scalar!("SELECT capabilities FROM machines WHERE id = $1", id1)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            got,
+            Some(vec![]),
+            "an explicit empty report is not NULL and must overwrite, not be swallowed by coalesce"
+        );
+        Ok(())
+    }
+
+    /// `update_machine_inventory` is the Hello-path refresh, keyed by the
+    /// authenticated `machines.id` (never the self-reported `machine_id`
+    /// string). Nothing in the task's tests called it at all; pin both halves
+    /// of the tri-state contract on it directly: a `None` report preserves
+    /// what's on disk, and a subsequent explicit report overwrites it.
+    #[sqlx::test]
+    async fn update_machine_inventory_none_preserves_then_explicit_overwrites_capabilities(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let id = upsert_machine(
+            &pool,
+            &AgentInfoRow {
+                machine_id: "caps-hello".into(),
+                hostname: "h".into(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+                capabilities: Some(vec!["systemd".into()]),
+            },
+        )
+        .await?;
+
+        // A silent (None) Hello must not erase what enrollment established.
+        update_machine_inventory(
+            &pool,
+            id,
+            &AgentInfoRow {
+                machine_id: "caps-hello".into(),
+                hostname: "h".into(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+                capabilities: None,
+            },
+        )
+        .await?;
+
+        let got: Option<Vec<String>> =
+            sqlx::query_scalar!("SELECT capabilities FROM machines WHERE id = $1", id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            got,
+            Some(vec!["systemd".to_string()]),
+            "update_machine_inventory must not erase capabilities on a None report"
+        );
+
+        // A subsequent Hello with an explicit new set must overwrite.
+        update_machine_inventory(
+            &pool,
+            id,
+            &AgentInfoRow {
+                machine_id: "caps-hello".into(),
+                hostname: "h".into(),
+                os: None,
+                kernel: None,
+                arch: None,
+                primary_ip: None,
+                agent_version: None,
+                capabilities: Some(vec!["systemd".into(), "docker".into()]),
+            },
+        )
+        .await?;
+
+        let got: Option<Vec<String>> =
+            sqlx::query_scalar!("SELECT capabilities FROM machines WHERE id = $1", id)
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(
+            got,
+            Some(vec!["systemd".to_string(), "docker".to_string()]),
+            "update_machine_inventory must apply an explicit new report"
+        );
         Ok(())
     }
 }

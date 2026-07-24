@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, machine_id, hostname, os, kernel, arch,\n               host(primary_ip) as \"primary_ip?\", agent_version, status,\n               last_seen_at, enrolled_at, tags, notes\n        FROM machines\n        WHERE id = $1\n        ",
+  "query": "\n        SELECT id, machine_id, hostname, os, kernel, arch,\n               host(primary_ip) as \"primary_ip?\", agent_version, status,\n               last_seen_at, enrolled_at, tags, notes, capabilities\n        FROM machines\n        WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -140,6 +140,17 @@
             "name": "notes"
           }
         }
+      },
+      {
+        "ordinal": 13,
+        "name": "capabilities",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "capabilities"
+          }
+        }
       }
     ],
     "parameters": {
@@ -160,8 +171,9 @@
       true,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "8c76740dad8d7f0774060cccb09607ce6033c5ce58782c8873e5ab4d349c5344"
+  "hash": "e8cbef99e4052960aa553a615f554a00eb6136c5615a30653c7794c0576e0d21"
 }

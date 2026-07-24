@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO machines (machine_id, hostname, status, capabilities)\n               VALUES ('caps-populated', 'caps-populated-host', 'online', ARRAY['systemd', 'journal'])\n               RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "a63747b5da430e5ea58c365e75064c89eb55bbdc3c85864e1663fcaa47324240"
+}

@@ -363,6 +363,13 @@ fn agent_info_row(info: &argus_proto::v1::AgentInfo) -> AgentInfoRow {
         arch: non_empty(&info.arch),
         primary_ip: non_empty(&info.primary_ip),
         agent_version: non_empty(&info.agent_version),
+        // Only an agent that SAYS it is reporting produces a non-NULL value.
+        // proto3 decodes an absent repeated field and an empty one identically,
+        // so this flag is the only thing separating "old agent, gate nothing"
+        // from "bare host, gate everything".
+        capabilities: info
+            .capabilities_reported
+            .then(|| info.capabilities.clone()),
     }
 }
 
@@ -422,6 +429,56 @@ mod tests {
         let kp = KeyPair::generate().unwrap();
         let params = CertificateParams::new(vec!["agent".into()]).unwrap();
         params.serialize_request(&kp).unwrap().pem().unwrap()
+    }
+
+    /// `agent_info_row` is the SINGLE conversion point from the proto message
+    /// to the row, and the only place `capabilities_reported` becomes the
+    /// `Option`. Pin all three tri-state outcomes directly, independent of any
+    /// DB round trip.
+    #[test]
+    fn agent_info_row_capabilities_tri_state() {
+        // Not reported -> None (NULL, gate nothing) -- even though the proto
+        // wire can't distinguish an empty repeated field from an absent one,
+        // this must not be confused with a genuinely-empty report below.
+        let not_reported = argus_proto::v1::AgentInfo {
+            machine_id: "m".into(),
+            hostname: "h".into(),
+            capabilities: vec!["systemd".into()],
+            capabilities_reported: false,
+            ..Default::default()
+        };
+        assert_eq!(
+            agent_info_row(&not_reported).capabilities,
+            None,
+            "capabilities_reported == false must map to None regardless of the repeated field's contents"
+        );
+
+        // Reported, but the host genuinely has none -> Some(vec![]), not None.
+        let reported_empty = argus_proto::v1::AgentInfo {
+            machine_id: "m".into(),
+            hostname: "h".into(),
+            capabilities: vec![],
+            capabilities_reported: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            agent_info_row(&reported_empty).capabilities,
+            Some(vec![]),
+            "capabilities_reported == true with an empty vec must map to Some(vec![]), not None"
+        );
+
+        // Reported with entries -> Some(entries).
+        let reported_some = argus_proto::v1::AgentInfo {
+            machine_id: "m".into(),
+            hostname: "h".into(),
+            capabilities: vec!["systemd".into(), "journal".into()],
+            capabilities_reported: true,
+            ..Default::default()
+        };
+        assert_eq!(
+            agent_info_row(&reported_some).capabilities,
+            Some(vec!["systemd".to_string(), "journal".to_string()])
+        );
     }
 
     async fn seed_token(pool: &PgPool, plain: &str, name: &str) {
@@ -612,6 +669,7 @@ mod tests {
                 arch: None,
                 primary_ip: None,
                 agent_version: None,
+                capabilities: None,
             },
         )
         .await?;
@@ -725,6 +783,7 @@ mod tests {
                 arch: None,
                 primary_ip: None,
                 agent_version: None,
+                capabilities: None,
             },
         )
         .await?;
@@ -739,6 +798,7 @@ mod tests {
                 arch: None,
                 primary_ip: None,
                 agent_version: None,
+                capabilities: None,
             },
         )
         .await?;
@@ -826,6 +886,7 @@ mod tests {
                 arch: None,
                 primary_ip: None,
                 agent_version: None,
+                capabilities: None,
             },
         )
         .await?;
@@ -900,6 +961,7 @@ mod tests {
                 arch: None,
                 primary_ip: None,
                 agent_version: None,
+                capabilities: None,
             },
         )
         .await?;
@@ -952,6 +1014,7 @@ mod tests {
                 arch: None,
                 primary_ip: None,
                 agent_version: None,
+                capabilities: None,
             },
         )
         .await?;
@@ -1025,6 +1088,7 @@ mod tests {
                 arch: None,
                 primary_ip: None,
                 agent_version: None,
+                capabilities: None,
             },
         )
         .await?;
@@ -1088,6 +1152,7 @@ mod tests {
                 arch: None,
                 primary_ip: None,
                 agent_version: None,
+                capabilities: None,
             },
         )
         .await?;
@@ -1156,6 +1221,7 @@ mod tests {
                 arch: None,
                 primary_ip: None,
                 agent_version: None,
+                capabilities: None,
             },
         )
         .await?;
@@ -1169,6 +1235,7 @@ mod tests {
                 arch: None,
                 primary_ip: None,
                 agent_version: None,
+                capabilities: None,
             },
         )
         .await?;

@@ -21,6 +21,10 @@ pub fn gather(agent_version: &str) -> Result<AgentInfo> {
         primary_ip: primary_ip(),
         arch: uname.machine().to_string_lossy().into_owned(),
         agent_version: agent_version.to_string(),
+        // The session probes and sets the real values on every (re)connect;
+        // `gather()` only runs once, at enrollment, before any client exists.
+        capabilities: Vec::new(),
+        capabilities_reported: false,
     })
 }
 

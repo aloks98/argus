@@ -202,6 +202,8 @@ struct MachineDetailDto {
     enrolled_at: OffsetDateTime,
     tags: Vec<String>,
     notes: Option<String>,
+    /// `None` = never reported; the client must gate nothing in that case.
+    capabilities: Option<Vec<String>>,
 }
 
 impl From<repo::MachineDetail> for MachineDetailDto {
@@ -220,6 +222,7 @@ impl From<repo::MachineDetail> for MachineDetailDto {
             enrolled_at: d.enrolled_at,
             tags: d.tags,
             notes: d.notes,
+            capabilities: d.capabilities,
         }
     }
 }
@@ -400,6 +403,7 @@ struct LogPageQuery {
     limit: Option<u32>,
     priority: Option<u32>,
     window: Option<String>,
+    since_ms: Option<u64>,
 }
 
 /// One page of older journal entries plus the anchor for the next page.
@@ -466,6 +470,38 @@ fn resolve_log_filters(priority: Option<u32>, window: Option<&str>) -> Option<Lo
         since_ms,
         current_boot,
     })
+}
+
+/// `resolve_log_filters` plus an explicit, already-resolved cutoff.
+///
+/// A page read must use the SAME cutoff its stream was given, otherwise every
+/// request re-resolves `now` and a view open longer than its own window finds
+/// each page fully truncated — reporting "beginning of window" while still
+/// displaying a longer span. The stream announces its resolved cutoff in a
+/// `meta` frame and the client echoes it here, so `since_ms` wins over `window`.
+/// `window` is still validated even when overridden, so a malformed request is
+/// rejected rather than silently accepted.
+///
+/// `Some(0)` is treated as "no explicit cutoff", matching the convention used
+/// everywhere else in this codebase that `since_ms == 0` means unset (see
+/// `crates/agent/src/logs.rs`). This is not a hypothetical: `window=boot`
+/// resolves to `since_ms = 0`, so the `meta` frame announces `{"since_ms":0}`
+/// and the client dutifully echoes `since_ms=0` back on every page read of a
+/// boot-windowed tail. Treating that as authoritative would set
+/// `current_boot = false` and silently drop the boot filter on every page
+/// read — the resolved `since_ms=0` cutoff is then inert (0 means unset), so
+/// the page comes back unfiltered by boot at all.
+fn resolve_log_filters_with_since(
+    priority: Option<u32>,
+    window: Option<&str>,
+    since_ms: Option<u64>,
+) -> Option<LogFilters> {
+    let mut f = resolve_log_filters(priority, window)?;
+    if let Some(explicit) = since_ms.filter(|&v| v != 0) {
+        f.since_ms = explicit;
+        f.current_boot = false;
+    }
+    Some(f)
 }
 
 /// Filters only apply to journal reads — `run_docker` ignores them entirely,
@@ -599,13 +635,24 @@ async fn log_stream(
         machine_id: id,
         request_id,
     };
+
+    // Announce the resolved cutoff FIRST, so every page read for this tail can
+    // echo it back instead of re-resolving `now` and drifting. A *named* event
+    // deliberately: the browser's EventSource routes named events to
+    // addEventListener and NOT to onmessage, so this frame cannot be mistaken
+    // for a log line by the existing NDJSON parsing.
+    let meta = Event::default()
+        .event("meta")
+        .data(format!(r#"{{"since_ms":{}}}"#, filters.since_ms));
+    let head = tokio_stream::once(Ok::<Event, Infallible>(meta));
+
     let stream = ReceiverStream::new(rx).map(move |chunk| {
         // The guard is owned by the closure, so it drops with the stream.
         let _ = &guard;
         Ok::<Event, Infallible>(Event::default().data(String::from_utf8_lossy(&chunk.data)))
     });
 
-    Sse::new(stream)
+    Sse::new(head.chain(stream))
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
         .into_response()
 }
@@ -630,8 +677,13 @@ async fn logs_page(
     let Some(before) = q.before.filter(|b| !b.is_empty()) else {
         return (StatusCode::BAD_REQUEST, "missing `before` cursor").into_response();
     };
-    let Some(filters) = resolve_log_filters(q.priority, q.window.as_deref()) else {
-        return (StatusCode::BAD_REQUEST, "invalid priority or window").into_response();
+    let Some(filters) = resolve_log_filters_with_since(q.priority, q.window.as_deref(), q.since_ms)
+    else {
+        return (
+            StatusCode::BAD_REQUEST,
+            "invalid priority, window or since_ms",
+        )
+            .into_response();
     };
     // Always a no-op today (the check above already rejects non-journal
     // sources), kept for defense-in-depth so this handler can never dispatch
@@ -1091,6 +1143,74 @@ mod tests {
             )
             .await?;
         assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        Ok(())
+    }
+
+    /// `repo`-level tests already pin the tri-state through `upsert_machine`
+    /// and `machine_detail`; this pins the SAME tri-state through the actual
+    /// `GET /api/machines/{id}` JSON body, which is the exact contract the
+    /// frontend's tab-gating reads (`MachineDetailPage.tsx`'s `caps` /
+    /// `lacks()`). `null` and `[]` are not interchangeable: `null` must gate
+    /// NOTHING (an agent that predates capability reporting) and `[]` must
+    /// gate EVERYTHING (a bare host that reported and has none) -- so the
+    /// distinction has to survive serialization, not just the repo layer.
+    #[sqlx::test]
+    async fn machine_detail_json_carries_the_capability_tri_state(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let null_id: Uuid = sqlx::query!(
+            r#"INSERT INTO machines (machine_id, hostname, status)
+               VALUES ('caps-null', 'caps-null-host', 'online') RETURNING id"#
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+
+        let empty_id: Uuid = sqlx::query!(
+            r#"INSERT INTO machines (machine_id, hostname, status, capabilities)
+               VALUES ('caps-empty', 'caps-empty-host', 'online', ARRAY[]::text[])
+               RETURNING id"#
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+
+        let populated_id: Uuid = sqlx::query!(
+            r#"INSERT INTO machines (machine_id, hostname, status, capabilities)
+               VALUES ('caps-populated', 'caps-populated-host', 'online', ARRAY['systemd', 'journal'])
+               RETURNING id"#
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+
+        let app = router(AppState {
+            pool,
+            hub: Arc::new(Hub::new()),
+        });
+
+        for (id, expected) in [
+            (null_id, serde_json::Value::Null),
+            (empty_id, serde_json::json!([])),
+            (populated_id, serde_json::json!(["systemd", "journal"])),
+        ] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/machines/{id}"))
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await?;
+            let detail: serde_json::Value = serde_json::from_slice(&body)?;
+            assert_eq!(
+                detail["capabilities"], expected,
+                "capabilities JSON mismatch for machine {id}"
+            );
+        }
 
         Ok(())
     }
@@ -1705,6 +1825,39 @@ mod tests {
             "SSE body must carry the chunk: {text}"
         );
 
+        // The leading frame must be a NAMED `meta` event: a browser's
+        // EventSource routes named events to addEventListener and NOT to
+        // onmessage, so an unnamed frame would be parsed as a log line by the
+        // client's NDJSON code. And it must come BEFORE the log chunk, so a
+        // page read never sees a chunk before it knows what cutoff to echo
+        // back.
+        let meta_pos = text
+            .find("event: meta\n")
+            .expect("the SSE body must contain a frame named `meta`");
+        let hello_pos = text.find("hello").expect("SSE body must carry the chunk");
+        assert!(
+            meta_pos < hello_pos,
+            "the `meta` frame must be emitted before the first log chunk: {text}"
+        );
+
+        // The `meta` frame's `data:` field carries the resolved cutoff. No
+        // window was requested, so it defaults to `all` (since_ms=0).
+        let after_meta = &text[meta_pos..];
+        let data_prefix = "data: ";
+        let data_start = after_meta
+            .find(data_prefix)
+            .map(|i| i + data_prefix.len())
+            .expect("the `meta` frame must carry a `data:` field");
+        let data_end = after_meta[data_start..]
+            .find('\n')
+            .map(|i| data_start + i)
+            .unwrap_or(after_meta.len());
+        assert_eq!(
+            &after_meta[data_start..data_end],
+            r#"{"since_ms":0}"#,
+            "the `meta` frame must announce the resolved cutoff: {text}"
+        );
+
         let row = sqlx::query!(
             "SELECT action, target_ref, result FROM audit_log WHERE machine_id = $1",
             machine_id,
@@ -1766,6 +1919,27 @@ mod tests {
                 Request::builder()
                     .uri(format!(
                         "/api/machines/{}/logs/page?source=docker:abc&before=s%3Dx",
+                        Uuid::new_v4()
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn logs_page_rejects_a_non_numeric_since_ms(pool: PgPool) -> anyhow::Result<()> {
+        // since_ms is Query<Option<u64>>; a non-numeric value fails axum's
+        // deserialization before the handler body ever runs, so this
+        // documents that the 400 comes from the extractor, not our code.
+        let (state, _hub) = app_state_with_hub(pool);
+        let app = router(state);
+        let resp = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/machines/{}/logs/page?source=journal:ssh.service&before=s%3Dx&since_ms=abc",
                         Uuid::new_v4()
                     ))
                     .body(Body::empty())?,
@@ -2140,5 +2314,68 @@ mod tests {
             0,
             "an absent priority defaults to 0 (unset), not rejected"
         );
+    }
+
+    #[test]
+    fn explicit_since_ms_overrides_the_window() {
+        // A page must be able to say "use the cutoff my stream was given".
+        let f = resolve_log_filters_with_since(None, Some("1h"), Some(1_600_000_000_000))
+            .expect("an explicit since_ms is valid");
+        assert_eq!(f.since_ms, 1_600_000_000_000);
+        assert!(!f.current_boot, "an explicit cutoff is not a boot window");
+    }
+
+    #[test]
+    fn explicit_since_ms_turns_off_a_requested_boot_window() {
+        // window="boot" alone sets current_boot=true (see
+        // resolve_log_filters_boot_sets_current_boot_and_no_since below). An
+        // explicit since_ms must still win and flip it back to false: an
+        // explicit cutoff and a boot window are alternative answers to the
+        // same question and must never combine. This is the true->false
+        // transition; `explicit_since_ms_overrides_the_window` above uses
+        // window="1h", whose current_boot is already false, so it never
+        // exercises this override.
+        let f = resolve_log_filters_with_since(None, Some("boot"), Some(1_600_000_000_000))
+            .expect("a boot window plus an explicit since_ms is valid");
+        assert_eq!(f.since_ms, 1_600_000_000_000);
+        assert!(
+            !f.current_boot,
+            "an explicit since_ms must suppress the boot window"
+        );
+    }
+
+    #[test]
+    fn explicit_since_ms_of_zero_does_not_turn_off_a_requested_boot_window() {
+        // Unlike `explicit_since_ms_turns_off_a_requested_boot_window` above
+        // (window=boot + since_ms=1_600_000_000_000, a pair the client can
+        // never actually produce), this is the pair that IS reachable
+        // end-to-end: `resolve_log_filters(_, Some("boot"))` resolves to
+        // `since_ms = 0`, so the `meta` frame announces `{"since_ms":0}` and
+        // the client echoes `since_ms=0` back on every subsequent page read
+        // of that tail. `since_ms == 0` means "unset" everywhere else in this
+        // codebase (crates/agent/src/logs.rs), so it must NOT be treated as
+        // an authoritative cutoff here either — doing so would flip
+        // `current_boot` to false and silently drop the boot filter on every
+        // page read.
+        let f = resolve_log_filters_with_since(None, Some("boot"), Some(0))
+            .expect("boot plus since_ms=0 is valid");
+        assert!(
+            f.current_boot,
+            "since_ms=0 must not suppress a requested boot window"
+        );
+        assert_eq!(f.since_ms, 0);
+    }
+
+    #[test]
+    fn without_since_ms_the_window_still_resolves() {
+        let f = resolve_log_filters_with_since(None, Some("boot"), None)
+            .expect("boot is a valid window");
+        assert!(f.current_boot);
+        assert_eq!(f.since_ms, 0);
+    }
+
+    #[test]
+    fn an_invalid_window_is_still_rejected_even_with_since_ms() {
+        assert!(resolve_log_filters_with_since(None, Some("bogus"), Some(1)).is_none());
     }
 }

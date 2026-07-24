@@ -50,6 +50,10 @@ export default function LogViewer({
   // stale in-flight page can never prepend into a freshly-reset, differently
   // filtered buffer.
   const runIdRef = useRef(0);
+  // The cutoff this tail resolved, learned from the stream's `meta` frame.
+  // A ref, not state: it must be readable by `loadOlder` without making the
+  // stream effect depend on it and tear the EventSource down.
+  const sinceMsRef = useRef<number | undefined>(undefined);
 
   const isJournal = source.startsWith("journal:");
 
@@ -74,6 +78,30 @@ export default function LogViewer({
     setFollowing(true);
     setAnchorLine(undefined);
     const es = new EventSource(logStreamUrl(machineId, source, filters));
+    sinceMsRef.current = undefined;
+    // Named events do NOT reach `onmessage`, so this cannot collide with the
+    // NDJSON log frames. The browser's EventSource auto-reconnects on a
+    // dropped connection (routine — the server ends the SSE stream whenever an
+    // agent session tears down), and the server re-resolves and re-announces a
+    // fresh cutoff on every such reconnect. But the line buffer is NOT cleared
+    // on a reconnect — only this effect clears it, on machine/source/filter
+    // change — so adopting that fresh cutoff here would pair a newer cutoff
+    // with an older buffer: `loadOlder` would then send a cutoff newer than
+    // the anchor already in view, `finalize_page` would truncate the page to
+    // nothing, and the viewer would report "beginning of window" while still
+    // showing an older span. So only adopt the announced cutoff the FIRST time
+    // for this buffer's lifetime; a later reconnect's cutoff is discarded and
+    // the buffer keeps paging against the cutoff it started with, exactly as
+    // long as the buffer itself survives.
+    es.addEventListener("meta", (e) => {
+      if (sinceMsRef.current !== undefined) return;
+      try {
+        const m = JSON.parse((e as MessageEvent).data) as { since_ms?: number };
+        sinceMsRef.current = typeof m.since_ms === "number" ? m.since_ms : undefined;
+      } catch {
+        // A malformed meta frame just means we page without an explicit cutoff.
+      }
+    });
     es.onmessage = (e) => {
       const batch = parseNdjsonBatch(e.data);
       if (batch.length === 0) return;
@@ -106,7 +134,7 @@ export default function LogViewer({
     // and reopened the stream, so this response is stale and must be dropped.
     const runId = runIdRef.current;
     try {
-      const page = await fetchLogPage(machineId, source, oldest, filters);
+      const page = await fetchLogPage(machineId, source, oldest, filters, sinceMsRef.current);
       if (runId !== runIdRef.current) return;
       if (page.lines.length > 0) {
         const seam = page.lines.length + 1;
@@ -174,7 +202,14 @@ export default function LogViewer({
               : "scroll up to load older"}
         </div>
       )}
-      <div className="min-h-0 flex-1" onWheel={onWheel}>
+      {/* `dark` is deliberate and not a theme bug: LazyLog's own surface is
+          always dark, but the row colours below come from theme tokens, so in
+          light mode `--foreground` resolves to near-black and the log text
+          renders dark-on-dark. Scoping a dark token context to just this
+          subtree keeps the rows readable in both themes. It is applied here
+          rather than on the component root so the "scroll up to load older"
+          status line above still follows the page theme. */}
+      <div className="dark min-h-0 flex-1" onWheel={onWheel}>
         <LazyLog
           // Remount on a source switch so an in-progress search term and scroll
           // position don't carry across from the previous unit's logs.

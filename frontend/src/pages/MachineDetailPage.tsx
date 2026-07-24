@@ -23,6 +23,10 @@ import {
   CardHeader,
   CardTitle,
   EmptyState,
+  Tabs,
+  TabsContent,
+  TabsList,
+  TabsTrigger,
 } from "@e412/rnui-react";
 import ContainersCard from "../components/ContainersCard";
 import LogDialog from "../components/LogDialog";
@@ -31,11 +35,11 @@ import LogViewer from "../components/LogViewer";
 import SpecStrip from "../components/SpecStrip";
 import type { SpecItem } from "../components/SpecStrip";
 import StatusBadge from "../components/StatusBadge";
-import Tabs from "../components/Tabs";
 import TimeSeriesChart from "../components/TimeSeriesChart";
 import type { ChartSeries } from "../components/TimeSeriesChart";
 import UnitsCard from "../components/UnitsCard";
-import { BOOT_LOGS, SYSTEM_JOURNAL } from "../api";
+import { BOOT_LOGS, CAP_DOCKER, CAP_JOURNAL, CAP_SYSTEMD, SYSTEM_JOURNAL } from "../api";
+import { cn } from "../lib/cn";
 import { useLogFilters } from "../lib/logFilters";
 import { formatBytesPerSec, formatRelative } from "../lib/format";
 import {
@@ -49,15 +53,6 @@ import type { Range } from "../lib/queries";
 import { machineTone } from "../lib/status";
 
 const RANGES: readonly Range[] = ["1h", "6h", "24h"];
-
-/** Declared once so the tab strip and the `?tab=` URL guard can't drift apart. */
-const TABS: { key: string; label: string }[] = [
-  { key: "overview", label: "Overview" },
-  { key: "containers", label: "Containers" },
-  { key: "units", label: "Units" },
-  { key: "logs", label: "Logs" },
-];
-const TAB_KEYS: readonly string[] = TABS.map((t) => t.key);
 
 // uPlot wants numeric x values in seconds, not ms and not date strings.
 const toSecs = (points: { ts: string }[]) => points.map((p) => Date.parse(p.ts) / 1000);
@@ -113,16 +108,6 @@ export default function MachineDetailPage() {
   // stacking — Back should return to wherever you came from, not walk you back
   // through each tab you looked at.
   const [searchParams, setSearchParams] = useSearchParams();
-  // Fall back for an unknown value too, not just a missing one: `?tab=typo`
-  // would otherwise select no tab and render no panel — a blank page from a
-  // hand-edited URL.
-  const requestedTab = searchParams.get("tab");
-  const tab = TAB_KEYS.includes(requestedTab ?? "") ? (requestedTab as string) : "overview";
-  const setTab = (key: string) => {
-    const next = new URLSearchParams(searchParams);
-    next.set("tab", key);
-    setSearchParams(next, { replace: true });
-  };
 
   // The whole journal defaults to the current boot — the cheapest and most
   // relevant read for "what has this box been doing since it came up".
@@ -141,6 +126,47 @@ export default function MachineDetailPage() {
   const notFound = machineQuery.error?.message === "machine 404";
   const error =
     machineQuery.error ?? metricsQuery.error ?? dockerQuery.error ?? systemdQuery.error;
+
+  // `null` capabilities means the agent predates capability reporting: gate
+  // NOTHING rather than blanking a working machine. An explicit (possibly
+  // empty) array is authoritative.
+  const caps = machineQuery.data?.capabilities ?? null;
+  const lacks = (cap: string) => caps !== null && !caps.includes(cap);
+  const TABS: { key: string; label: string; disabled?: boolean; reason?: string }[] = [
+    { key: "overview", label: "Overview" },
+    {
+      key: "containers",
+      label: "Containers",
+      disabled: lacks(CAP_DOCKER),
+      reason: lacks(CAP_DOCKER) ? "no Docker daemon on this host" : undefined,
+    },
+    {
+      key: "units",
+      label: "Units",
+      disabled: lacks(CAP_SYSTEMD),
+      reason: lacks(CAP_SYSTEMD) ? "no systemd on this host" : undefined,
+    },
+    {
+      key: "logs",
+      label: "Logs",
+      disabled: lacks(CAP_JOURNAL),
+      reason: lacks(CAP_JOURNAL) ? "no journald on this host" : undefined,
+    },
+  ];
+
+  // Fall back for an unknown value too, not just a missing one: `?tab=typo`
+  // would otherwise select no tab and render no panel — a blank page from a
+  // hand-edited URL. The same guard covers a tab that's disabled: a
+  // bookmarked `?tab=units` for a host with no systemd renders the overview
+  // instead of a blank panel.
+  const requestedTab = searchParams.get("tab");
+  const requested = TABS.find((t) => t.key === requestedTab);
+  const tab = requested && !requested.disabled ? (requestedTab as string) : "overview";
+  const setTab = (key: string) => {
+    const next = new URLSearchParams(searchParams);
+    next.set("tab", key);
+    setSearchParams(next, { replace: true });
+  };
 
   const backLink = (
     <Link to="/machines" className="text-sm text-muted-foreground hover:underline">
@@ -248,16 +274,56 @@ export default function MachineDetailPage() {
         <SpecStrip items={specItems} />
       </div>
 
-      <Tabs tabs={TABS} active={tab} onChange={setTab} />
+      <Tabs value={tab} onValueChange={(value) => setTab(String(value))}>
+        <TabsList>
+          {TABS.map((t) => (
+            <TabsTrigger
+              key={t.key}
+              value={t.key}
+              disabled={t.disabled}
+              title={t.reason}
+              aria-describedby={t.disabled && t.reason ? `tab-reason-${t.key}` : undefined}
+              // Only the selected colour is overridden — rnui's sizing, spacing
+              // and disabled treatment are kept.
+              //
+              // The `dark:` copies are NOT redundant. rnui's base carries BOTH
+              // `data-active:bg-background` AND `dark:data-active:bg-input/30`.
+              // tailwind-merge only dedupes classes whose modifier chains match,
+              // so a bare `data-active:bg-primary` beats the first and loses to
+              // the second — the override would work in light mode and silently
+              // do nothing in dark. The tokens themselves already flip per mode
+              // (`--primary` is hazard yellow in dark, near-black in light), so
+              // the same utility is correct in both; it just has to be spelled
+              // once per modifier chain the library uses.
+              className={cn(
+                "data-active:bg-primary data-active:text-primary-foreground",
+                "dark:data-active:bg-primary dark:data-active:text-primary-foreground",
+                "dark:data-active:border-transparent",
+              )}
+            >
+              {t.label}
+            </TabsTrigger>
+          ))}
+        </TabsList>
+        {/*
+         * Rendered outside TabsList (a role="tablist" should contain only
+         * tabs) and outside each trigger (nesting would fold the reason into
+         * the trigger's accessible name and double-announce it). `title`
+         * covers pointer users; this sr-only span + aria-describedby covers
+         * keyboard/screen-reader users regardless of whether the library
+         * renders disabled tabs with the native `disabled` attribute (which
+         * suppresses `title` tooltips in Chromium and drops the control from
+         * the focus order) or with `aria-disabled`.
+         */}
+        {TABS.map((t) =>
+          t.disabled && t.reason ? (
+            <span key={t.key} id={`tab-reason-${t.key}`} className="sr-only">
+              {t.reason}
+            </span>
+          ) : null,
+        )}
 
-      {tab === "overview" && (
-        <div
-          role="tabpanel"
-          id="panel-overview"
-          aria-labelledby="tab-overview"
-          tabIndex={0}
-          className="mt-4"
-        >
+        <TabsContent value="overview" className="mt-4">
           <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="font-display text-sm uppercase tracking-widest">Metrics</h2>
             <ButtonGroup>
@@ -337,51 +403,34 @@ export default function MachineDetailPage() {
               format={formatBytesPerSec}
             />
           </div>
-        </div>
-      )}
+        </TabsContent>
 
-      {tab === "containers" && (
-        <div
-          role="tabpanel"
-          id="panel-containers"
-          aria-labelledby="tab-containers"
-          tabIndex={0}
-          className="mt-4"
-        >
+        <TabsContent value="containers" className="mt-4">
           <ContainersCard machineId={id} containers={containers} />
-        </div>
-      )}
+        </TabsContent>
 
-      {tab === "units" && (
-        <div
-          role="tabpanel"
-          id="panel-units"
-          aria-labelledby="tab-units"
-          tabIndex={0}
-          className="mt-4"
-        >
-          <UnitsCard machineId={id} units={units} />
-        </div>
-      )}
+        <TabsContent value="units" className="mt-4">
+          <UnitsCard machineId={id} units={units} canReadJournal={!lacks(CAP_JOURNAL)} />
+        </TabsContent>
 
-      {tab === "logs" && (
-        <div
-          role="tabpanel"
-          id="panel-logs"
-          aria-labelledby="tab-logs"
-          tabIndex={0}
-          className="mt-4 flex h-[70vh] min-h-0 flex-col"
-        >
-          <LogFilterBar value={logFilters} onChange={setLogFilters} />
-          <div className="min-h-0 flex-1">
-            <LogViewer
-              machineId={id}
-              source={SYSTEM_JOURNAL}
-              filters={logFilters}
-            />
+        <TabsContent value="logs" className="mt-4">
+          {/* The sizing chain lives on this inner div, not on TabsContent.
+              LazyLog is virtua-backed and derives its height from its parent,
+              so it collapses to zero rows if any link in the chain does not
+              resolve to a real height — putting the flex column on the panel
+              itself left the viewer rendered but empty. */}
+          <div className="flex h-[70vh] min-h-0 flex-col">
+            <LogFilterBar value={logFilters} onChange={setLogFilters} />
+            <div className="min-h-0 flex-1">
+              <LogViewer
+                machineId={id}
+                source={SYSTEM_JOURNAL}
+                filters={logFilters}
+              />
+            </div>
           </div>
-        </div>
-      )}
+        </TabsContent>
+      </Tabs>
 
       <LogDialog />
     </>

@@ -522,3 +522,101 @@ find every page read fully truncated and report "beginning of window" while stil
 displaying a longer span. Each read is self-consistent with the current window;
 the fix is for the server to return the resolved `since_ms` on stream open and
 the client to echo it on page requests.
+
+## Capability reporting + log-window fix — manual verification (2026-07-24)
+
+Two parts: the deferred log-window bug from PR #8, then agent capability
+reporting. Design of record:
+`docs/superpowers/specs/2026-07-24-capability-reporting-design.md`.
+
+### Part 1 — the log window is now one cutoff per buffer
+
+The window used to be re-resolved on every request, so a tail and its pages
+disagreed and a view open longer than its own window paged into nothing. Now
+`logs/stream` resolves once and announces it in a leading **named** SSE frame,
+and the client echoes it back as `since_ms`:
+
+```
+$ curl -sN ".../logs/stream?source=journal:@system&tail=2&follow=false&window=1h" | head -3
+event: meta
+data: {"since_ms":1784903548983}
+```
+The frame is **named** on purpose: a browser's `EventSource` routes named events
+to `addEventListener` and *not* to `onmessage`, so it can never be parsed as a
+log line by the NDJSON client code.
+
+- An explicit `since_ms` on a page read is honoured (every line at or after it);
+  `since_ms=abc` and `since_ms=-5` are both **400**.
+- **`since_ms=0` must NOT override a boot window.** `window=boot` resolves to
+  `since_ms=0, current_boot=true`, so the client echoes `0` back — and treating
+  that as an authoritative cutoff silently dropped `-b` from the page argv.
+  Measured on a host booted 2026-07-18: `window=boot` returned 0 older lines,
+  while `window=boot&since_ms=0` returned 50 reaching back to 2026-07-17 — i.e.
+  the *previous boot*, in a view labelled "current boot". `0` now means unset,
+  matching the convention used everywhere else.
+- The client adopts the announced cutoff only **once per buffer**. An
+  `EventSource` auto-reconnect re-announces a fresher cutoff, but the line buffer
+  is not cleared on reconnect, so adopting it would pair a new cutoff with old
+  lines and resurrect the original symptom.
+
+### Part 2 — capability reporting
+
+The agent probes systemd (D-Bus), docker (a real `ping`) and journald
+(`journalctl --version`) once per session and reports them on `AgentInfo`.
+
+**The docker probe must be a `ping`, not `inner.is_some()`** — verified
+non-destructively by giving the agent a private mount namespace whose
+`/var/run/docker.sock` is a plain file (stopping dockerd was not an option: the
+dev Postgres runs in Docker):
+
+```bash
+touch /tmp/notasock
+sudo -n unshare -m sh -c 'mount --bind /tmp/notasock /var/run/docker.sock && exec ./target/debug/argus-agent'
+```
+
+| Condition | Reported |
+|---|---|
+| dockerd answering | `["systemd","docker","journal"]` |
+| socket present, not answering | `["systemd","journal"]` — docker correctly dropped |
+
+The bollard client *constructs* fine against the dead path, so `inner.is_some()`
+would have wrongly claimed `docker`. Host dockerd and Postgres were verified
+unaffected afterwards.
+
+**The tri-state, through the API** (this is the whole feature):
+
+| DB | API | UI |
+|---|---|---|
+| `NULL` | `null` | gate **nothing** (agent predates the feature) |
+| `{}` | `[]` | gate everything (bare host, e.g. an Alpine LXC) |
+| `{systemd}` | `["systemd"]` | gate the rest |
+
+`NULL` and `{}` must never collapse: treating "not reported" as "supports
+nothing" would blank every tab on a working machine the moment an older agent
+connects. proto3 cannot tell an empty repeated field from an absent one, which
+is why `AgentInfo.capabilities_reported` (field 9) exists.
+
+**Capabilities refresh per session, not per heartbeat.** `Hello` carries them and
+is sent at session open, so a manual `UPDATE machines SET capabilities=...`
+persists until the agent reconnects. Both write paths use
+`coalesce($n, machines.capabilities)` so a silent agent never *erases* an
+established set, while an intentional `{}` still overwrites.
+
+**Gating covers per-row affordances, not just tabs.** The Units tab is gated on
+`systemd` but its per-unit Logs button opens a `journal:` source — a *different*
+capability — so it is gated separately. The container equivalent is safe by
+construction (its link needs `docker`, and the Containers tab already requires
+it).
+
+### Two operational gotchas
+
+- **`cargo test --workspace -- --ignored` against the dev database rotates the
+  CA.** One of the ignored server tests is
+  `ca::load_or_init_persists_and_reloads_the_same_ca`, which rewrites
+  `ca_material`. The control plane then logs *"generated and persisted new CA"*
+  and every enrolled agent is orphaned (mTLS fails, machine goes offline).
+  Re-enroll with a fresh token and data dir afterwards.
+- **`argus-pg` does not restart itself.** If `cargo clippy`/`test` suddenly fails
+  with `error communicating with database: Connection refused`, the container has
+  stopped — `docker start argus-pg`. Nothing is wrong with the code; `sqlx`'s
+  compile-time query checking needs a reachable database (or `SQLX_OFFLINE=true`).

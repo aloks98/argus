@@ -37,7 +37,17 @@ export type MachineDetail = {
   enrolled_at: string;
   tags: string[];
   notes: string | null;
+  /** `null` = the agent never reported; gate nothing. */
+  capabilities: string[] | null;
 };
+
+// Capability strings the agent may report in `MachineDetail.capabilities`.
+// Mirrors argus_common::{CAP_SYSTEMD, CAP_DOCKER, CAP_JOURNAL} — named here
+// (rather than spelled as literals at each gating call site) so drift between
+// the Rust and TS sides has exactly one place to fix.
+export const CAP_SYSTEMD = "systemd";
+export const CAP_DOCKER = "docker";
+export const CAP_JOURNAL = "journal";
 
 export type MetricPoint = {
   ts: string;
@@ -235,6 +245,7 @@ export async function fetchLogPage(
   source: string,
   before: string,
   filters: LogFilters = ALL_LOGS,
+  sinceMs?: number,
   limit = 500,
 ): Promise<LogPage> {
   const params = new URLSearchParams({
@@ -243,6 +254,10 @@ export async function fetchLogPage(
     limit: String(limit),
     ...filterParams(filters),
   });
+  // The cutoff the stream resolved for this tail. Sending it keeps every page
+  // on the SAME window as the tail; without it the server re-resolves `now` per
+  // request and a view open longer than its own window pages into nothing.
+  if (sinceMs !== undefined) params.set("since_ms", String(sinceMs));
   const r = await fetch(`/api/machines/${id}/logs/page?${params.toString()}`);
   if (!r.ok) throw new Error(`log page ${r.status}`);
   return (await r.json()) as LogPage;

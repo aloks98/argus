@@ -36,6 +36,23 @@ impl DockerClient {
         }
     }
 
+    /// Whether a daemon is actually answering, bounded by `timeout`.
+    ///
+    /// `connect()` succeeding only means a client was constructed — it never
+    /// contacts the daemon — so this pings `/_ping` rather than trusting that.
+    ///
+    /// Consumed by `capabilities::probe()`, called once per session from
+    /// `session::connect_and_serve` immediately before `Hello`.
+    pub async fn ping_ok(&self, timeout: Duration) -> bool {
+        let Some(docker) = &self.inner else {
+            return false;
+        };
+        matches!(
+            tokio::time::timeout(timeout, docker.ping()).await,
+            Ok(Ok(_))
+        )
+    }
+
     /// All containers (running + stopped) mapped to proto `Container`. Empty on
     /// no-daemon or any listing error (logged) — the fleet view just shows none.
     pub async fn list_containers(&self) -> Vec<Container> {

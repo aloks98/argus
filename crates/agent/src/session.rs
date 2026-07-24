@@ -134,14 +134,23 @@ async fn connect_and_serve(
     // stream error, or the RPC never opening at all), rather than relying
     // solely on drop-timing.
     let sender_agent_id = identity.agent_id.clone();
+    // Probed once per session, not per request. Re-reporting on every reconnect
+    // is what lets a host that gained (or lost) a subsystem be reflected without
+    // an agent restart.
+    let caps = crate::capabilities::probe(systemd, docker).await;
     let sender = tokio::spawn(async move {
-        let info = match crate::info::gather(env!("CARGO_PKG_VERSION")) {
+        let mut info = match crate::info::gather(env!("CARGO_PKG_VERSION")) {
             Ok(info) => info,
             Err(e) => {
                 tracing::warn!(error = %e, "session: gathering AgentInfo for Hello failed");
                 return;
             }
         };
+        info.capabilities = caps;
+        // Marks field 8 as authoritative. An agent that never sets this reports
+        // `false`, which the control plane stores as NULL and treats as "unknown,
+        // gate nothing" — the correct reading for a pre-capability agent.
+        info.capabilities_reported = true;
 
         if tx
             .send(AgentFrame {

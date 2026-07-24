@@ -15,6 +15,13 @@ pub const AGENT_DATA_DIR: &str = "/var/lib/argus";
 /// Connection-level control frames use stream id 0; sub-streams use ids > 0.
 pub const CONTROL_STREAM_ID: u64 = 0;
 
+/// Capability names reported by the agent on `AgentInfo` and stored in
+/// `machines.capabilities`. Both binaries import these so a capability is never
+/// spelled as a string literal on either side of the wire.
+pub const CAP_SYSTEMD: &str = "systemd";
+pub const CAP_DOCKER: &str = "docker";
+pub const CAP_JOURNAL: &str = "journal";
+
 /// Environment variable names shared across both binaries.
 pub mod env {
     // ---- Control plane ----

@@ -43,9 +43,17 @@ const VERB_DONE: Record<UnitAction, string> = {
 export default function UnitsCard({
   machineId,
   units,
+  canReadJournal = true,
 }: {
   machineId: string;
   units: Unit[];
+  /**
+   * Whether this host has journald. Gated separately from the Units tab
+   * itself, which is gated on `systemd`: the two are independent capabilities,
+   * so a host can run systemd with no readable journal — and then every
+   * per-unit Logs link would open a dialog that silently fails.
+   */
+  canReadJournal?: boolean;
 }) {
   const action = useUnitAction(machineId);
   const actionError = action.error;
@@ -233,13 +241,30 @@ export default function UnitsCard({
                         // it and the buttons sat left under a right-aligned
                         // header. Auto margin is what pushes a fit-width block.
                         <ButtonGroup className="ml-auto justify-end">
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            render={<Link to={`?tab=units&logs=${encodeURIComponent(`journal:${u.name}`)}`} />}
-                          >
-                            Logs
-                          </Button>
+                          {canReadJournal ? (
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              render={<Link to={`?tab=units&logs=${encodeURIComponent(`journal:${u.name}`)}`} />}
+                            >
+                              Logs
+                            </Button>
+                          ) : (
+                            // Rendered as a plain disabled Button rather than a
+                            // Link: `disabled` does nothing to an anchor, so a
+                            // Link here would still navigate and open a dialog
+                            // that cannot load. Matches the Start/Stop buttons
+                            // beside it — shown for consistency, disabled when
+                            // unavailable.
+                            <Button
+                              size="sm"
+                              variant="outline"
+                              disabled
+                              title="no journald on this host"
+                            >
+                              Logs
+                            </Button>
+                          )}
                           <Button
                             size="sm"
                             variant="outline"

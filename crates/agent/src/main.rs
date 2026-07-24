@@ -7,6 +7,7 @@
 //! This is the skeleton: the enrollment handshake (slice #1) and session loop are
 //! stubbed with their intended shape.
 
+mod capabilities;
 mod config;
 mod docker;
 mod enroll;
