@@ -22,11 +22,22 @@ mod jobs;
 mod repo;
 mod terminal;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::sync::Arc;
 
 #[tokio::main]
 async fn main() -> Result<()> {
+    // CLI dispatch happens BEFORE `Config::from_env`, and loads only the
+    // database URL. A recovery command that requires the configuration that
+    // broke is not a recovery command -- `argus local-admin reset` has to work
+    // when the OIDC variables (or `ARGUS_FIELD_KEY`, or `ARGUS_PUBLIC_URL`)
+    // are absent or wrong, which is exactly when it is needed. One
+    // subcommand does not justify an argument-parsing dependency.
+    let args: Vec<String> = std::env::args().collect();
+    if args.get(1).map(String::as_str) == Some("local-admin") {
+        return run_local_admin_cli(&args).await;
+    }
+
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
@@ -70,6 +81,57 @@ async fn main() -> Result<()> {
     )?;
 
     Ok(())
+}
+
+/// `argus local-admin reset [--username <name>]`, and the sole entry point for
+/// every other `local-admin` invocation (which prints usage and fails).
+///
+/// Deliberately does NOT call `config::Config::from_env`: this command is the
+/// recovery path for a control plane that refuses to boot (design §4's
+/// `auth_is_configured`), and a recovery command that requires the
+/// configuration that broke is not a recovery command. It reads only
+/// `ARGUS_DATABASE_URL` and connects via `db::connect_url`, which takes a bare
+/// URL for exactly this reason.
+async fn run_local_admin_cli(args: &[String]) -> Result<()> {
+    match args.get(2).map(String::as_str) {
+        Some("reset") => {
+            let rest = args.get(3..).unwrap_or_default();
+            let username = parse_username_flag(rest).unwrap_or_else(|| "admin".to_string());
+
+            let database_url =
+                std::env::var(argus_common::env::DATABASE_URL).with_context(|| {
+                    format!(
+                        "missing required env var {}",
+                        argus_common::env::DATABASE_URL
+                    )
+                })?;
+            let pool = db::connect_url(&database_url).await?;
+            let password = auth::local::reset_local_admin(&pool, &username).await?;
+
+            println!(
+                "Local admin created.\n\n  username: {username}\n  password: {password}\n\n\
+                 This password is shown ONCE and is not recoverable. Store it now.\n\
+                 Run this command again to issue a new one."
+            );
+            Ok(())
+        }
+        _ => {
+            eprintln!("Usage: argus local-admin reset [--username <name>]");
+            std::process::exit(2);
+        }
+    }
+}
+
+/// Look for `--username <name>` anywhere in the trailing args, defaulting to
+/// `None` (the caller falls back to `admin`) when absent or dangling.
+fn parse_username_flag(rest: &[String]) -> Option<String> {
+    let mut iter = rest.iter();
+    while let Some(arg) = iter.next() {
+        if arg == "--username" {
+            return iter.next().cloned();
+        }
+    }
+    None
 }
 
 /// The boot rule (design §4): the invariant is "some authentication method is

@@ -1,6 +1,7 @@
 //! Browser authentication: middleware, extractor, and the OIDC flow.
 
 pub mod claims;
+pub mod local;
 pub mod oidc;
 pub mod password;
 pub mod session;

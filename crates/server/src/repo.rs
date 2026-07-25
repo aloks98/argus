@@ -654,11 +654,13 @@ pub async fn delete_expired_sessions(pool: &PgPool) -> Result<u64> {
 }
 
 // The local-admin break-glass credential (design §6). `local_admin_exists` is
-// wired to the boot rule (`main.rs`); the rest -- the CLI provisioning verb
-// and the login handler -- land in later tasks of the same slice, so they
-// stay unreachable from `main` for now. Allowed per-item rather than at
-// module level, since the rest of `repo.rs` is fully wired -- matches the
-// convention in `auth/password.rs` and `agent/systemd.rs`.
+// wired to the boot rule (`main.rs`); `upsert_local_admin` is now wired to the
+// CLI (`argus local-admin reset`, via `auth::local::reset_local_admin`). Only
+// the login handler still lands in a later task of the same slice, so
+// `get_local_admin`/`LocalAdmin` stay unreachable from non-test code for now.
+// Allowed per-item rather than at module level, since the rest of `repo.rs` is
+// fully wired -- matches the convention in `auth/password.rs` and
+// `agent/systemd.rs`.
 #[allow(dead_code)]
 pub struct LocalAdmin {
     pub username: String,
@@ -678,7 +680,6 @@ pub async fn get_local_admin(pool: &PgPool) -> Result<Option<LocalAdmin>> {
 
 /// Create or rotate. `ON CONFLICT` on the single-row primary key makes this an
 /// in-place rotation rather than an accumulation of credentials.
-#[allow(dead_code)]
 pub async fn upsert_local_admin(pool: &PgPool, username: &str, password_hash: &str) -> Result<()> {
     sqlx::query!(
         "INSERT INTO local_admin (id, username, password_hash) VALUES (true, $1, $2)
