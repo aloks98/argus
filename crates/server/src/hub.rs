@@ -8,14 +8,38 @@
 
 use argus_proto::v1::{
     server_frame, Command, CommandResult, Container, LogChunk, LogTailRequest, LogTailStop,
-    ServerFrame, Unit, Verb,
+    PtyClose, PtyFlow, PtyInput, PtyOpen, PtyResize, ServerFrame, Unit, Verb,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot};
 use tonic::Status;
 use uuid::Uuid;
+
+/// Per-session flow-control accounting, shared between the gRPC inbound task
+/// (which fills the buffer) and the WS output task (which drains it).
+///
+/// `buffered` and `paused` are guarded as ONE unit (a single `Mutex`, not two
+/// independent atomics) so a fill (`deliver_pty_output`) racing a drain
+/// (`on_pty_drained`) can never compute "should we flip the edge" from a torn
+/// combination of the two — e.g. reading a byte count one task just updated
+/// but a `paused` flag the other hasn't caught up to yet. Review fix: the
+/// original independent-atomics version let a dropped `PtyFlow` send (the
+/// agent's shared outbound channel is only 16 deep and carries everything)
+/// leave this pair permanently out of sync with what the agent actually
+/// knows — either latching `paused` true forever with the frame never sent
+/// (suppressing every future pause attempt), or, worse, recording locally
+/// "resumed" while the agent is still genuinely parked, wedging the terminal
+/// with no error, no eof, and no close until the 30-minute idle timer.
+pub struct PtyFlowState {
+    inner: Mutex<PtyFlowInner>,
+}
+
+struct PtyFlowInner {
+    buffered: usize,
+    paused: bool,
+}
 
 /// One live agent connection: its outbound frame channel plus a per-connection
 /// counter for the fresh non-zero `stream_id` each dispatched command gets. The
@@ -46,6 +70,9 @@ pub struct Hub {
     /// Filled by `deliver_chunk` (the gRPC frame handler) and read/removed via
     /// `open_tail`/`close_tail` (the HTTP SSE handler).
     tails: Mutex<HashMap<String, (Uuid, mpsc::Sender<LogChunk>)>>,
+    /// session_id -> (machine, byte sink for the WS handler, flow state).
+    #[allow(clippy::type_complexity)]
+    ptys: Mutex<HashMap<String, (Uuid, mpsc::Sender<Vec<u8>>, Arc<PtyFlowState>)>>,
     epoch_counter: AtomicU64,
 }
 
@@ -88,6 +115,19 @@ impl Hub {
         if conns.get(&machine_id).map(|h| h.epoch) == Some(epoch) {
             conns.remove(&machine_id);
         }
+    }
+
+    /// Whether a machine currently has a live registered Session. Used by
+    /// the terminal WS handler to tell apart two failure modes that look
+    /// identical from the receiving end (a PTY's output channel just closes
+    /// with no `eof` marker): the whole agent connection ending
+    /// (`close_ptys_for`, called from `grpc.rs` strictly AFTER `unregister`)
+    /// versus `deliver_pty_output`'s single-session overrun backstop
+    /// (`close_pty`, which never touches `conns`). By the time a caller
+    /// observes the channel closed, `unregister` for a real disconnect has
+    /// already run, so this is a reliable way to distinguish the two.
+    pub fn is_connected(&self, machine_id: Uuid) -> bool {
+        self.conns.lock().unwrap().contains_key(&machine_id)
     }
 
     /// Replace the cached container snapshot for a machine.
@@ -286,6 +326,302 @@ impl Hub {
             payload: Some(server_frame::Payload::LogTailStop(LogTailStop {
                 request_id,
             })),
+        };
+        tx.send(Ok(frame))
+            .await
+            .map_err(|_| DispatchError::NotConnected)
+    }
+
+    /// Mint a session, register its byte sink + flow state, return them to the
+    /// WS handler. Mirrors `open_tail`. Called by `terminal::handle` on every
+    /// WebSocket upgrade.
+    pub fn open_pty(
+        &self,
+        machine_id: Uuid,
+    ) -> (String, mpsc::Receiver<Vec<u8>>, Arc<PtyFlowState>) {
+        let session_id = Uuid::new_v4().to_string();
+        let (tx, rx) = mpsc::channel(argus_common::PTY_CHANNEL_CAP);
+        let state = Arc::new(PtyFlowState {
+            inner: Mutex::new(PtyFlowInner {
+                buffered: 0,
+                paused: false,
+            }),
+        });
+        self.ptys
+            .lock()
+            .unwrap()
+            .insert(session_id.clone(), (machine_id, tx, state.clone()));
+        (session_id, rx, state)
+    }
+
+    pub fn close_pty(&self, session_id: &str) {
+        self.ptys.lock().unwrap().remove(session_id);
+    }
+
+    pub fn close_ptys_for(&self, machine_id: Uuid) {
+        self.ptys
+            .lock()
+            .unwrap()
+            .retain(|_, (owner, _, _)| *owner != machine_id);
+    }
+
+    /// Route an agent `PtyOutput` into its session's buffer. NON-BLOCKING: the
+    /// caller is the gRPC inbound drain, which must never stall the shared
+    /// Session. Accounts bytes and, on crossing the high-water mark, emits
+    /// `PtyFlow{paused:true}` so the agent throttles. A full channel is the
+    /// unreachable-by-sizing defensive teardown (never a dropped byte).
+    ///
+    /// Channel contract (this is what the WS handler must consume): the
+    /// channel carries `Vec<u8>` items, and an EMPTY item is *exclusively* the
+    /// eof marker -- a real chunk is never forwarded empty. That is enforced
+    /// structurally right here, not by convention on the agent side: a
+    /// `PtyOutput{data: [], eof: false}` (genuinely nothing to deliver, not
+    /// eof) is dropped before it would ever reach the channel, so it can never
+    /// be confused with the marker below. The only way an empty `Vec` reaches
+    /// the receiver is the explicit eof push.
+    pub fn deliver_pty_output(&self, session_id: &str, machine_id: Uuid, data: Vec<u8>, eof: bool) {
+        let (sender, state) = {
+            let ptys = self.ptys.lock().unwrap();
+            match ptys.get(session_id) {
+                Some((owner, tx, st)) if *owner == machine_id => (tx.clone(), st.clone()),
+                _ => return,
+            }
+        };
+        // Nothing to deliver and not eof: dropping this is free (zero bytes
+        // change nothing on screen) and is what keeps the invariant above
+        // true -- forwarding it would be indistinguishable from eof.
+        if data.is_empty() && !eof {
+            return;
+        }
+        let len = data.len();
+        if len > 0 && sender.try_send(data).is_err() {
+            // Channel full despite flow control (a bug, not a fast
+            // program): tear the session down rather than drop or block.
+            self.close_pty(session_id);
+            let _ = self.try_send_pty_close(machine_id, session_id);
+            return;
+        }
+        if eof {
+            // The WS handler observes this empty final frame and closes. Same
+            // never-drop-never-block rule applies to the marker itself: if it
+            // can't be enqueued, tear the session down rather than leave the
+            // WS handler waiting on an eof that will never arrive.
+            if sender.try_send(Vec::new()).is_err() {
+                self.close_pty(session_id);
+                let _ = self.try_send_pty_close(machine_id, session_id);
+                return;
+            }
+        }
+        if len == 0 {
+            return;
+        }
+        // Account the bytes and decide the pause edge as ONE guarded step
+        // (see `PtyFlowState`'s doc comment), so a concurrent drain can never
+        // observe a torn buffered/paused pair.
+        let should_pause = {
+            let mut inner = state.inner.lock().unwrap();
+            inner.buffered += len;
+            if inner.buffered >= argus_common::PTY_HIGH_WATER && !inner.paused {
+                inner.paused = true;
+                true
+            } else {
+                false
+            }
+        };
+        if should_pause
+            && self
+                .try_send_pty_flow(machine_id, session_id, true)
+                .is_err()
+        {
+            // The frame never reached the agent (its shared 16-slot outbound
+            // channel is fullest exactly under load, i.e. exactly when this
+            // fires). Roll the local flag back to false rather than leaving
+            // it latched true with nobody told: the agent keeps flooding
+            // regardless (it was never actually paused), so the very next
+            // byte that crosses high-water will retry this send -- `deliver_
+            // pty_output` MUST stay non-blocking/non-awaiting here (it runs
+            // on the never-stall gRPC inbound drain), so this is a best-
+            // effort retry-on-next-edge rather than a guaranteed delivery
+            // (contrast `on_pty_drained`'s resume path below, which CAN
+            // afford to await and so gets a stronger guarantee).
+            let mut inner = state.inner.lock().unwrap();
+            inner.paused = false;
+        }
+    }
+
+    /// Called by the WS handler after it writes `len` bytes to the socket, so
+    /// the byte counter reflects what is still buffered. On dropping below the
+    /// low-water mark, emits `PtyFlow{paused:false}`.
+    ///
+    /// Async (unlike `deliver_pty_output`): the caller is the WS outbound
+    /// task, which already awaits the socket send, so this can afford to
+    /// await room on the agent's outbound channel too -- a GUARANTEED
+    /// delivery rather than a best-effort `try_send`. That matters
+    /// specifically for the resume edge: a dropped resume is what wedges a
+    /// terminal forever (the agent stays parked, so no more output ever
+    /// arrives to give a pause edge -- and thus no more `deliver_pty_output`
+    /// calls -- a chance to retry), whereas a dropped pause naturally gets
+    /// retried by the next byte the still-flooding agent produces. Making
+    /// resume undroppable (as long as the agent is still connected at all)
+    /// closes that gap at the source instead of hoping for a retry that may
+    /// never come.
+    pub async fn on_pty_drained(&self, session_id: &str, len: usize) {
+        let (machine_id, state) = {
+            let ptys = self.ptys.lock().unwrap();
+            match ptys.get(session_id) {
+                Some((owner, _, st)) => (*owner, st.clone()),
+                None => return,
+            }
+        };
+        let should_resume = {
+            let mut inner = state.inner.lock().unwrap();
+            // Saturating: an over-report here must not wrap `buffered` to
+            // ~usize::MAX and pin the session above high-water forever.
+            inner.buffered = inner.buffered.saturating_sub(len);
+            if inner.buffered <= argus_common::PTY_LOW_WATER && inner.paused {
+                inner.paused = false;
+                true
+            } else {
+                false
+            }
+        };
+        if should_resume {
+            let _ = self.send_pty_flow(machine_id, session_id, false).await;
+        }
+    }
+
+    /// Non-blocking `PtyFlow` send (from `deliver_pty_output`'s sync,
+    /// never-await accounting path).
+    fn try_send_pty_flow(
+        &self,
+        machine_id: Uuid,
+        session_id: &str,
+        paused: bool,
+    ) -> Result<(), DispatchError> {
+        let (tx, stream_id) = self.conn_slot(machine_id)?;
+        let frame = ServerFrame {
+            stream_id,
+            payload: Some(server_frame::Payload::PtyFlow(PtyFlow {
+                session_id: session_id.to_string(),
+                paused,
+            })),
+        };
+        tx.try_send(Ok(frame))
+            .map_err(|_| DispatchError::NotConnected)
+    }
+
+    /// Guaranteed-delivery `PtyFlow` send (awaits room on the outbound
+    /// channel instead of failing immediately). Used only by `on_pty_drained`
+    /// -- see its doc comment for why the resume edge specifically needs
+    /// this instead of `try_send_pty_flow`.
+    async fn send_pty_flow(
+        &self,
+        machine_id: Uuid,
+        session_id: &str,
+        paused: bool,
+    ) -> Result<(), DispatchError> {
+        let (tx, stream_id) = self.conn_slot(machine_id)?;
+        let frame = ServerFrame {
+            stream_id,
+            payload: Some(server_frame::Payload::PtyFlow(PtyFlow {
+                session_id: session_id.to_string(),
+                paused,
+            })),
+        };
+        tx.send(Ok(frame))
+            .await
+            .map_err(|_| DispatchError::NotConnected)
+    }
+
+    fn try_send_pty_close(&self, machine_id: Uuid, session_id: &str) -> Result<(), DispatchError> {
+        let (tx, stream_id) = self.conn_slot(machine_id)?;
+        let frame = ServerFrame {
+            stream_id,
+            payload: Some(server_frame::Payload::PtyClose(PtyClose {
+                session_id: session_id.to_string(),
+            })),
+        };
+        tx.try_send(Ok(frame))
+            .map_err(|_| DispatchError::NotConnected)
+    }
+
+    /// Dispatched by `terminal::handle` before it audits, so an offline agent
+    /// leaves no `terminal.open` row.
+    pub async fn send_pty_open(
+        &self,
+        machine_id: Uuid,
+        session_id: String,
+        cols: u32,
+        rows: u32,
+    ) -> Result<(), DispatchError> {
+        let (tx, stream_id) = self.conn_slot(machine_id)?;
+        let frame = ServerFrame {
+            stream_id,
+            payload: Some(server_frame::Payload::PtyOpen(PtyOpen {
+                session_id,
+                cols,
+                rows,
+                shell: String::new(),
+            })),
+        };
+        tx.send(Ok(frame))
+            .await
+            .map_err(|_| DispatchError::NotConnected)
+    }
+
+    /// Forwards a keystroke frame from `terminal::handle`'s inbound loop.
+    pub async fn send_pty_input(
+        &self,
+        machine_id: Uuid,
+        session_id: String,
+        data: Vec<u8>,
+    ) -> Result<(), DispatchError> {
+        let (tx, stream_id) = self.conn_slot(machine_id)?;
+        let frame = ServerFrame {
+            stream_id,
+            payload: Some(server_frame::Payload::PtyInput(PtyInput {
+                session_id,
+                data,
+            })),
+        };
+        tx.send(Ok(frame))
+            .await
+            .map_err(|_| DispatchError::NotConnected)
+    }
+
+    /// Forwards a resize control frame from `terminal::handle`'s inbound loop.
+    pub async fn send_pty_resize(
+        &self,
+        machine_id: Uuid,
+        session_id: String,
+        cols: u32,
+        rows: u32,
+    ) -> Result<(), DispatchError> {
+        let (tx, stream_id) = self.conn_slot(machine_id)?;
+        let frame = ServerFrame {
+            stream_id,
+            payload: Some(server_frame::Payload::PtyResize(PtyResize {
+                session_id,
+                cols,
+                rows,
+            })),
+        };
+        tx.send(Ok(frame))
+            .await
+            .map_err(|_| DispatchError::NotConnected)
+    }
+
+    /// Dispatched by `terminal::handle`'s `PtyCloseGuard` on every exit past a
+    /// successful `PtyOpen` dispatch, including a panic unwind.
+    pub async fn send_pty_close(
+        &self,
+        machine_id: Uuid,
+        session_id: String,
+    ) -> Result<(), DispatchError> {
+        let (tx, stream_id) = self.conn_slot(machine_id)?;
+        let frame = ServerFrame {
+            stream_id,
+            payload: Some(server_frame::Payload::PtyClose(PtyClose { session_id })),
         };
         tx.send(Ok(frame))
             .await
@@ -639,5 +975,313 @@ mod tests {
         let hub = Hub::new();
         let res = hub.send_log_stop(Uuid::new_v4(), "r1".into()).await;
         assert!(matches!(res, Err(DispatchError::NotConnected)));
+    }
+
+    #[tokio::test]
+    async fn pty_flow_pauses_at_high_water_and_resumes_at_low_water() {
+        let hub = Hub::new();
+        let machine_id = Uuid::new_v4();
+        // A fake agent connection so send_pty_flow has somewhere to go.
+        let (tx, mut agent_rx) = mpsc::channel::<Result<ServerFrame, Status>>(64);
+        hub.register(machine_id, tx);
+
+        let (session_id, mut rx, _state) = hub.open_pty(machine_id);
+
+        // Push just over the high-water mark -> a pause frame is emitted.
+        let chunk = vec![0u8; argus_common::PTY_HIGH_WATER + 1];
+        hub.deliver_pty_output(&session_id, machine_id, chunk, false);
+        let paused = recv_pty_flow(&mut agent_rx).await;
+        assert!(
+            paused,
+            "crossing high-water must emit PtyFlow{{paused:true}}"
+        );
+
+        // Drain below the low-water mark -> a resume frame is emitted.
+        while rx.try_recv().is_ok() {
+            hub.on_pty_drained(&session_id, argus_common::PTY_HIGH_WATER + 1)
+                .await;
+        }
+        let resumed_paused = recv_pty_flow(&mut agent_rx).await;
+        assert!(!resumed_paused, "draining below low-water must resume");
+    }
+
+    // Helper: pull frames until a PtyFlow arrives, return its `paused`.
+    async fn recv_pty_flow(rx: &mut mpsc::Receiver<Result<ServerFrame, Status>>) -> bool {
+        loop {
+            let frame = tokio::time::timeout(std::time::Duration::from_secs(1), rx.recv())
+                .await
+                .expect("a frame within 1s")
+                .expect("channel open")
+                .expect("ok frame");
+            if let Some(server_frame::Payload::PtyFlow(f)) = frame.payload {
+                return f.paused;
+            }
+        }
+    }
+
+    /// The measured shape of the review's live-firehose reproduction (`seq 1
+    /// 200000` in a real terminal: 1,488,985 bytes across 10,818 `PtyOutput`
+    /// frames, ~138 bytes/chunk) -- NOT the 64 KiB the original sizing
+    /// assumed. Feeds many ~138-byte chunks, without draining the receiver
+    /// (mirrors a browser renderer that can't keep up), and asserts the BYTE
+    /// watermark binds before the message-count channel cap does: a
+    /// `PtyFlow{paused:true}` must come out, and the session must still be
+    /// alive afterward -- not torn down by the full-channel backstop.
+    ///
+    /// This must fail against the old `PTY_CHANNEL_CAP = 2048`: at 138
+    /// bytes/chunk the channel fills (2048 messages) at ~283 KiB, well below
+    /// `PTY_HIGH_WATER` (1 MiB — reached only after ~7,600 chunks), so the
+    /// full-channel teardown fires FIRST and this test's `PtyClose` branch
+    /// panics instead of ever seeing a `PtyFlow`.
+    #[tokio::test]
+    async fn many_small_chunks_trip_the_byte_watermark_before_the_channel_fills() {
+        let hub = Hub::new();
+        let machine_id = Uuid::new_v4();
+        let (tx, mut agent_rx) = mpsc::channel::<Result<ServerFrame, Status>>(64);
+        hub.register(machine_id, tx);
+        let (session_id, mut rx, _state) = hub.open_pty(machine_id);
+
+        let chunk = vec![b'x'; 138];
+        // Comfortably past PTY_HIGH_WATER at 138 bytes/chunk.
+        let chunks_needed = argus_common::PTY_HIGH_WATER / 138 + 8;
+        for _ in 0..chunks_needed {
+            hub.deliver_pty_output(&session_id, machine_id, chunk.clone(), false);
+        }
+
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), agent_rx.recv())
+            .await
+            .expect("a frame within 1s -- flow control never engaged in time")
+            .expect("channel open")
+            .expect("ok frame");
+        match frame.payload {
+            Some(server_frame::Payload::PtyFlow(f)) => {
+                assert!(f.paused, "expected PtyFlow{{paused:true}}")
+            }
+            Some(server_frame::Payload::PtyClose(_)) => panic!(
+                "session was torn down by the full-channel backstop instead of being \
+                 throttled -- the message-count cap bound before the byte watermark did"
+            ),
+            other => panic!("expected PtyFlow, got {other:?}"),
+        }
+
+        // Still alive: a session the backstop tore down would silently drop
+        // this (the entry is gone from the registry), so a further chunk
+        // must still reach the receiver.
+        hub.deliver_pty_output(&session_id, machine_id, chunk.clone(), false);
+        assert_eq!(
+            rx.recv()
+                .await
+                .expect("session still delivering after pausing")
+                .len(),
+            138
+        );
+    }
+
+    /// Mirrors `close_tails_for_closes_only_the_owning_machines_tails`: closing
+    /// one machine's PTY sessions must not touch another machine's.
+    #[tokio::test]
+    async fn close_ptys_for_closes_only_the_owning_machines_ptys() {
+        let hub = Hub::new();
+        let a = Uuid::new_v4();
+        let b = Uuid::new_v4();
+        let (_sid_a1, mut rx_a1, _st_a1) = hub.open_pty(a);
+        let (_sid_a2, mut rx_a2, _st_a2) = hub.open_pty(a);
+        let (sid_b, mut rx_b, _st_b) = hub.open_pty(b);
+
+        hub.close_ptys_for(a);
+
+        assert!(rx_a1.recv().await.is_none(), "A's first pty must close");
+        assert!(rx_a2.recv().await.is_none(), "A's second pty must close");
+
+        // B's pty is untouched: still delivers.
+        hub.deliver_pty_output(&sid_b, b, b"still alive".to_vec(), false);
+        assert_eq!(
+            rx_b.recv().await.expect("B's pty still delivers"),
+            b"still alive"
+        );
+    }
+
+    /// Mirrors `a_foreign_machine_cannot_deliver_into_another_machines_tail`:
+    /// the same trust boundary applies to PTY output -- a session belongs to
+    /// the machine it was opened against, and any other authenticated agent
+    /// must not be able to inject bytes into it.
+    #[tokio::test]
+    async fn a_foreign_machine_cannot_deliver_into_another_machines_pty() {
+        let hub = Hub::new();
+        let owner = Uuid::new_v4();
+        let other = Uuid::new_v4();
+        let (session_id, mut rx, _state) = hub.open_pty(owner);
+
+        hub.deliver_pty_output(&session_id, other, b"spoof".to_vec(), false);
+        assert!(
+            rx.try_recv().is_err(),
+            "a foreign machine must not deliver into another machine's pty"
+        );
+
+        hub.deliver_pty_output(&session_id, owner, b"real".to_vec(), false);
+        assert_eq!(rx.recv().await.expect("owner delivers"), b"real");
+    }
+
+    /// The highest-risk branch: when the per-session channel is full despite
+    /// flow control, `deliver_pty_output` must neither block (this is called
+    /// from the never-stall gRPC inbound drain) nor silently drop the byte --
+    /// it must tear the session down (dispatch `PtyClose`, drop the sender so
+    /// the consumer observes disconnection) while everything already buffered
+    /// stays intact for the consumer to drain.
+    #[tokio::test]
+    async fn deliver_pty_output_full_channel_tears_down_the_session_instead_of_dropping_or_blocking(
+    ) {
+        let hub = Hub::new();
+        let machine_id = Uuid::new_v4();
+        let (tx, mut agent_rx) = mpsc::channel::<Result<ServerFrame, Status>>(64);
+        hub.register(machine_id, tx);
+
+        let (session_id, mut rx, _state) = hub.open_pty(machine_id);
+
+        // Fill the channel to capacity WITHOUT draining `rx`. One byte per
+        // chunk keeps the total (PTY_CHANNEL_CAP bytes) far under
+        // PTY_HIGH_WATER, so no PtyFlow pause frame is emitted along the way
+        // -- the only frame this test expects on `agent_rx` is the teardown's
+        // PtyClose.
+        for _ in 0..argus_common::PTY_CHANNEL_CAP {
+            hub.deliver_pty_output(&session_id, machine_id, vec![0u8], false);
+        }
+
+        // The channel is now exactly full. This delivery must return
+        // immediately (a hang here would mean the call blocked, which alone
+        // would fail the test via timeout) rather than either dropping the
+        // byte silently or awaiting room.
+        hub.deliver_pty_output(&session_id, machine_id, vec![0u8], false);
+
+        // Teardown must have dispatched PtyClose to the agent.
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), agent_rx.recv())
+            .await
+            .expect("a frame within 1s")
+            .expect("channel open")
+            .expect("ok frame");
+        match frame.payload {
+            Some(server_frame::Payload::PtyClose(c)) => assert_eq!(c.session_id, session_id),
+            other => panic!("expected PtyClose from the full-channel teardown, got {other:?}"),
+        }
+
+        // Every chunk that DID make it in before the channel filled is still
+        // there -- nothing was dropped -- and once fully drained the sender
+        // (removed from the registry by the teardown) is gone, so the
+        // channel closes instead of hanging open forever.
+        let mut drained = 0;
+        while let Some(chunk) = rx.recv().await {
+            assert_eq!(chunk, vec![0u8]);
+            drained += 1;
+        }
+        assert_eq!(
+            drained,
+            argus_common::PTY_CHANNEL_CAP,
+            "no buffered byte was dropped by the teardown"
+        );
+    }
+
+    /// Finding 2: a dropped `PtyFlow{paused:true}` send (the agent's shared
+    /// 16-slot outbound channel is fullest exactly under load, i.e. exactly
+    /// when a pause would fire) must NOT leave the local `paused` flag
+    /// latched true with the frame never having gone out -- that would
+    /// suppress every future pause attempt (the CAS-style edge check only
+    /// fires when the old value was false) while the agent, never actually
+    /// told to pause, keeps flooding regardless. The fix rolls `paused` back
+    /// to false on send failure so the very next byte crossing high-water
+    /// retries.
+    ///
+    /// This must fail against the old fire-and-forget code, which did
+    /// `state.paused.swap(true, ..)` unconditionally BEFORE attempting the
+    /// send and never rolled back on failure.
+    #[tokio::test]
+    async fn a_dropped_pause_frame_does_not_latch_paused_with_no_recovery() {
+        let hub = Hub::new();
+        let machine_id = Uuid::new_v4();
+        // A capacity-1 outbound channel, pre-filled: the pause attempt's
+        // try_send below has no room and must fail.
+        let (tx, mut agent_rx) = mpsc::channel::<Result<ServerFrame, Status>>(1);
+        tx.try_send(Ok(ServerFrame {
+            stream_id: 0,
+            payload: None,
+        }))
+        .expect("prefill the one slot");
+        hub.register(machine_id, tx);
+
+        let (session_id, _rx, state) = hub.open_pty(machine_id);
+
+        // Cross high-water: the pause send fails (channel full).
+        let chunk = vec![0u8; argus_common::PTY_HIGH_WATER + 1];
+        hub.deliver_pty_output(&session_id, machine_id, chunk, false);
+
+        assert!(
+            !state.inner.lock().unwrap().paused,
+            "a dropped pause send must roll back rather than latch paused=true \
+             forever with the agent never actually told"
+        );
+
+        // Drain the prefilled slot so the retry has room, then feed one more
+        // byte over high-water: the retry this time must get through.
+        let _ = agent_rx.recv().await.expect("drain the prefill frame");
+        hub.deliver_pty_output(&session_id, machine_id, vec![0u8], false);
+        let frame = tokio::time::timeout(std::time::Duration::from_secs(1), agent_rx.recv())
+            .await
+            .expect("a retried PtyFlow within 1s -- no recovery from the dropped send")
+            .expect("channel open")
+            .expect("ok frame");
+        match frame.payload {
+            Some(server_frame::Payload::PtyFlow(f)) => {
+                assert!(f.paused, "the retried pause must now get through")
+            }
+            other => panic!("expected PtyFlow, got {other:?}"),
+        }
+    }
+
+    /// The eof path, after hardening the empty-`Vec` marker against ambiguity
+    /// with a genuinely empty, non-eof chunk (which must never be forwarded at
+    /// all -- see `deliver_pty_output`'s doc comment for the full contract).
+    #[tokio::test]
+    async fn deliver_pty_output_eof_is_observed_unambiguously_by_the_consumer() {
+        let hub = Hub::new();
+        let machine_id = Uuid::new_v4();
+        let (session_id, mut rx, _state) = hub.open_pty(machine_id);
+
+        // A genuinely empty, non-eof chunk must be dropped, not forwarded --
+        // forwarding it would be indistinguishable from the eof marker below.
+        hub.deliver_pty_output(&session_id, machine_id, Vec::new(), false);
+        assert!(
+            rx.try_recv().is_err(),
+            "an empty non-eof chunk must never reach the channel"
+        );
+
+        // Real output arriving together with eof (the common case: the
+        // shell's final read returns its last bytes and EOF together).
+        hub.deliver_pty_output(&session_id, machine_id, b"bye\n".to_vec(), true);
+        let data = rx.recv().await.expect("the real bytes arrive first");
+        assert_eq!(data, b"bye\n");
+        let marker = rx.recv().await.expect("the eof marker follows");
+        assert!(
+            marker.is_empty(),
+            "eof is signalled by an empty chunk, and only by one"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "nothing follows the eof marker for this session"
+        );
+    }
+
+    /// Eof with no trailing data (the shell exits with nothing left to flush)
+    /// must still produce exactly the marker -- no phantom empty chunk before
+    /// it, since that would already have been the (indistinguishable) case
+    /// this task's fix rules out.
+    #[tokio::test]
+    async fn deliver_pty_output_eof_with_no_trailing_data_sends_only_the_marker() {
+        let hub = Hub::new();
+        let machine_id = Uuid::new_v4();
+        let (session_id, mut rx, _state) = hub.open_pty(machine_id);
+
+        hub.deliver_pty_output(&session_id, machine_id, Vec::new(), true);
+        let marker = rx.recv().await.expect("eof marker arrives");
+        assert!(marker.is_empty());
+        assert!(rx.try_recv().is_err(), "nothing else follows");
     }
 }

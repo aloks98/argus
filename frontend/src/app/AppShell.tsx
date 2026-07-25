@@ -58,7 +58,7 @@ function TopBar() {
       : `${rows.filter((r) => r.status === "online").length}/${rows.length} ONLINE`;
 
   return (
-    <header className="sticky top-0 z-30 flex h-12 shrink-0 items-center gap-3 border-b-2 border-border bg-background px-3">
+    <header className="sticky top-0 z-30 flex h-12 shrink-0 items-center gap-3 border-b border-border bg-background px-3">
       <SidebarTrigger aria-label="Toggle sidebar" title="Toggle sidebar" />
       {summary !== null && (
         <span className="ml-auto font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
@@ -91,9 +91,11 @@ function FleetSidebar() {
     // rather than removing the nav entirely.
     //
     // The border modifier matches rnui's own (`group-data-[side=left]:border-r`)
-    // so tailwind-merge can dedupe and this 2px wins; an unmodified `border-r-2`
-    // would lose to the base's higher-specificity variant.
-    <Sidebar collapsible="icon" className="group-data-[side=left]:border-r-2 border-border">
+    // so tailwind-merge can dedupe and ours wins; an unmodified `border-r`
+    // would lose to the base's higher-specificity variant. Keep the modifier
+    // even now that the width matches rnui's default — dropping it would
+    // quietly reintroduce that trap the next time this width changes.
+    <Sidebar collapsible="icon" className="group-data-[side=left]:border-r border-border">
       <SidebarHeader className="gap-0 p-0">
         <Link
           to="/machines"
@@ -158,8 +160,8 @@ function FleetSidebar() {
       <SidebarFooter
         className={
           rail
-            ? "items-center border-t-2 border-border px-0 py-2"
-            : "flex-row items-center border-t-2 border-border px-3 py-2"
+            ? "items-center border-t border-border px-0 py-2"
+            : "flex-row items-center border-t border-border px-3 py-2"
         }
       >
         <ThemeToggle showLabel={!rail} />

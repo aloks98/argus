@@ -97,7 +97,7 @@ export default function ContainersCard({
       {/* rnui's `Table` brings its own overflow-x-auto container — see UnitsCard. */}
       {/* Same height bound + sticky header as UnitsCard so the two tabs behave
           alike; on a short container list the cap simply never applies. */}
-      <div className="border-2 border-border [&>[data-slot=table-container]]:max-h-[65vh]">
+      <div className="border border-border [&>[data-slot=table-container]]:max-h-[65vh]">
         {containers.length === 0 ? (
           <EmptyState
             title="No containers"

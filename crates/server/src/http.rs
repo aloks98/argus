@@ -69,8 +69,12 @@ fn router(state: AppState) -> Router {
         )
         .route("/api/machines/{id}/logs/stream", get(log_stream))
         .route("/api/machines/{id}/logs/page", get(logs_page))
-        // TODO: nest remaining /api routes (terminal WS, events SSE, audit,
-        // enroll-tokens) and /auth OIDC routes here (PRD §9.1).
+        .route(
+            "/api/machines/{id}/terminal",
+            axum::routing::any(crate::terminal::terminal_ws),
+        )
+        // TODO: nest remaining /api routes (events SSE, audit, enroll-tokens)
+        // and /auth OIDC routes here (PRD §9.1).
         .fallback(static_handler)
         .layer(TraceLayer::new_for_http())
         .with_state(state)

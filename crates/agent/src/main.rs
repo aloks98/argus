@@ -15,6 +15,7 @@ mod identity;
 mod info;
 mod logs;
 mod metrics;
+mod pty;
 mod session;
 mod systemd;
 

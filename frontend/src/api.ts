@@ -228,6 +228,12 @@ export function logStreamUrl(
   return `/api/machines/${id}/logs/stream?${params.toString()}`;
 }
 
+/** WebSocket URL for an interactive terminal to a machine. */
+export function terminalWsUrl(id: string): string {
+  const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
+  return `${proto}//${window.location.host}/api/machines/${id}/terminal`;
+}
+
 /** One backward page of journal entries plus the next anchor. */
 export type LogPage = {
   lines: LogLine[];

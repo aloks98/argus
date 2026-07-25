@@ -126,6 +126,14 @@ async fn connect_and_serve(
     let inbound_tails = tails.clone();
     let inbound_docker_logs = docker.clone();
 
+    // session_id -> the live PTY for that terminal. Mirrors `tails`: a PTY
+    // must be closeable by PtyClose and must not survive the session that
+    // opened it, so every entry is closed when this function returns.
+    let ptys: std::sync::Arc<
+        std::sync::Mutex<std::collections::HashMap<String, crate::pty::PtyHandle>>,
+    > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
+    let inbound_ptys = ptys.clone();
+
     // Sender task: Hello first (fresh snapshot, re-sent on every reconnect so
     // the fleet view self-heals), then a Heartbeat on every tick. It normally
     // exits on its own once `tx` can no longer deliver, but that only happens
@@ -408,6 +416,71 @@ async fn connect_and_serve(
                                 handle.abort();
                             }
                         }
+                        Some(server_frame::Payload::PtyOpen(req)) => {
+                            let out = inbound_tx.clone();
+                            match crate::pty::open(
+                                req.session_id.clone(),
+                                frame.stream_id,
+                                req.cols as u16,
+                                req.rows as u16,
+                                &req.shell,
+                                out,
+                            ) {
+                                Ok(handle) => {
+                                    if let Some(old) =
+                                        inbound_ptys.lock().unwrap().insert(req.session_id, handle)
+                                    {
+                                        // `close()` blocks the calling thread joining the
+                                        // reader (which can itself be parked in a
+                                        // `blocking_send` if the outbound channel is
+                                        // full -- see pty.rs's teardown doc). Never run
+                                        // that join on an async worker thread; hand it
+                                        // to the blocking pool instead.
+                                        tokio::task::spawn_blocking(move || old.close());
+                                    }
+                                }
+                                Err(e) => {
+                                    // Surface the failure in the terminal as an eof
+                                    // notice, mirroring how a shell exit is reported.
+                                    let _ = inbound_tx
+                                        .send(AgentFrame {
+                                            stream_id: frame.stream_id,
+                                            payload: Some(agent_frame::Payload::PtyOutput(
+                                                argus_proto::v1::PtyOutput {
+                                                    session_id: req.session_id,
+                                                    data: format!("could not start a shell: {e}\r\n")
+                                                        .into_bytes(),
+                                                    eof: true,
+                                                },
+                                            )),
+                                        })
+                                        .await;
+                                }
+                            }
+                        }
+                        Some(server_frame::Payload::PtyInput(inp)) => {
+                            if let Some(h) = inbound_ptys.lock().unwrap().get(&inp.session_id) {
+                                h.write_input(&inp.data);
+                            }
+                        }
+                        Some(server_frame::Payload::PtyResize(rz)) => {
+                            if let Some(h) = inbound_ptys.lock().unwrap().get(&rz.session_id) {
+                                h.resize(rz.cols as u16, rz.rows as u16);
+                            }
+                        }
+                        Some(server_frame::Payload::PtyFlow(fl)) => {
+                            if let Some(h) = inbound_ptys.lock().unwrap().get(&fl.session_id) {
+                                h.set_paused(fl.paused);
+                            }
+                        }
+                        Some(server_frame::Payload::PtyClose(cl)) => {
+                            if let Some(h) = inbound_ptys.lock().unwrap().remove(&cl.session_id) {
+                                // See the PtyOpen arm above: `close()` blocks on a
+                                // thread join, so it must not run inline on the
+                                // async event loop.
+                                tokio::task::spawn_blocking(move || h.close());
+                            }
+                        }
                         _ => {}
                     }
                 }
@@ -431,6 +504,16 @@ async fn connect_and_serve(
     // session would leave `journalctl -f` running until the agent restarts.
     for (_, handle) in tails.lock().unwrap().drain() {
         handle.abort();
+    }
+
+    // A PTY belongs to the session that opened it too. `close()` blocks the
+    // caller joining its reader thread (which can be parked mid-`blocking_send`
+    // against a full outbound channel -- see pty.rs's teardown doc), so each
+    // teardown runs on the blocking pool rather than inline here: this
+    // function is still on the async event loop, and joining synchronously
+    // could wedge it for as long as the stall lasts.
+    for (_, handle) in ptys.lock().unwrap().drain() {
+        tokio::task::spawn_blocking(move || handle.close());
     }
 
     result

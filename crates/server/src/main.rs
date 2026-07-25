@@ -19,6 +19,7 @@ mod hub;
 mod identity;
 mod jobs;
 mod repo;
+mod terminal;
 
 use anyhow::Result;
 use std::sync::Arc;

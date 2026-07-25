@@ -23,6 +23,7 @@ prost.workspace = true
 axum.workspace = true
 tower-http.workspace = true
 rust-embed.workspace = true
+futures-util.workspace = true
 
 sqlx.workspace = true
 

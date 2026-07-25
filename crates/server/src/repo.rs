@@ -200,22 +200,27 @@ pub async fn cert_is_active(pool: &PgPool, fingerprint: &str) -> Result<Option<U
     Ok(row.map(|r| r.machine_id))
 }
 
-/// Flip a machine to `online` (session established) and stamp `last_seen_at`.
+/// Record that a machine is alive as of now: stamp `last_seen_at` *and*
+/// (re)assert `status = 'online'`. Called both at session establishment and on
+/// every liveness-bearing frame thereafter.
+///
+/// Re-asserting the status on every such frame is load-bearing, not redundant
+/// with the establishment call. `mark_stale_offline` flips any machine whose
+/// `last_seen_at` falls behind the cutoff, including one whose session is still
+/// up and merely stalled — a slow host, a paused VM, a network hiccup. If a
+/// heartbeat only stamped the timestamp, that machine could never come back:
+/// heartbeats would resume and `last_seen_at` would advance while the status
+/// stayed `offline` forever, since the only other writer of `online` is a
+/// brand-new session. The observable symptom is a machine whose `last_seen_at`
+/// ticks up every heartbeat interval while the fleet page still shows it
+/// offline.
+///
+/// A frame arriving on an authenticated session is itself the proof of life, so
+/// it is what has to restore the status. Which frames count as proof is decided
+/// by the caller (`grpc::handle_frame`) — notably log chunks do not.
 pub async fn mark_online(pool: &PgPool, machine_id: Uuid) -> Result<()> {
     sqlx::query!(
         "UPDATE machines SET status = 'online', last_seen_at = now(), updated_at = now() WHERE id = $1",
-        machine_id,
-    )
-    .execute(pool)
-    .await?;
-
-    Ok(())
-}
-
-/// Bump `last_seen_at` on each heartbeat without otherwise touching `status`.
-pub async fn touch_last_seen(pool: &PgPool, machine_id: Uuid) -> Result<()> {
-    sqlx::query!(
-        "UPDATE machines SET last_seen_at = now(), updated_at = now() WHERE id = $1",
         machine_id,
     )
     .execute(pool)
@@ -753,9 +758,9 @@ mod tests {
             .expect("read status");
         assert_eq!(row.status, "online");
 
-        touch_last_seen(&pool, machine_row_id)
+        mark_online(&pool, machine_row_id)
             .await
-            .expect("touch last seen");
+            .expect("heartbeat bump");
         let row = sqlx::query!(
             "SELECT last_seen_at FROM machines WHERE id = $1",
             machine_row_id
@@ -828,6 +833,66 @@ mod tests {
         .await
         .expect("seed machine")
         .id
+    }
+
+    /// Regression: a machine the sweeper flipped while its session was merely
+    /// stalled must return to `online` on its next heartbeat.
+    ///
+    /// This failed before `mark_online` replaced the stamp-only heartbeat
+    /// write. The symptom was subtle because the machine looked half-alive:
+    /// `last_seen_at` advanced every heartbeat interval while the fleet page
+    /// showed it offline indefinitely, since the only writer of `online` was a
+    /// brand-new session and the existing session never dropped.
+    ///
+    /// `#[sqlx::test]` rather than the shared-DB style above because
+    /// `mark_stale_offline` sweeps every row in the database, so it needs a
+    /// database of its own to make an exact count meaningful.
+    #[sqlx::test]
+    async fn heartbeat_after_sweep_restores_online(pool: PgPool) -> anyhow::Result<()> {
+        let id = seed_machine(&pool, "stalled-host").await;
+
+        // The precondition — an online machine whose heartbeats then stalled —
+        // is set up in raw SQL rather than by calling `mark_online`. Driving
+        // the setup through the function under test lets a regression in it
+        // hide: with the status write removed, the machine never reaches
+        // `online`, the sweep below flips nothing, and the test fails at the
+        // precondition instead of at the assertion that names the bug.
+        //
+        // Backdating past the cutoff (rather than sweeping with a zero one)
+        // states the actual scenario — heartbeats stalled longer than the 45s
+        // the sweeper allows — and keeps the test off the razor's edge between
+        // the Rust-side cutoff and Postgres's `now()`.
+        sqlx::query!(
+            "UPDATE machines SET status = 'online', last_seen_at = now() - interval '5 minutes' WHERE id = $1",
+            id,
+        )
+        .execute(&pool)
+        .await?;
+
+        let flipped = mark_stale_offline(&pool, std::time::Duration::from_secs(45)).await?;
+        assert_eq!(flipped, 1, "the stalled machine should have been swept");
+        let status = sqlx::query!("SELECT status FROM machines WHERE id = $1", id)
+            .fetch_one(&pool)
+            .await?
+            .status;
+        assert_eq!(status, "offline", "precondition: the sweep marked it down");
+
+        // The session was never lost, so no new session (and no `Hello`) will
+        // arrive — only the next heartbeat on the existing one.
+        mark_online(&pool, id).await?;
+
+        let row = sqlx::query!(
+            "SELECT status, last_seen_at FROM machines WHERE id = $1",
+            id
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            row.status, "online",
+            "a heartbeat must bring a swept-but-live machine back online"
+        );
+        assert!(row.last_seen_at.is_some(), "and re-stamp last_seen_at");
+        Ok(())
     }
 
     /// A fully-populated `MetricsSampleRow` with `cpu_pct` set to `cpu_pct`

@@ -215,6 +215,11 @@ impl AgentService for AgentSvc {
             // their SSE streams open forever with no eof (a frozen "live"
             // view in the browser).
             hub.close_tails_for(machine_id);
+            // Same reasoning for open terminals: dropping the ptys registry
+            // entries drops their byte-sink `Sender`s, which is what makes
+            // the WS handler's `rx.recv()` observe closure and end the
+            // browser session instead of hanging silently forever.
+            hub.close_ptys_for(machine_id);
             tracing::info!(%machine_id, "session: agent disconnected");
         });
 
@@ -241,9 +246,9 @@ async fn handle_agent_frame(
                 // `repo::update_machine_inventory`'s doc comment for why.
                 repo::update_machine_inventory(pool, machine_id, &agent_info_row(info)).await?;
             }
-            // `mark_online` already stamps `last_seen_at = now()`, so a
+            // Stamps `last_seen_at = now()` as well as the status, so a
             // freshly-online machine isn't immediately eligible for the 45s
-            // offline sweeper -- no extra `touch_last_seen` needed here.
+            // offline sweeper.
             repo::mark_online(pool, machine_id).await?;
             repo::audit(
                 pool,
@@ -264,27 +269,35 @@ async fn handle_agent_frame(
             .await
             .ok();
         }
+        // The periodic push frames below are all proof of life, so each one
+        // both stamps `last_seen_at` and re-asserts `online` — see
+        // `repo::mark_online` for why re-asserting matters: without it a
+        // machine the sweeper flipped during a stall stays `offline` forever
+        // even as its heartbeats resume.
         Some(agent_frame::Payload::Heartbeat(_)) => {
-            repo::touch_last_seen(pool, machine_id).await?;
+            repo::mark_online(pool, machine_id).await?;
         }
         Some(agent_frame::Payload::Metrics(m)) => {
             let row = metrics_row_from_proto(&m);
             repo::insert_metrics(pool, machine_id, &row).await?;
-            repo::touch_last_seen(pool, machine_id).await?;
+            repo::mark_online(pool, machine_id).await?;
         }
         Some(agent_frame::Payload::DockerState(ds)) => {
             hub.set_docker(machine_id, ds.containers);
-            repo::touch_last_seen(pool, machine_id).await?;
+            repo::mark_online(pool, machine_id).await?;
         }
         Some(agent_frame::Payload::SystemdState(ss)) => {
             hub.set_systemd(machine_id, ss.units);
-            repo::touch_last_seen(pool, machine_id).await?;
+            repo::mark_online(pool, machine_id).await?;
         }
         Some(agent_frame::Payload::LogChunk(chunk)) => {
-            // Deliberately no `touch_last_seen` here: a log tail is not evidence
+            // Deliberately no `mark_online` here: a log tail is not evidence
             // that the agent's heartbeat path is healthy, and refreshing on log
             // traffic would let a busy log mask a wedged agent.
             hub.deliver_chunk(&chunk.request_id.clone(), machine_id, chunk);
+        }
+        Some(agent_frame::Payload::PtyOutput(out)) => {
+            hub.deliver_pty_output(&out.session_id, machine_id, out.data, out.eof);
         }
         Some(agent_frame::Payload::CommandResult(cr)) => {
             let command_id = cr.command_id.clone();
@@ -320,8 +333,12 @@ async fn handle_agent_frame(
             hub.complete(&command_id, machine_id, cr);
         }
         _ => {
-            // PTY frames are a later slice; ignore for now. LogChunk is
-            // already handled above.
+            // No payload, or `Ack` -- a low-level stream-control
+            // acknowledgement the server doesn't currently act on. Every
+            // other `agent_frame::Payload` variant is matched above; note
+            // PtyOpen/PtyInput/PtyResize/PtyClose are `server_frame::Payload`
+            // variants (server -> agent) and cannot appear in this match at
+            // all.
         }
     }
 

@@ -30,8 +30,18 @@ export default defineConfig({
   server: {
     // During `npm run dev`, proxy the API/stream surfaces to the local control
     // plane so the SPA and backend share an origin.
+    //
+    // `/api` MUST use the object form with `ws: true`: the terminal is a
+    // WebSocket (`/api/machines/:id/terminal`), and the shorthand string form
+    // does not forward upgrade requests — the socket just never opens. That
+    // fails silently in a way that looks like a broken terminal rather than a
+    // broken proxy, because xterm does not echo locally (the remote PTY does),
+    // so a dead socket shows no prompt AND no response to typing.
+    //
+    // Dev-only: the production build is embedded in the control-plane binary
+    // and served from the same origin, so no proxy is involved there.
     proxy: {
-      "/api": "http://localhost:8080",
+      "/api": { target: "http://localhost:8080", ws: true },
       "/auth": "http://localhost:8080",
     },
   },

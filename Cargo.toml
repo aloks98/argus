@@ -31,9 +31,11 @@ rcgen = { version = "0.14", features = ["x509-parser"] } # defaults already sele
 rustls-pemfile = "2"
 
 # Browser HTTP surface + embedded frontend
-axum = "0.8"
+axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.7", features = ["trace"] }
 rust-embed = "8"
+# StreamExt/SinkExt for splitting a WebSocket into concurrent send/recv halves.
+futures-util = "0.3"
 
 # Postgres. Compile-time-checked queries; ring TLS to match the rest of the stack.
 sqlx = { version = "0.9", default-features = false, features = [

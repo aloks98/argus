@@ -73,7 +73,7 @@ export default function FleetPage() {
         </Alert>
       )}
 
-      <div className="border-2 border-border">
+      <div className="border border-border">
         {!isPending && rows.length === 0 ? (
           <EmptyState
             title="No machines enrolled yet"

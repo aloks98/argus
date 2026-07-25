@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) as n FROM audit_log WHERE machine_id=$1 AND action='terminal.open'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "1dea7ffc8b5b589bbfa676719d4dcd310646bbb87789d7190f15d6971c28c8d2"
+}

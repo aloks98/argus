@@ -44,7 +44,7 @@ export default function LogDialog() {
           utility against that `sm:` one, so the narrow default would win at
           ≥640px. Matching the modifier is what lets ours take effect. */}
       <DialogContent className="flex h-[85vh] w-[92vw] max-w-6xl flex-col gap-0 p-0 sm:max-w-6xl">
-        <DialogHeader className="border-b-2 border-border p-4 text-left">
+        <DialogHeader className="border-b border-border p-4 text-left">
           <DialogTitle className="font-mono text-sm">{source ?? ""}</DialogTitle>
           <DialogDescription className="font-mono text-[11px]">
             Live tail — closing this stops it on the agent. Drag to select and copy.

@@ -35,6 +35,7 @@ import LogViewer from "../components/LogViewer";
 import SpecStrip from "../components/SpecStrip";
 import type { SpecItem } from "../components/SpecStrip";
 import StatusBadge from "../components/StatusBadge";
+import TerminalView from "../components/TerminalView";
 import TimeSeriesChart from "../components/TimeSeriesChart";
 import type { ChartSeries } from "../components/TimeSeriesChart";
 import UnitsCard from "../components/UnitsCard";
@@ -152,6 +153,7 @@ export default function MachineDetailPage() {
       disabled: lacks(CAP_JOURNAL),
       reason: lacks(CAP_JOURNAL) ? "no journald on this host" : undefined,
     },
+    { key: "terminal", label: "Terminal" },
   ];
 
   // Fall back for an unknown value too, not just a missing one: `?tab=typo`
@@ -429,6 +431,10 @@ export default function MachineDetailPage() {
               />
             </div>
           </div>
+        </TabsContent>
+
+        <TabsContent value="terminal" className="mt-4">
+          <TerminalView machineId={id} />
         </TabsContent>
       </Tabs>
 

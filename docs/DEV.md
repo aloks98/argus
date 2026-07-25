@@ -620,3 +620,154 @@ it).
   with `error communicating with database: Connection refused`, the container has
   stopped — `docker start argus-pg`. Nothing is wrong with the code; `sqlx`'s
   compile-time query checking needs a reachable database (or `SQLX_OFFLINE=true`).
+
+## Terminal (PTY) slice — manual verification (2026-07-25)
+
+Interactive shell to a guest: xterm.js ↔ WebSocket ↔ server ↔ the single mTLS
+gRPC `Session` ↔ `portable-pty` on the agent. Design of record:
+`docs/superpowers/specs/2026-07-24-terminal-design.md`. Agent runs as root.
+
+### Running it in dev
+
+The `/api` vite proxy **must** use the object form with `ws: true`
+(`frontend/vite.config.ts`). The shorthand string form does not forward
+WebSocket upgrades, so `/api/machines/:id/terminal` silently never opens. It
+presents as a broken terminal, not a broken proxy: xterm does not echo locally
+(the remote PTY does), so a dead socket shows **no prompt and no response to
+typing**. Diagnose by comparing the two:
+
+```bash
+# opens on :8080 but times out through :5173  => the proxy, not the terminal
+node -e 'const w=new WebSocket("ws://localhost:8080/api/machines/<ID>/terminal");
+         w.onopen=()=>console.log("direct OPEN");w.onerror=()=>console.log("direct FAIL")'
+```
+
+### Protocol-level checks (all green)
+
+- Real shell over a real WebSocket: `echo PTY-OK-$((6*7))` returned `PTY-OK-42`
+  — the shell genuinely evaluated the arithmetic, so it is a true PTY.
+- `exit` closed the socket cleanly; **zero zombies**, no orphaned shells, and the
+  agent had no leftover children.
+- `audit_log` gained `terminal.open` / `ok` with `target_ref` = the session UUID.
+- A plain `GET` to the terminal route returns **400** (not-an-upgrade), not 404.
+
+### The firehose test — use a SLOW consumer
+
+**A throughput test cannot detect a backpressure bug.** A client that drains as
+fast as it can never fills the server's per-session buffer, so flow control is
+never exercised. The first firehose test here passed on `seq 1 200000` while the
+same command in a browser killed the session with `code 1005` — xterm renders,
+so it drains far slower.
+
+The test must therefore be a deliberately slow consumer. Busy-wait a few ms per
+message so the TCP receive window fills and the server's buffer crosses
+`PTY_HIGH_WATER`:
+
+```js
+ws.onmessage = (e) => {
+  bytes += e.data.byteLength;
+  out += dec.decode(new Uint8Array(e.data), { stream: true });
+  const t = Date.now(); while (Date.now() - t < 3) {}   // ~3ms of "rendering"
+};
+```
+
+Expected with `seq 1 200000` (verified): the session **stays open**, all
+1,488,964 bytes arrive with the final line `200000` present (**no dropped
+bytes**), the machine stays `online` with fresh heartbeats throughout, and no
+zombies or leftover children remain. A tear-down with `code 1005` means the
+message cap is binding before the byte watermark — see the sizing rule below.
+
+### The sizing rule (this caused a Critical)
+
+`PTY_CHANNEL_CAP` is in **messages**; the water marks are in **bytes**. The cap
+must never bind first:
+
+> `PTY_CHANNEL_CAP × (smallest sustained chunk) > PTY_HIGH_WATER`
+
+Real PTY chunks measure **~138 bytes** (1,488,985 bytes over 10,818 frames), not
+the 64 KiB an earlier draft assumed. At `PTY_CHANNEL_CAP = 32768` and
+`PTY_HIGH_WATER = 1 MiB` the breakeven is **32 bytes/chunk**, so measured traffic
+sits ~4.3× above the floor. **Any change to these constants must re-check that
+inequality**, not just make the numbers bigger.
+
+### Browser checks (confirmed by the maintainer)
+
+1. `top` redraws cleanly and `q` exits — escape sequences survive the whole chain.
+2. **Maximize keeps the same session** (scrollback intact, `top` still running);
+   Restore returns. A remount here would silently kill the shell.
+3. Resize reflows the shell (`echo $COLUMNS`, `stty size`).
+4. Switching tabs away kills the session **by design** (unmount → `PtyClose` →
+   agent kills the shell).
+5. Escape reaches the shell — it does **not** restore from maximize. Restoring on
+   Esc would mean intercepting it, and Esc is load-bearing in vim/less/fzf.
+
+### Two dark-mode traps
+
+Both of these shipped looking correct in light mode and passing `tsc` + build:
+
+- The terminal surface is always `bg-black` and the dark theme's page background
+  is `#000000`, so without a border the terminal is **invisible** against the
+  page. `--border` (`#242424` dark / `#D4D4D8` light) works for both.
+- The border **and** the padding must sit on the *wrapper*, not the div xterm
+  mounts into. `FitAddon` measures `term.element.parentElement`'s computed
+  height, which under this app's `border-box` reset includes that element's own
+  border and padding — putting either on the mount div makes it overcount and
+  clip the last row.
+
+**Check every UI change in both themes.** This is the third dark-mode-only defect
+in this project (after the tab colour and the log viewer's dark-on-dark text).
+
+### Known gaps (recorded in the design doc)
+
+WebSocket Pongs are not tracked, so the keepalive Ping is a liveness probe rather
+than dead-socket detection — the 30-minute idle timer is the real backstop. Also
+deferred: agent-side read coalescing, and a bounded PTY input queue.
+
+## Machine status: a heartbeat restores `online` (2026-07-25)
+
+**The bug.** `mark_stale_offline` flips any machine whose `last_seen_at` falls
+behind the 45s cutoff — including one whose session is still up and merely
+*stalled* (a slow host, a paused VM, a network hiccup). The heartbeat path then
+only stamped `last_seen_at` and deliberately left `status` alone, and the only
+other writer of `online` was a brand-new session. So a machine swept during a
+stall could never come back: heartbeats resumed and `last_seen_at` ticked up
+every interval while the fleet page showed it `offline` indefinitely.
+
+The symptom is distinctive, and worth recognising — **`last_seen_at` advancing
+while the badge says offline**. A machine that is genuinely gone has a frozen
+`last_seen_at`; only this bug produces a fresh timestamp on an offline row.
+
+**The fix.** `repo::touch_last_seen` is gone; the liveness-bearing frames
+(`Heartbeat`, `Metrics`, `DockerState`, `SystemdState`) call `repo::mark_online`,
+which stamps the timestamp *and* re-asserts the status. A frame arriving on an
+authenticated session is itself the proof of life, so it is what restores the
+status. `LogChunk` still deliberately does not count — a busy log would otherwise
+mask a wedged agent.
+
+**Live verification.** With an agent connected, force the sweeper's effect and
+watch a heartbeat undo it:
+
+```bash
+Q() { docker exec argus-pg psql -U postgres -d argus -tAc "$1"; }
+Q "SELECT count(*) FROM audit_log WHERE action='agent.online'"   # note it
+Q "UPDATE machines SET status='offline' WHERE hostname='fatman'"
+sleep 35
+Q "SELECT status FROM machines WHERE hostname='fatman'"          # -> online
+Q "SELECT count(*) FROM audit_log WHERE action='agent.online'"   # -> UNCHANGED
+```
+
+The audit count is the load-bearing part of this check. `agent.online` is written
+only on `Hello`, so an unchanged count proves no new session occurred and the
+recovery came from a heartbeat on the *existing* stream — which is the thing that
+was broken. Measured: `offline` at 10:18:02 → `online` by 10:18:09, audit count
+34 before and after.
+
+The regression test is `repo::tests::heartbeat_after_sweep_restores_online`. It
+sets its precondition in raw SQL rather than by calling `mark_online`: driving
+setup through the function under test made the deliberate-break check fail at the
+precondition (the sweep flipped nothing, because nothing was ever `online`)
+instead of at the assertion that names the bug.
+
+> Re-verifying this rotates nothing, but note that running the gates *before* it
+> does: `cargo test --workspace -- --ignored` rewrites `ca_material` (see the
+> gotcha above), so re-enroll the agent before trying the live check.

@@ -150,7 +150,7 @@ export default function UnitsCard({
           here would just nest a second one, and `sticky` would then resolve
           against the inner container and never move). With the height on that
           element, the header below can stick to it. */}
-      <div className="border-2 border-border [&>[data-slot=table-container]]:max-h-[65vh]">
+      <div className="border border-border [&>[data-slot=table-container]]:max-h-[65vh]">
         {units.length === 0 ? (
           <EmptyState
             title="No units"

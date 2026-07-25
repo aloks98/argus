@@ -77,6 +77,7 @@ message ServerFrame {
     PtyClose pty_close = 9;
     UpdateAgent update = 10;            // self-update: download new binary + re-exec
     Ping ping = 11;
+    PtyFlow pty_flow = 12;
   }
 }
 
@@ -188,7 +189,8 @@ message LogChunk {
 
 message PtyOpen { string session_id = 1; uint32 cols = 2; uint32 rows = 3; string shell = 4; }
 message PtyInput { string session_id = 1; bytes data = 2; }
-message PtyOutput { string session_id = 1; bytes data = 2; }
+message PtyOutput { string session_id = 1; bytes data = 2; bool eof = 3; }
+message PtyFlow   { string session_id = 1; bool paused = 2; }
 message PtyResize { string session_id = 1; uint32 cols = 2; uint32 rows = 3; }
 message PtyClose { string session_id = 1; }
 
