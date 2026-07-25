@@ -654,20 +654,15 @@ pub async fn delete_expired_sessions(pool: &PgPool) -> Result<u64> {
 }
 
 // The local-admin break-glass credential (design §6). `local_admin_exists` is
-// wired to the boot rule (`main.rs`); `upsert_local_admin` is now wired to the
-// CLI (`argus local-admin reset`, via `auth::local::reset_local_admin`). Only
-// the login handler still lands in a later task of the same slice, so
-// `get_local_admin`/`LocalAdmin` stay unreachable from non-test code for now.
-// Allowed per-item rather than at module level, since the rest of `repo.rs` is
-// fully wired -- matches the convention in `auth/password.rs` and
-// `agent/systemd.rs`.
-#[allow(dead_code)]
+// wired to the boot rule (`main.rs`); `upsert_local_admin` is wired to the CLI
+// (`argus local-admin reset`, via `auth::local::reset_local_admin`);
+// `get_local_admin`/`LocalAdmin`/`touch_local_admin_login` are wired to
+// `POST /auth/local` (`auth::local::login`).
 pub struct LocalAdmin {
     pub username: String,
     pub password_hash: String,
 }
 
-#[allow(dead_code)]
 pub async fn get_local_admin(pool: &PgPool) -> Result<Option<LocalAdmin>> {
     let row = sqlx::query!("SELECT username, password_hash FROM local_admin WHERE id = true")
         .fetch_optional(pool)
@@ -702,7 +697,6 @@ pub async fn local_admin_exists(pool: &PgPool) -> Result<bool> {
     Ok(n > 0)
 }
 
-#[allow(dead_code)]
 pub async fn touch_local_admin_login(pool: &PgPool) -> Result<()> {
     sqlx::query!("UPDATE local_admin SET last_login_at = now() WHERE id = true")
         .execute(pool)

@@ -48,9 +48,13 @@ pub struct AppState {
     pub oidc_client: Option<Arc<crate::auth::oidc::OidcClient>>,
     /// `Config.public_url`, carried independently of `oidc` so the session
     /// cookie's `Secure` attribute can be decided with no OIDC config present
-    /// at all -- a local login (later task) sets a cookie in exactly that
-    /// state (local-admin design §4).
+    /// at all -- a local login sets a cookie in exactly that state
+    /// (local-admin design §4).
     pub public_url: String,
+    /// Guards `POST /auth/local` (local-admin design §10). One instance for
+    /// the process's lifetime, shared via this `Arc` clone across every
+    /// request -- a per-request limiter would limit nothing.
+    pub limiter: Arc<crate::auth::ratelimit::LoginLimiter>,
 }
 
 pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
@@ -78,6 +82,7 @@ pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
         cipher,
         oidc_client,
         public_url: cfg.public_url.clone(),
+        limiter: Arc::new(crate::auth::ratelimit::LoginLimiter::new()),
     });
 
     let listener = tokio::net::TcpListener::bind(&cfg.http_addr).await?;
@@ -114,20 +119,27 @@ fn router(state: AppState) -> Router {
             "/api/machines/{id}/terminal",
             axum::routing::any(crate::terminal::terminal_ws),
         )
+        // `POST /api/local-admin/rotate` lives INSIDE this router deliberately
+        // (local-admin design §5.2): it must sit behind the same
+        // `require_auth` layer and `SameSite=Lax` cookie as every other verb,
+        // not under the public `/auth/*` prefix.
+        .route("/api/local-admin/rotate", post(crate::auth::local::rotate))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_auth,
         ));
 
     // Public: infra endpoints (PRD §9.1 puts them outside OIDC), the OIDC flow
-    // itself, and the SPA bundle -- which must render the sign-in view BEFORE
-    // any session exists. The bundle is an empty shell; all data is behind /api.
+    // itself, the local-admin login, and the SPA bundle -- which must render
+    // the sign-in view BEFORE any session exists. The bundle is an empty
+    // shell; all data is behind /api.
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
         .route("/auth/login", get(crate::auth::oidc::login))
         .route("/auth/callback", get(crate::auth::oidc::callback))
         .route("/auth/logout", post(crate::auth::oidc::logout))
+        .route("/auth/local", post(crate::auth::local::login))
         .merge(api)
         .fallback(static_handler)
         .layer(TraceLayer::new_for_http())
@@ -2577,6 +2589,7 @@ mod tests {
             ),
             oidc_client: Some(oidc_client),
             public_url: "http://localhost:8080".into(),
+            limiter: Arc::new(crate::auth::ratelimit::LoginLimiter::new()),
         }
     }
 
@@ -2754,6 +2767,243 @@ mod tests {
         let me: serde_json::Value = serde_json::from_slice(&body)?;
         assert_eq!(me["subject"], "sub-9");
         assert_eq!(me["email"], "op@example.com");
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn local_login_rejects_bad_credentials_without_setting_a_cookie(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let hash = crate::auth::password::hash_password("the-real-one")?;
+        repo::upsert_local_admin(&pool, "admin", &hash).await?;
+
+        let res = router(test_state(pool.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/local")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"wrong"}"#))?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            res.headers().get("set-cookie").is_none(),
+            "a failed login must not set a session cookie"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn local_login_with_correct_credentials_sets_a_working_session(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let hash = crate::auth::password::hash_password("the-real-one")?;
+        repo::upsert_local_admin(&pool, "admin", &hash).await?;
+        let app = router(test_state(pool.clone()));
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/local")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"admin","password":"the-real-one"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let cookie = res
+            .headers()
+            .get("set-cookie")
+            .expect("session cookie")
+            .to_str()?
+            .to_string();
+        assert!(
+            cookie.contains("HttpOnly"),
+            "session cookie must be HttpOnly"
+        );
+
+        // The session must resolve through the SAME middleware OIDC sessions use.
+        let me = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me")
+                    .header("cookie", cookie.split(';').next().unwrap())
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(me.status(), StatusCode::OK);
+        Ok(())
+    }
+
+    /// No admin configured must be indistinguishable from a wrong password.
+    #[sqlx::test]
+    async fn local_login_with_no_admin_configured_returns_the_same_failure(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let res = router(test_state(pool.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/local")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"anything"}"#))?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(res.headers().get("set-cookie").is_none());
+        Ok(())
+    }
+
+    /// Same failure across all three reasons: wrong password, wrong username
+    /// (a row exists, but the caller names a different one), and no admin
+    /// configured at all. Pins body AND status as byte-identical, not merely
+    /// "some 401" -- design §11's whole point is that these three cases must
+    /// be indistinguishable to the caller.
+    #[sqlx::test]
+    async fn local_login_failure_response_is_identical_across_all_three_reasons(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        async fn body_and_status(
+            app: Router,
+            payload: &str,
+        ) -> anyhow::Result<(StatusCode, Vec<u8>)> {
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/auth/local")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))?,
+                )
+                .await?;
+            let status = res.status();
+            let body = to_bytes(res.into_body(), usize::MAX).await?.to_vec();
+            Ok((status, body))
+        }
+
+        // Case 1: no admin row exists at all.
+        let (status_no_admin, body_no_admin) = body_and_status(
+            router(test_state(pool.clone())),
+            r#"{"username":"admin","password":"whatever"}"#,
+        )
+        .await?;
+
+        let hash = crate::auth::password::hash_password("the-real-one")?;
+        repo::upsert_local_admin(&pool, "admin", &hash).await?;
+
+        // Case 2: a row exists, but the password is wrong.
+        let (status_wrong_password, body_wrong_password) = body_and_status(
+            router(test_state(pool.clone())),
+            r#"{"username":"admin","password":"wrong"}"#,
+        )
+        .await?;
+
+        // Case 3: a row exists, but the username is wrong.
+        let (status_wrong_username, body_wrong_username) = body_and_status(
+            router(test_state(pool.clone())),
+            r#"{"username":"root","password":"the-real-one"}"#,
+        )
+        .await?;
+
+        assert_eq!(status_no_admin, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_no_admin, status_wrong_password);
+        assert_eq!(status_no_admin, status_wrong_username);
+        assert_eq!(
+            body_no_admin, body_wrong_password,
+            "no-admin-configured and wrong-password bodies must be byte-identical"
+        );
+        assert_eq!(
+            body_no_admin, body_wrong_username,
+            "no-admin-configured and wrong-username bodies must be byte-identical"
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn local_login_returns_429_with_retry_after_before_touching_the_database(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let state = test_state(pool);
+        // Exhaust the burst directly against the limiter -- no admin row is
+        // ever created, so if the handler queried the database on this path
+        // it would 401 (or 500, absent a row/table setup), never 429.
+        let now = std::time::Instant::now();
+        for _ in 0..(crate::auth::ratelimit::BURST + 1) {
+            state.limiter.record_failure(now);
+        }
+        let app = router(state);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/local")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"x"}"#))?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            res.headers().get("retry-after").is_some(),
+            "a 429 must carry Retry-After"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn local_admin_rotate_requires_auth_and_issues_a_new_password(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let hash = crate::auth::password::hash_password("original")?;
+        repo::upsert_local_admin(&pool, "admin", &hash).await?;
+
+        // No session: must not rotate anything.
+        let res = router(test_state(pool.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/local-admin/rotate")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = auth_cookie(&pool).await?;
+        let res = router(test_state(pool.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/local-admin/rotate")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)?;
+        let new_password = v["password"].as_str().expect("password field").to_string();
+        assert_ne!(new_password, "original");
+
+        let row = repo::get_local_admin(&pool)
+            .await?
+            .expect("row still present");
+        assert_eq!(row.username, "admin", "rotate must not rename the account");
+        assert!(crate::auth::password::verify_password(
+            &new_password,
+            &row.password_hash
+        ));
+
+        let audited =
+            sqlx::query!("SELECT result FROM audit_log WHERE action = 'local_admin.rotate'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(audited.result.as_deref(), Some("ok"));
+
         Ok(())
     }
 }

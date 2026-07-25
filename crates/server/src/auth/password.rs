@@ -4,11 +4,12 @@
 //! characters is arithmetically unguessable online, which is what demotes rate
 //! limiting to a backstop rather than the primary control.
 //!
-//! `generate_password`/`hash_password` are now wired in via
-//! `auth::local::reset_local_admin` (the CLI, this task). `verify_password`
-//! and the dummy-hash helpers below are still only reachable from the login
-//! handler a later task of the same slice adds, so they keep their own
-//! per-item `#[allow(dead_code)]` rather than a module-level one.
+//! `generate_password`/`hash_password` are wired in via
+//! `auth::local::reset_local_admin` (the CLI). `verify_password` and the
+//! dummy-hash helpers below are wired in via `auth::local::login` (`POST
+//! /auth/local`), which is what pays the argon2id cost on every path --
+//! including "no admin configured" -- so response timing never reveals
+//! whether a local admin exists.
 use anyhow::{anyhow, Result};
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -41,7 +42,6 @@ pub fn hash_password(password: &str) -> Result<String> {
 
 /// Returns false for a malformed stored hash rather than propagating: a corrupt
 /// row must deny the login, never crash the handler or admit the caller.
-#[allow(dead_code)]
 pub fn verify_password(password: &str, phc: &str) -> bool {
     match PasswordHash::new(phc) {
         Ok(parsed) => Argon2::default()
@@ -56,10 +56,8 @@ pub fn verify_password(password: &str, phc: &str) -> bool {
 /// "no local admin configured" returns in microseconds while a wrong password
 /// takes ~100ms, and that difference tells an attacker whether the credential
 /// exists at all.
-#[allow(dead_code)]
 pub const DUMMY_PHC: &str = "$argon2id$v=19$m=19456,t=2,p=1$9tkWNBxDNecw0mDcgXHBVA$9+5x76AgJroS3Mf4jCcOxF3tUuUhPjpIpon0meok1b4";
 
-#[allow(dead_code)]
 pub fn verify_against_dummy(password: &str) {
     let _ = verify_password(password, DUMMY_PHC);
 }

@@ -297,7 +297,11 @@ fn flow_cookie(secure: bool, sealed: String) -> Cookie<'static> {
         .build()
 }
 
-fn session_cookie(secure: bool, token: String) -> Cookie<'static> {
+/// `pub(crate)`: `auth::local::login` (`POST /auth/local`) builds the
+/// identical session cookie a local login mints, so both auth methods share
+/// exactly one cookie shape rather than a second implementation drifting out
+/// of sync with this one.
+pub(crate) fn session_cookie(secure: bool, token: String) -> Cookie<'static> {
     Cookie::build((argus_common::SESSION_COOKIE, token))
         .http_only(true)
         .same_site(SameSite::Lax)
@@ -729,14 +733,17 @@ pub async fn callback(
         // requires this row to carry -- goes in `detail` via
         // `audit_with_detail`, exactly like `grpc.rs` already does for
         // enrollment denials (`result = "denied"`, the extra fact in
-        // `detail`).
+        // `detail`). `method` rides alongside it (local-admin design §9) so
+        // every `auth.denied`/`auth.login` row states which auth method
+        // produced it explicitly, rather than it being inferred from the
+        // absence of a field on the local-admin path.
         if let Err(e) = repo::audit_with_detail(
             &state.pool,
             Actor::System,
             "auth.denied",
             None,
             "denied",
-            serde_json::json!({ "subject": subject }),
+            serde_json::json!({ "subject": subject, "method": "oidc" }),
         )
         .await
         {
@@ -774,13 +781,17 @@ pub async fn callback(
 
     // Fail closed (CLAUDE.md: every verb goes through the audit log from the
     // start): if the row can't be written, revoke the session we just
-    // created rather than let anyone sign in unaudited.
-    if let Err(e) = repo::audit(
+    // created rather than let anyone sign in unaudited. `detail` carries
+    // `method` (local-admin design §9) so `auth.login` rows are explicit
+    // about which auth method produced them, matching `auth::local::login`'s
+    // own `auth.login` write.
+    if let Err(e) = repo::audit_with_detail(
         &state.pool,
         Actor::User(&identity),
         "auth.login",
         None,
         "ok",
+        serde_json::json!({ "method": "oidc" }),
     )
     .await
     {
@@ -1119,6 +1130,7 @@ mod tests {
             ),
             oidc_client: Some(oidc_client),
             public_url,
+            limiter: Arc::new(crate::auth::ratelimit::LoginLimiter::new()),
         }
     }
 
@@ -1138,6 +1150,7 @@ mod tests {
             ),
             oidc_client: None,
             public_url: "http://localhost:8080".into(),
+            limiter: Arc::new(crate::auth::ratelimit::LoginLimiter::new()),
         }
     }
 

@@ -48,18 +48,15 @@ struct Bucket {
 
 /// Guards `POST /auth/local`. Shared across concurrent requests via
 /// `AppState`, so every method takes `&self` -- interior mutability via
-/// `std::sync::Mutex` rather than `&mut self`. Not yet consumed: the login
-/// handler (`auth::local`, a later task of the same slice) is the intended
-/// caller, hence the per-item `#[allow(dead_code)]` below rather than a
-/// module-level one, matching the convention already used by
-/// `auth/password.rs` and `repo.rs`'s `local_admin` items.
+/// `std::sync::Mutex` rather than `&mut self`. Constructed once at startup
+/// (`http::serve`) and consulted by the login handler (`auth::local::login`)
+/// before it ever touches the database.
 #[derive(Default)]
 pub struct LoginLimiter {
     bucket: Mutex<Bucket>,
 }
 
 impl LoginLimiter {
-    #[allow(dead_code)]
     pub fn new() -> Self {
         Self::default()
     }
@@ -67,7 +64,6 @@ impl LoginLimiter {
     /// `None` means the caller may proceed immediately. `Some(d)` means wait
     /// `d` longer. Never blocks, sleeps, or touches the database -- the
     /// handler decides what a `429` looks like.
-    #[allow(dead_code)]
     pub fn check(&self, now: Instant) -> Option<Duration> {
         let bucket = self.lock();
         if bucket.consecutive_failures < BURST {
@@ -85,7 +81,6 @@ impl LoginLimiter {
 
     /// Record a failed attempt. Escalates the delay for the *next* `check`;
     /// it does not itself reject anything.
-    #[allow(dead_code)]
     pub fn record_failure(&self, now: Instant) {
         let mut bucket = self.lock();
         bucket.consecutive_failures = bucket.consecutive_failures.saturating_add(1);
@@ -96,7 +91,6 @@ impl LoginLimiter {
     /// punishes a consecutive run of *failures*, not lifetime attempts, so
     /// the legitimate user who eventually gets the (generated, unmemorable)
     /// password right is not left paying for earlier typos.
-    #[allow(dead_code)]
     pub fn record_success(&self) {
         let mut bucket = self.lock();
         bucket.consecutive_failures = 0;

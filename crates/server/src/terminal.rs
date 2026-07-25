@@ -423,6 +423,7 @@ mod tests {
                 ),
                 oidc_client: Some(oidc_client),
                 public_url: "http://localhost:8080".into(),
+                limiter: Arc::new(crate::auth::ratelimit::LoginLimiter::new()),
             },
             hub,
         )
