@@ -2791,6 +2791,16 @@ mod tests {
             res.headers().get("set-cookie").is_none(),
             "a failed login must not set a session cookie"
         );
+
+        // CLAUDE.md: every verb goes through the audit log from the start.
+        // Design §9 requires `method` on the row explicitly, not merely "some
+        // audit row got written".
+        let audited =
+            sqlx::query!("SELECT result, detail FROM audit_log WHERE action = 'auth.denied'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(audited.result.as_deref(), Some("denied"));
+        assert_eq!(audited.detail, serde_json::json!({ "method": "local" }));
         Ok(())
     }
 
@@ -2836,6 +2846,16 @@ mod tests {
             )
             .await?;
         assert_eq!(me.status(), StatusCode::OK);
+
+        // CLAUDE.md: every verb goes through the audit log from the start,
+        // and design §9 requires `method` be explicit on the row -- nothing
+        // else would notice it silently vanishing.
+        let audited =
+            sqlx::query!("SELECT result, detail FROM audit_log WHERE action = 'auth.login'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(audited.result.as_deref(), Some("ok"));
+        assert_eq!(audited.detail, serde_json::json!({ "method": "local" }));
         Ok(())
     }
 
@@ -2931,10 +2951,13 @@ mod tests {
         let state = test_state(pool);
         // Exhaust the burst directly against the limiter -- no admin row is
         // ever created, so if the handler queried the database on this path
-        // it would 401 (or 500, absent a row/table setup), never 429.
+        // it would 401 (or 500, absent a row/table setup), never 429. `check`
+        // itself reserves the slot it grants (the concurrency fix), so
+        // calling it alone -- with no separate `record_failure` -- is enough
+        // to spend the whole burst.
         let now = std::time::Instant::now();
         for _ in 0..(crate::auth::ratelimit::BURST + 1) {
-            state.limiter.record_failure(now);
+            state.limiter.check(now);
         }
         let app = router(state);
 
@@ -2955,12 +2978,70 @@ mod tests {
         Ok(())
     }
 
+    /// The concurrency bug this fix round exists for, proven at the real
+    /// router: fire far more than `BURST` requests at `/auth/local`
+    /// SIMULTANEOUSLY (no admin row configured, so every one of them takes
+    /// the real, ~100ms argon2 dummy-hash path -- giving the verifies actual
+    /// overlapping wall-clock time to race in). Under the old
+    /// check-then-record-failure-later design, every one of them would read
+    /// "under budget" before any recorded itself, so all would pass and none
+    /// would ever see a 429. With the reservation folded into `check`, at
+    /// most `BURST` may ever be admitted regardless of how they interleave.
+    #[sqlx::test]
+    async fn concurrent_local_logins_cannot_collectively_exceed_the_burst(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let app = router(test_state(pool));
+        let total = crate::auth::ratelimit::BURST + 15;
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..total {
+            let app = app.clone();
+            set.spawn(async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/auth/local")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"username":"admin","password":"x"}"#))
+                        .expect("request"),
+                )
+                .await
+                .expect("router call")
+                .status()
+            });
+        }
+
+        let mut unauthorized = 0u32;
+        let mut too_many = 0u32;
+        while let Some(res) = set.join_next().await {
+            match res? {
+                StatusCode::UNAUTHORIZED => unauthorized += 1,
+                StatusCode::TOO_MANY_REQUESTS => too_many += 1,
+                other => panic!("unexpected status {other} from a concurrent local login"),
+            }
+        }
+
+        assert_eq!(
+            unauthorized,
+            crate::auth::ratelimit::BURST,
+            "concurrency must not let more than BURST requests past the limiter"
+        );
+        assert_eq!(too_many, total - crate::auth::ratelimit::BURST);
+
+        Ok(())
+    }
+
     #[sqlx::test]
     async fn local_admin_rotate_requires_auth_and_issues_a_new_password(
         pool: PgPool,
     ) -> anyhow::Result<()> {
+        // A NON-default username: a hardcoded `reset_local_admin(&pool, "admin")`
+        // -- the exact shortcut `rotate` deliberately avoids -- would pass a
+        // test seeded with "admin" identically to the real username-preserving
+        // implementation. Only a non-default seed can tell the two apart.
         let hash = crate::auth::password::hash_password("original")?;
-        repo::upsert_local_admin(&pool, "admin", &hash).await?;
+        repo::upsert_local_admin(&pool, "breakglass", &hash).await?;
 
         // No session: must not rotate anything.
         let res = router(test_state(pool.clone()))
@@ -2992,7 +3073,10 @@ mod tests {
         let row = repo::get_local_admin(&pool)
             .await?
             .expect("row still present");
-        assert_eq!(row.username, "admin", "rotate must not rename the account");
+        assert_eq!(
+            row.username, "breakglass",
+            "rotate must not rename the account"
+        );
         assert!(crate::auth::password::verify_password(
             &new_password,
             &row.password_hash

@@ -25,6 +25,22 @@
 //! plus a mutex: no I/O, no database, no async, and it takes `now: Instant`
 //! explicitly rather than reading the clock, so tests can drive time without
 //! sleeping.
+//!
+//! **`check` RESERVES the slot it grants, atomically, before the caller ever
+//! runs the (slow) argon2 verify.** An earlier version of this module had
+//! `check` merely *read* `consecutive_failures` and left recording a failure
+//! to a separate `record_failure` call made after the verify completed. That
+//! left a real gap: N requests arriving concurrently all read
+//! `consecutive_failures` before any of them finished verifying (~100ms
+//! away), so all N observed "under budget" and all N proceeded -- the
+//! effective limit was "N concurrent", not "`BURST` total", for any N. Folding
+//! the reservation into `check` itself closes that: incrementing happens
+//! under the same lock acquisition as the read, so only `BURST` callers can
+//! ever observe `None` before the bucket's own count reflects it for the
+//! next caller, no matter how long each one then takes to actually verify.
+//! `record_success` still unwinds a reservation the moment a real success is
+//! confirmed, so a legitimate login is never left paying for its own
+//! reservation.
 
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -61,36 +77,56 @@ impl LoginLimiter {
         Self::default()
     }
 
-    /// `None` means the caller may proceed immediately. `Some(d)` means wait
-    /// `d` longer. Never blocks, sleeps, or touches the database -- the
-    /// handler decides what a `429` looks like.
+    /// `None` means the caller may proceed immediately -- and, critically,
+    /// this call has ALREADY counted that as a (pessimistic) failure: it
+    /// increments `consecutive_failures` and stamps `last_attempt` before
+    /// returning, under the same lock acquisition that read them, so no
+    /// concurrent caller can observe the pre-increment count. `record_success`
+    /// below is what unwinds that the moment a real success is confirmed --
+    /// a caller that never calls back in (because it crashed, or the
+    /// database lookup failed) simply leaves one reservation spent, which is
+    /// the conservative direction to fail in.
+    ///
+    /// `Some(d)` means wait `d` longer, and makes NO state change at all --
+    /// hammering while already delayed must not itself escalate the delay
+    /// further, or an attacker could extend their own penalty into ours.
+    ///
+    /// Never blocks, sleeps, or touches the database -- the handler decides
+    /// what a `429` looks like, and the (blocking) argon2 verify happens
+    /// entirely after this returns `None`.
     pub fn check(&self, now: Instant) -> Option<Duration> {
-        let bucket = self.lock();
+        let mut bucket = self.lock();
         if bucket.consecutive_failures < BURST {
+            bucket.consecutive_failures += 1;
+            bucket.last_attempt = Some(now);
             return None;
         }
         let delay = Self::delay_for(bucket.consecutive_failures);
-        let last = bucket.last_attempt?;
+        let Some(last) = bucket.last_attempt else {
+            // Unreachable in practice (`consecutive_failures >= BURST > 0`
+            // implies some earlier call already set `last_attempt`), but if
+            // it ever were reached, failing OPEN (no delay) rather than
+            // unwrapping is the direction that can never become a lockout.
+            bucket.consecutive_failures += 1;
+            bucket.last_attempt = Some(now);
+            return None;
+        };
         let elapsed = now.saturating_duration_since(last);
         if elapsed >= delay {
+            bucket.consecutive_failures = bucket.consecutive_failures.saturating_add(1);
+            bucket.last_attempt = Some(now);
             None
         } else {
             Some(delay - elapsed)
         }
     }
 
-    /// Record a failed attempt. Escalates the delay for the *next* `check`;
-    /// it does not itself reject anything.
-    pub fn record_failure(&self, now: Instant) {
-        let mut bucket = self.lock();
-        bucket.consecutive_failures = bucket.consecutive_failures.saturating_add(1);
-        bucket.last_attempt = Some(now);
-    }
-
     /// A successful login clears the penalty entirely: the escalating delay
-    /// punishes a consecutive run of *failures*, not lifetime attempts, so
-    /// the legitimate user who eventually gets the (generated, unmemorable)
-    /// password right is not left paying for earlier typos.
+    /// punishes a consecutive run of *failures* (or reservations that never
+    /// panned out), not lifetime attempts, so the legitimate user who
+    /// eventually gets the (generated, unmemorable) password right is not
+    /// left paying for earlier typos -- including the reservation `check`
+    /// took out for THIS successful attempt itself.
     pub fn record_success(&self) {
         let mut bucket = self.lock();
         bucket.consecutive_failures = 0;
@@ -127,6 +163,20 @@ impl LoginLimiter {
 mod tests {
     use super::*;
 
+    /// Drives the limiter through exactly `attempts` allowed reservations,
+    /// advancing the simulated clock only as far as each one's own reported
+    /// delay requires -- the fastest an attacker who never once succeeds
+    /// could possibly go. Returns the `Instant` at which the last one was
+    /// admitted, so callers can inspect the state immediately afterward.
+    fn exhaust(l: &LoginLimiter, mut now: Instant, attempts: u32) -> Instant {
+        for _ in 0..attempts {
+            while let Some(d) = l.check(now) {
+                now += d;
+            }
+        }
+        now
+    }
+
     #[test]
     fn allows_until_the_burst_is_spent_then_delays() {
         let l = LoginLimiter::new();
@@ -136,7 +186,6 @@ mod tests {
                 l.check(t0).is_none(),
                 "attempt {i} within burst must be allowed"
             );
-            l.record_failure(t0);
         }
         assert!(
             l.check(t0).is_some(),
@@ -144,14 +193,29 @@ mod tests {
         );
     }
 
+    /// The concurrency property this module exists to guarantee (see the
+    /// module doc): many requests arriving at (approximately) the same
+    /// instant -- modelled here as the same identical `Instant`, i.e. zero
+    /// interleaved verify latency at all, the worst case -- must not all be
+    /// admitted. `check` reserves the slot itself, under the lock, before the
+    /// caller ever runs the slow argon2 verify, so calling it far more than
+    /// `BURST` times at one identical instant still only lets `BURST` through.
+    #[test]
+    fn concurrent_checks_at_the_same_instant_cannot_exceed_the_burst() {
+        let l = LoginLimiter::new();
+        let t0 = Instant::now();
+        let allowed = (0..BURST + 10).filter(|_| l.check(t0).is_none()).count();
+        assert_eq!(
+            allowed, BURST as usize,
+            "only the burst may pass at a single instant, no matter how many arrive"
+        );
+    }
+
     #[test]
     fn the_delay_escalates_but_is_capped() {
         let l = LoginLimiter::new();
-        let t0 = Instant::now();
-        for _ in 0..(BURST + 20) {
-            l.record_failure(t0);
-        }
-        let d = l.check(t0).expect("should be delaying");
+        let now = exhaust(&l, Instant::now(), BURST + 20);
+        let d = l.check(now).expect("should be delaying");
         assert!(
             d <= MAX_DELAY,
             "delay {d:?} must not exceed the cap {MAX_DELAY:?}"
@@ -159,16 +223,16 @@ mod tests {
     }
 
     /// A hard lockout would be a denial of service on the one credential that
-    /// exists to rescue the operator. However many failures occur, waiting
-    /// must eventually allow another attempt.
+    /// exists to rescue the operator. However many failed/reserved attempts
+    /// occur, waiting must eventually allow another attempt. Driven through
+    /// `check` itself now (rather than a separate `record_failure`), since
+    /// `check` is the only way to add to the count at all -- this proves the
+    /// property against the real, single entry point.
     #[test]
     fn no_sequence_of_failures_produces_a_permanent_lock() {
         let l = LoginLimiter::new();
-        let t0 = Instant::now();
-        for _ in 0..10_000 {
-            l.record_failure(t0);
-        }
-        let later = t0 + MAX_DELAY + Duration::from_secs(1);
+        let now = exhaust(&l, Instant::now(), 10_000);
+        let later = now + MAX_DELAY + Duration::from_secs(1);
         assert!(
             l.check(later).is_none(),
             "after waiting out the capped delay, an attempt must be allowed"
@@ -178,14 +242,11 @@ mod tests {
     #[test]
     fn success_clears_the_penalty() {
         let l = LoginLimiter::new();
-        let t0 = Instant::now();
-        for _ in 0..(BURST + 5) {
-            l.record_failure(t0);
-        }
-        assert!(l.check(t0).is_some());
+        let now = exhaust(&l, Instant::now(), BURST + 5);
+        assert!(l.check(now).is_some());
         l.record_success();
         assert!(
-            l.check(t0).is_none(),
+            l.check(now).is_none(),
             "a successful login resets the limiter"
         );
     }

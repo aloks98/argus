@@ -119,4 +119,37 @@ mod tests {
         assert!(!verify_password("", DUMMY_PHC));
         assert!(!verify_password("admin", DUMMY_PHC));
     }
+
+    /// What actually makes the no-admin path cost the same as a real
+    /// verification: the argon2 PARAMETERS (`m`/`t`/`p`) must match, not
+    /// merely "some argon2id string". `verify_password` only needs a
+    /// well-formed PHC to run -- it would happily "succeed" (return `false`,
+    /// same as today) against a hash with WEAKER parameters, at a fraction of
+    /// the cost, and every existing status/body/cookie assertion in
+    /// `http.rs` would stay green while the timing gap design §11 exists to
+    /// close quietly reopened. This pins the parameters segment of
+    /// `DUMMY_PHC` to always match a freshly generated hash's, so a future
+    /// argon2 version/parameter bump that updates one and not the other
+    /// fails loudly here instead of only in production timing.
+    #[test]
+    fn the_dummy_hash_shares_argon2_parameters_with_a_freshly_generated_hash() {
+        // PHC layout: "$argon2id$v=19$m=..,t=..,p=..$salt$hash" -- the
+        // parameters are the 4th '$'-delimited field (index 3).
+        fn params(phc: &str) -> Option<&str> {
+            phc.split('$').nth(3)
+        }
+
+        let fresh = hash_password("whatever").expect("hash");
+        let dummy_params = params(DUMMY_PHC);
+        let fresh_params = params(&fresh);
+        assert!(
+            dummy_params.is_some(),
+            "DUMMY_PHC must parse as a PHC string"
+        );
+        assert_eq!(
+            dummy_params, fresh_params,
+            "DUMMY_PHC's argon2 parameters must match a freshly generated hash's, \
+             or the no-admin path stops costing what a real verification costs"
+        );
+    }
 }

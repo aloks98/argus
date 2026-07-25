@@ -125,6 +125,29 @@ fn authorized_party_ok(audiences: &[&str], azp: Option<&str>, client_id: &str) -
     azp == Some(client_id)
 }
 
+/// The `auth.denied` audit `detail` for a role-admission rejection: `subject`
+/// is the non-principal fact design doc §9 requires this row to carry, and
+/// `method` (local-admin design §9) makes the login method explicit rather
+/// than inferred from its absence on the local-admin path.
+///
+/// Extracted to a pure function -- exactly like `authorized_party_ok` above,
+/// and for the same reason: driving `callback` to this point end-to-end
+/// needs a live (or fully mocked) IdP that exercises real ID-token
+/// verification, which this crate has no harness for. Without this
+/// extraction, "does `auth.denied` still carry `method: oidc`" has zero test
+/// coverage and a regression that dropped the field would leave every
+/// existing test green.
+fn denied_detail(subject: &str) -> serde_json::Value {
+    serde_json::json!({ "subject": subject, "method": "oidc" })
+}
+
+/// The `auth.login` audit `detail` for a successful callback. See
+/// `denied_detail` for why this is its own testable function rather than
+/// an inline literal only reachable through a full callback run.
+fn login_detail() -> serde_json::Value {
+    serde_json::json!({ "method": "oidc" })
+}
+
 /// Reject anything that is not a same-site absolute path. A browser treats
 /// `//host` as protocol-relative and `\` as a separator, so both must go --
 /// and so must ASCII tab/newline: `Query<..>` percent-decodes `%09`/`%0A` to
@@ -743,7 +766,7 @@ pub async fn callback(
             "auth.denied",
             None,
             "denied",
-            serde_json::json!({ "subject": subject, "method": "oidc" }),
+            denied_detail(&subject),
         )
         .await
         {
@@ -791,7 +814,7 @@ pub async fn callback(
         "auth.login",
         None,
         "ok",
-        serde_json::json!({ "method": "oidc" }),
+        login_detail(),
     )
     .await
     {
@@ -924,6 +947,25 @@ mod tests {
         // Degenerate: no audiences at all. The library's own aud check rejects
         // this before we run; assert our helper does not itself admit it.
         assert!(authorized_party_ok(&[], None, US));
+    }
+
+    /// Pins design §9's "`method` rides alongside [`subject`]" for the
+    /// role-denied path. Exercised directly (`callback` itself needs a live
+    /// or fully mocked IdP to reach this line -- see `denied_detail`'s doc
+    /// comment) so a regression that dropped the field is still caught,
+    /// rather than every other test staying green around it.
+    #[test]
+    fn denied_detail_names_the_method_and_carries_the_subject() {
+        let v = denied_detail("some-subject");
+        assert_eq!(v["method"], "oidc");
+        assert_eq!(v["subject"], "some-subject");
+    }
+
+    /// Same rationale as `denied_detail_names_the_method_and_carries_the_subject`,
+    /// for the success path's `auth.login` detail.
+    #[test]
+    fn login_detail_names_the_method() {
+        assert_eq!(login_detail()["method"], "oidc");
     }
 
     #[test]

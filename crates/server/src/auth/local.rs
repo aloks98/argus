@@ -70,9 +70,12 @@ fn rate_limited(retry_after: Duration) -> Response {
 /// `POST /auth/local` -- the break-glass login (design §8). Public, mounted
 /// alongside the other `/auth/*` routes.
 ///
-/// The three properties that matter here:
+/// The properties that matter here:
 /// 1. The limiter is consulted BEFORE any query, so a caller who is being
-///    delayed never costs the database anything.
+///    delayed never costs the database anything. `LoginLimiter::check`
+///    itself RESERVES the slot it grants (see that module's doc comment) --
+///    that is what keeps concurrent callers from all observing "under
+///    budget" while each other's argon2 verify is still in flight.
 /// 2. Wrong username, wrong password, and no-admin-configured all resolve
 ///    through exactly one `generic_failure()` return, and every one of those
 ///    paths pays the same argon2id verification cost -- the real hash when an
@@ -80,13 +83,18 @@ fn rate_limited(retry_after: Duration) -> Response {
 ///    dummy verification is the bug design §11 exists to prevent: without it
 ///    "no local admin configured" would return in microseconds while a wrong
 ///    password takes ~100ms, leaking whether the credential exists at all.
-/// 3. Success mints an ORDINARY session via the same `repo::create_session`
+/// 3. The argon2id verify runs inside `spawn_blocking`, never directly on the
+///    async task. At ~100ms and ~19 MiB per call, running it in-line would
+///    pin a tokio worker thread for that whole span; a few dozen concurrent
+///    unauthenticated requests would then be enough to stall the ENTIRE
+///    browser HTTP surface, which is a denial of service on exactly the
+///    recovery path §10.2 exists to keep available.
+/// 4. Success mints an ORDINARY session via the same `repo::create_session`
 ///    the OIDC callback uses, with the `local:` -prefixed subject that can
 ///    never collide with a provider's `sub`. There is no second session
 ///    concept.
 pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>) -> Response {
-    let now = Instant::now();
-    if let Some(retry_after) = state.limiter.check(now) {
+    if let Some(retry_after) = state.limiter.check(Instant::now()) {
         return rate_limited(retry_after);
     }
 
@@ -104,20 +112,44 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
     // reasons applies. The username comparison is deliberately ordinary
     // (not constant-time): it is public information the moment ANY account
     // exists (the CLI's usage text names the default), unlike the password.
+    //
+    // Both arms move an owned `String` copy of the submitted password into
+    // `spawn_blocking` -- never a reference to `req.password` -- so the
+    // verify runs on tokio's blocking pool rather than pinning this request's
+    // async worker for argon2id's ~100ms. Neither arm logs the password or
+    // lets it reach a `Debug`/error path; only the boolean result crosses
+    // back.
     let valid = match &admin {
         Some(row) => {
-            let password_ok =
-                crate::auth::password::verify_password(&req.password, &row.password_hash);
+            let password = req.password.clone();
+            let phc = row.password_hash.clone();
+            let password_ok = tokio::task::spawn_blocking(move || {
+                crate::auth::password::verify_password(&password, &phc)
+            })
+            .await
+            .unwrap_or_else(|e| {
+                tracing::error!(error = %e, "local login: argon2 verify task panicked");
+                false
+            });
             password_ok && req.username == row.username
         }
         None => {
-            crate::auth::password::verify_against_dummy(&req.password);
+            let password = req.password.clone();
+            if let Err(e) = tokio::task::spawn_blocking(move || {
+                crate::auth::password::verify_against_dummy(&password)
+            })
+            .await
+            {
+                tracing::error!(error = %e, "local login: dummy verify task panicked");
+            }
             false
         }
     };
 
     if !valid {
-        state.limiter.record_failure(now);
+        // No `record_failure` call: `check` above already reserved this
+        // attempt as a pessimistic failure BEFORE the verify ran, which is
+        // the fix for the concurrency gap -- see `ratelimit`'s doc comment.
         if let Err(e) = repo::audit_with_detail(
             &state.pool,
             Actor::System,
@@ -241,7 +273,85 @@ pub async fn rotate(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use sqlx::PgPool;
+
+    /// A minimal `AppState` for driving `login` directly (no router/oneshot
+    /// needed: it takes its extractors as plain arguments, mirroring
+    /// `auth::oidc`'s own test helpers). No OIDC configured -- irrelevant to
+    /// this handler -- but a fresh `LoginLimiter` and cipher, matching
+    /// `auth::oidc::tests::test_app_state_no_oidc`.
+    fn test_state(pool: PgPool) -> AppState {
+        AppState {
+            pool,
+            hub: std::sync::Arc::new(crate::hub::Hub::default()),
+            oidc: None,
+            cipher: std::sync::Arc::new(
+                crate::crypto::FieldCipher::from_b64_key(
+                    &base64::engine::general_purpose::STANDARD.encode([4u8; 32]),
+                )
+                .expect("test cipher"),
+            ),
+            oidc_client: None,
+            public_url: "http://localhost:8080".into(),
+            limiter: std::sync::Arc::new(crate::auth::ratelimit::LoginLimiter::new()),
+        }
+    }
+
+    /// The timing-indistinguishability property (design §11) has no coverage
+    /// anywhere else: deleting `verify_against_dummy` from the `None` arm of
+    /// `login` leaves every status/body/cookie assertion in `http.rs`
+    /// unchanged -- the only observable difference is elapsed time. The real
+    /// gap without the dummy verify is ~1000x (microseconds vs. argon2id's
+    /// ~100ms); a 2x ("50%") tolerance is nowhere near tight enough to flake
+    /// under CI jitter but is nowhere near loose enough to hide a skipped
+    /// verify either.
+    #[sqlx::test]
+    async fn no_admin_and_wrong_password_cost_about_the_same_time(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        // Case 1: nothing configured at all -- the dummy-hash path.
+        let t0 = std::time::Instant::now();
+        let _ = login(
+            State(test_state(pool.clone())),
+            Json(LoginRequest {
+                username: "admin".into(),
+                password: "whatever-1".into(),
+            }),
+        )
+        .await;
+        let no_admin_elapsed = t0.elapsed();
+
+        // Case 2: a row exists, but the password is wrong -- the real-hash
+        // path. Fresh `test_state` (hence a fresh limiter) so neither case
+        // pays for the other's reservation.
+        let hash = crate::auth::password::hash_password("the-real-one")?;
+        repo::upsert_local_admin(&pool, "admin", &hash).await?;
+        let t1 = std::time::Instant::now();
+        let _ = login(
+            State(test_state(pool.clone())),
+            Json(LoginRequest {
+                username: "admin".into(),
+                password: "wrong-2".into(),
+            }),
+        )
+        .await;
+        let wrong_password_elapsed = t1.elapsed();
+
+        let (a, b) = (
+            no_admin_elapsed.as_secs_f64(),
+            wrong_password_elapsed.as_secs_f64(),
+        );
+        let ratio = a.max(b) / a.min(b).max(f64::EPSILON);
+        assert!(
+            ratio <= 2.0,
+            "no-admin ({no_admin_elapsed:?}) and wrong-password ({wrong_password_elapsed:?}) \
+             paths must cost about the same -- a {ratio:.1}x gap suggests the dummy \
+             verification was skipped"
+        );
+
+        Ok(())
+    }
 
     #[sqlx::test]
     async fn reset_generates_a_working_password_and_stores_only_its_hash(
