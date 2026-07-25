@@ -108,6 +108,36 @@ async fn run_local_admin_cli(args: &[String]) -> Result<()> {
             let pool = db::connect_url(&database_url).await?;
             let password = auth::local::reset_local_admin(&pool, &username).await?;
 
+            // Every verb goes through the audit log from the start (CLAUDE.md).
+            // `Actor::System` here (not inside `reset_local_admin` itself,
+            // which stays the one generate-hash-store implementation shared
+            // with the in-app rotation endpoint a later task adds -- that
+            // endpoint has a real `Identity` and will audit as `Actor::User`)
+            // because the CLI has host and database access but no
+            // authenticated principal, which is precisely what `System`
+            // means. The username -- not the password, which never goes near
+            // an audit row -- goes in `detail` since the actor column itself
+            // can't carry it.
+            //
+            // A failed audit write must not cost the operator the password
+            // they just generated: the reset has already happened by this
+            // point, and losing the one-time display because of an
+            // unrelated logging failure would be the worst outcome here. So
+            // this is deliberately non-fatal -- warn and keep going, don't
+            // propagate the error and skip the `println!` below.
+            if let Err(e) = repo::audit_with_detail(
+                &pool,
+                repo::Actor::System,
+                "local_admin.reset",
+                None,
+                "ok",
+                serde_json::json!({ "username": username }),
+            )
+            .await
+            {
+                eprintln!("warning: failed to write audit log entry: {e}");
+            }
+
             println!(
                 "Local admin created.\n\n  username: {username}\n  password: {password}\n\n\
                  This password is shown ONCE and is not recoverable. Store it now.\n\
