@@ -2,6 +2,7 @@
 
 pub mod claims;
 pub mod oidc;
+pub mod password;
 pub mod session;
 
 use crate::http::AppState;

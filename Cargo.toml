@@ -79,6 +79,9 @@ x509-parser = "0.16"
 rand = "0.9"
 rustix = { version = "1", features = ["system"] }
 
+# Local admin password hashing. Pure Rust (no -sys crates, no OpenSSL, no cmake).
+argon2 = { version = "0.5", features = ["std"] }
+
 # Metrics slice: host CPU/mem/swap/load/disk/net/uptime sampling
 sysinfo = "0.39"
 
