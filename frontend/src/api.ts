@@ -17,6 +17,67 @@ function unauthenticatedOr(r: Response): Response {
   return r;
 }
 
+/**
+ * Thrown by `localLogin` when the server's global limiter (design §10) is
+ * throttling attempts. Distinct from the generic sign-in failure: telling the
+ * operator "you're being rate-limited" reveals nothing about whether the
+ * account exists, so it is safe to surface on its own.
+ */
+export class RateLimited extends Error {
+  retryAfterSeconds: number;
+  constructor(retryAfterSeconds: number) {
+    super("rate limited");
+    this.name = "RateLimited";
+    this.retryAfterSeconds = retryAfterSeconds;
+  }
+}
+
+/**
+ * `POST /auth/local` -- the break-glass login (design §8). Public: this is a
+ * plain fetch, not routed through `unauthenticatedOr`, because a 401 HERE
+ * means "wrong username or password", not "session died mid-visit" -- mapping
+ * it to `Unauthenticated` would be wrong on both counts (there is no session
+ * yet, and the global `MutationCache` handler in `main.tsx` treats that type
+ * as a signal to flip the gate).
+ *
+ * Resolves on success (the server already set the session cookie via
+ * `Set-Cookie`; the caller just needs to invalidate `["me"]`). On any
+ * failure other than rate-limiting, throws a plain `Error` with a
+ * deliberately generic message -- the server makes wrong-username,
+ * wrong-password, and no-admin-configured indistinguishable (design §11),
+ * and surfacing anything more specific here would undo that.
+ */
+export async function localLogin(username: string, password: string): Promise<void> {
+  const r = await fetch("/auth/local", {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ username, password }),
+  });
+  if (r.status === 429) {
+    const parsed = Number(r.headers.get("Retry-After"));
+    throw new RateLimited(Number.isFinite(parsed) && parsed > 0 ? parsed : 30);
+  }
+  if (!r.ok) {
+    throw new Error("Sign-in failed");
+  }
+}
+
+/**
+ * `POST /api/local-admin/rotate` -- authenticated in-app rotation (design
+ * §5.2). Behind `require_auth` like every other `/api/*` verb, so a 401 here
+ * really does mean the session died mid-visit -- `unauthenticatedOr` is the
+ * right call, unlike in `localLogin` above.
+ *
+ * Returns the new password for one-time display. The caller is responsible
+ * for never persisting it anywhere but a transient UI state.
+ */
+export async function rotateLocalAdmin(): Promise<string> {
+  const r = unauthenticatedOr(await fetch("/api/local-admin/rotate", { method: "POST" }));
+  if (!r.ok) throw new Error(`rotate failed: ${r.status}`);
+  const body: { password: string } = await r.json();
+  return body.password;
+}
+
 export type FleetRow = {
   id: string;
   hostname: string;

@@ -23,10 +23,17 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "@e412/rnui-react";
+import RotateLocalAdmin from "../components/RotateLocalAdmin";
 import ThemeToggle from "../components/ThemeToggle";
 import { useFleet } from "../lib/queries";
 import { logout, useMe } from "../lib/session";
 import { navSections } from "./routes";
+
+/** The footer's shared full-width error banner (see `AppShell`'s comment on
+ *  why it can't live inline in the ~3rem rail). Sign-out and password
+ *  rotation each compose their own title/message into this one shape rather
+ *  than owning separate banners. */
+type AccountError = { title: string; message: React.ReactNode };
 
 /**
  * The persistent chrome: a floating sidebar for nav, and a top bar owning the
@@ -38,24 +45,23 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // Lifted above the sidebar rather than kept local to AccountFooter: at rail
   // width the footer is ~3rem wide, nowhere near enough to show an error
   // message, so this renders as a full-width banner instead -- the operator
-  // must be able to tell sign-out failed regardless of sidebar state.
-  const [signOutError, setSignOutError] = useState<string | null>(null);
+  // must be able to tell an account action failed regardless of sidebar
+  // state. Shared by sign-out and password rotation, the footer's two
+  // account actions.
+  const [accountError, setAccountError] = useState<AccountError | null>(null);
 
   return (
     <SidebarProvider>
-      {signOutError !== null && (
+      {accountError !== null && (
         <Alert
           variant="destructive"
           className="fixed inset-x-0 top-0 z-50 rounded-none border-x-0 border-t-0"
         >
-          <AlertTitle>Sign-out failed</AlertTitle>
-          <AlertDescription>
-            {signOutError} Your session is still active on this server -- you are
-            NOT signed out. Try again before walking away from this browser.
-          </AlertDescription>
+          <AlertTitle>{accountError.title}</AlertTitle>
+          <AlertDescription>{accountError.message}</AlertDescription>
         </Alert>
       )}
-      <FleetSidebar onSignOutError={setSignOutError} />
+      <FleetSidebar onAccountError={setAccountError} />
       {/* min-w-0 + overflow-x-hidden are load-bearing for wide content (the
           units table runs ~130 rows with 90-char unit names): SidebarInset is a
           flex child, and a flex item defaults to `min-width: auto`, so without
@@ -106,17 +112,17 @@ function TopBar() {
  */
 function AccountFooter({
   rail,
-  onSignOutError,
+  onAccountError,
 }: {
   rail: boolean;
-  onSignOutError: (message: string | null) => void;
+  onAccountError: (error: AccountError | null) => void;
 }) {
   const { data } = useMe();
   const queryClient = useQueryClient();
   const identity = data?.display_name ?? data?.email ?? data?.subject ?? null;
 
   const handleSignOut = () => {
-    onSignOutError(null);
+    onAccountError(null);
     void logout()
       .then(async () => {
         // Invalidating an ACTIVELY OBSERVED query notifies its observer (the
@@ -142,7 +148,15 @@ function AccountFooter({
         // clear the query cache here, or the shell flips to <SignIn/> while
         // the operator is actually still signed in.
         const message = err instanceof Error ? err.message : "Sign-out failed.";
-        onSignOutError(message);
+        onAccountError({
+          title: "Sign-out failed",
+          message: (
+            <>
+              {message} Your session is still active on this server -- you are
+              NOT signed out. Try again before walking away from this browser.
+            </>
+          ),
+        });
       });
   };
 
@@ -158,16 +172,27 @@ function AccountFooter({
       )}
       <div className={rail ? "flex flex-col items-center gap-1" : "flex w-full items-center justify-between gap-2"}>
         <ThemeToggle showLabel={!rail} />
-        <Button
-          variant="outline"
-          size="sm"
-          aria-label="Sign out"
-          title="Sign out"
-          className="size-8 justify-center p-0"
-          onClick={handleSignOut}
-        >
-          <LogOut className="size-4" />
-        </Button>
+        {/* The two icon-only account actions grouped together so
+            `justify-between` above still reads as "toggle on the left,
+            actions on the right" with a third control added; in the rail
+            this nested flex just continues the same vertical stack. */}
+        <div className={rail ? "flex flex-col items-center gap-1" : "flex items-center gap-1"}>
+          <RotateLocalAdmin
+            onError={(message) =>
+              onAccountError(message === null ? null : { title: "Rotation failed", message })
+            }
+          />
+          <Button
+            variant="outline"
+            size="sm"
+            aria-label="Sign out"
+            title="Sign out"
+            className="size-8 justify-center p-0"
+            onClick={handleSignOut}
+          >
+            <LogOut className="size-4" />
+          </Button>
+        </div>
       </div>
     </>
   );
@@ -183,9 +208,9 @@ function AccountFooter({
  * still sizes its parent.
  */
 function FleetSidebar({
-  onSignOutError,
+  onAccountError,
 }: {
-  onSignOutError: (message: string | null) => void;
+  onAccountError: (error: AccountError | null) => void;
 }) {
   const location = useLocation();
   const { state, isMobile } = useSidebar();
@@ -272,7 +297,7 @@ function FleetSidebar({
             : "gap-1 border-t border-border px-3 py-2"
         }
       >
-        <AccountFooter rail={rail} onSignOutError={onSignOutError} />
+        <AccountFooter rail={rail} onAccountError={onAccountError} />
       </SidebarFooter>
 
       {/* Draggable edge strip: toggling from the sidebar's own border, in
