@@ -239,6 +239,42 @@ mod tests {
         );
     }
 
+    /// The one mutation that turns "no permanent lockout" into a REAL
+    /// permanent lockout: if the delayed (`Some(d)`) branch of `check` ever
+    /// stamped `last_attempt = now`, every poll from a caller hammering the
+    /// endpoint would push the countdown's origin forward by the poll
+    /// interval, so `elapsed >= delay` would never become true again.
+    ///
+    /// `exhaust` (used by every other test here) cannot catch this: it calls
+    /// `check` exactly once per delay period, jumping the simulated clock
+    /// straight to the boundary, so it never exercises a caller that polls
+    /// FASTER than the delay -- which is exactly what a real attacker (or an
+    /// impatient legitimate user) does. This test polls in small steps
+    /// instead, driven first well past the burst so the delay is pinned at
+    /// its cap (`MAX_DELAY`) -- the worst, most realistic case -- and asserts
+    /// admission happens within `MAX_DELAY` plus a little slack.
+    #[test]
+    fn hammering_while_delayed_does_not_extend_the_delay() {
+        let l = LoginLimiter::new();
+        let mut now = exhaust(&l, Instant::now(), BURST + 20);
+
+        let deadline = now + MAX_DELAY + Duration::from_secs(5);
+        let mut admitted = false;
+        while now < deadline {
+            now += Duration::from_millis(100);
+            if l.check(now).is_none() {
+                admitted = true;
+                break;
+            }
+        }
+        assert!(
+            admitted,
+            "polling every 100ms must still be admitted within MAX_DELAY plus slack -- \
+             if this fails, the delayed branch is mutating state (e.g. `last_attempt`) \
+             it must leave alone, which is a real permanent lockout under a sustained flood"
+        );
+    }
+
     #[test]
     fn success_clears_the_penalty() {
         let l = LoginLimiter::new();
