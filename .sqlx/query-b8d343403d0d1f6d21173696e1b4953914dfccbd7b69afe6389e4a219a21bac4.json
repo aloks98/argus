@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE local_admin SET last_login_at = now() WHERE id = true",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "b8d343403d0d1f6d21173696e1b4953914dfccbd7b69afe6389e4a219a21bac4"
+}

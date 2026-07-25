@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT last_login_at FROM local_admin",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "last_login_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "local_admin",
+            "name": "last_login_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "19c042b8ac20fa6a94f5d7a38d72fb165b9b61d7ab92970975a8fdd8540298d1"
+}

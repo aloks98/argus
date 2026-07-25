@@ -653,6 +653,63 @@ pub async fn delete_expired_sessions(pool: &PgPool) -> Result<u64> {
     Ok(r.rows_affected())
 }
 
+// The local-admin break-glass credential (design §6). This task adds only the
+// repo layer; no provisioning verb or login handler calls into it yet (those
+// land in later tasks of the same slice), so nothing below is reachable from
+// `main` yet. Allowed per-item rather than at module level, since the rest of
+// `repo.rs` is fully wired -- matches the convention in `auth/password.rs` and
+// `agent/systemd.rs`.
+#[allow(dead_code)]
+pub struct LocalAdmin {
+    pub username: String,
+    pub password_hash: String,
+}
+
+#[allow(dead_code)]
+pub async fn get_local_admin(pool: &PgPool) -> Result<Option<LocalAdmin>> {
+    let row = sqlx::query!("SELECT username, password_hash FROM local_admin WHERE id = true")
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| LocalAdmin {
+        username: r.username,
+        password_hash: r.password_hash,
+    }))
+}
+
+/// Create or rotate. `ON CONFLICT` on the single-row primary key makes this an
+/// in-place rotation rather than an accumulation of credentials.
+#[allow(dead_code)]
+pub async fn upsert_local_admin(pool: &PgPool, username: &str, password_hash: &str) -> Result<()> {
+    sqlx::query!(
+        "INSERT INTO local_admin (id, username, password_hash) VALUES (true, $1, $2)
+         ON CONFLICT (id) DO UPDATE SET username = $1, password_hash = $2, updated_at = now()",
+        username,
+        password_hash,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Used by the boot rule: the control plane may start without OIDC config only
+/// if this returns true.
+#[allow(dead_code)]
+pub async fn local_admin_exists(pool: &PgPool) -> Result<bool> {
+    let n = sqlx::query_scalar!("SELECT count(*) FROM local_admin")
+        .fetch_one(pool)
+        .await?
+        .unwrap_or(0);
+    Ok(n > 0)
+}
+
+#[allow(dead_code)]
+pub async fn touch_local_admin_login(pool: &PgPool) -> Result<()> {
+    sqlx::query!("UPDATE local_admin SET last_login_at = now() WHERE id = true")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1595,5 +1652,63 @@ mod tests {
         let m = Uuid::nil();
         assert_eq!(Actor::Agent(m).as_str(), m.to_string());
         assert_eq!(Actor::System.as_str(), "system");
+    }
+
+    #[sqlx::test]
+    async fn local_admin_round_trips_and_rotation_updates_the_hash(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        assert!(!local_admin_exists(&pool).await?, "starts absent");
+        assert!(get_local_admin(&pool).await?.is_none());
+
+        upsert_local_admin(&pool, "admin", "$argon2id$first").await?;
+        assert!(local_admin_exists(&pool).await?);
+        let a = get_local_admin(&pool).await?.expect("row");
+        assert_eq!(a.username, "admin");
+        assert_eq!(a.password_hash, "$argon2id$first");
+
+        // Rotation replaces the hash in place rather than adding a row.
+        upsert_local_admin(&pool, "admin", "$argon2id$second").await?;
+        let b = get_local_admin(&pool).await?.expect("row");
+        assert_eq!(b.password_hash, "$argon2id$second");
+
+        let count = sqlx::query_scalar!("SELECT count(*) FROM local_admin")
+            .fetch_one(&pool)
+            .await?
+            .unwrap_or(0);
+        assert_eq!(count, 1, "rotation must not create a second row");
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn a_second_local_admin_row_is_rejected_by_the_schema(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        upsert_local_admin(&pool, "admin", "$argon2id$x").await?;
+        // Bypass the repo helper to prove the SCHEMA enforces single-row, not
+        // just our upsert. Without the constraint this insert would succeed.
+        let second = sqlx::query!(
+            "INSERT INTO local_admin (id, username, password_hash) VALUES (true, 'other', 'y')"
+        )
+        .execute(&pool)
+        .await;
+        assert!(second.is_err(), "the schema must reject a second row");
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn touch_login_stamps_last_login_at(pool: PgPool) -> anyhow::Result<()> {
+        upsert_local_admin(&pool, "admin", "$argon2id$x").await?;
+        let before = sqlx::query_scalar!("SELECT last_login_at FROM local_admin")
+            .fetch_one(&pool)
+            .await?;
+        assert!(before.is_none(), "not stamped until a login happens");
+
+        touch_local_admin_login(&pool).await?;
+        let after = sqlx::query_scalar!("SELECT last_login_at FROM local_admin")
+            .fetch_one(&pool)
+            .await?;
+        assert!(after.is_some());
+        Ok(())
     }
 }
