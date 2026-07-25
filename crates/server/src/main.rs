@@ -45,6 +45,16 @@ async fn main() -> Result<()> {
     db::migrate(&pool).await?;
     tracing::info!("migrations applied");
 
+    // Design §4: the invariant is "authentication is configured", not "OIDC is
+    // configured". Booting with neither would serve the browser surface -- and
+    // a root PTY on every machine -- to anyone who can reach the port.
+    if cfg.oidc.is_none() && !repo::local_admin_exists(&pool).await? {
+        anyhow::bail!(
+            "no authentication is configured: set the OIDC variables, or create \
+             a local admin with `argus local-admin reset`"
+        );
+    }
+
     // Load (or generate + persist) the internal CA, then issue the control
     // plane's own TLS leaf for the agent gRPC surface (Spine, build slice #1).
     let field_cipher = crypto::FieldCipher::from_b64_key(&cfg.field_key_b64)?;

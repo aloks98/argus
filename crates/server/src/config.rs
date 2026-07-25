@@ -10,13 +10,16 @@ pub enum RequiredRole {
     Named(String),
 }
 
-/// OIDC settings. All required fields are validated at startup; the server
-/// refuses to boot without them, because the alternative to authentication
-/// here is an unauthenticated root shell.
+/// OIDC settings. Optional as a whole (local-admin design §4: the invariant is
+/// "some authentication method is configured", not "OIDC specifically is").
+/// When present, all fields were validated together at startup by
+/// `oidc_from_env_values` -- there is no way to reach a partially-populated
+/// `OidcConfig`.
 ///
-/// Held (behind `Arc`) in `AppState.oidc`; every field is read by the OIDC
-/// flow handlers (`crate::auth::oidc`).
-#[derive(Clone)]
+/// Held (behind `Arc`, and now `Option`) in `AppState.oidc`; every field is
+/// read by the OIDC flow handlers (`crate::auth::oidc`), which degrade to a
+/// 404 rather than panic when it is `None`.
+#[derive(Clone, Debug)]
 pub struct OidcConfig {
     pub issuer: String,
     pub client_id: String,
@@ -24,6 +27,11 @@ pub struct OidcConfig {
     pub required_role: RequiredRole,
     pub roles_claim: String,
     pub scopes: Vec<String>,
+    /// Same value as `Config.public_url` -- kept here too because it builds
+    /// `redirect_uri`, which is genuinely OIDC-specific. The cookie `Secure`
+    /// decision reads `Config.public_url` instead (local-admin design §4):
+    /// that decision is not OIDC-specific, and a local login sets a session
+    /// cookie in states where this struct doesn't exist at all.
     pub public_url: String,
     pub ca_cert_path: Option<String>,
 }
@@ -31,9 +39,6 @@ pub struct OidcConfig {
 impl OidcConfig {
     pub fn redirect_uri(&self) -> String {
         redirect_uri(&self.public_url)
-    }
-    pub fn cookie_secure(&self) -> bool {
-        cookie_secure(&self.public_url)
     }
 }
 
@@ -68,7 +73,14 @@ fn redirect_uri(public_url: &str) -> String {
 
 /// Derived from how the deployment is reachable, not a toggle. It can weaken a
 /// cookie flag on localhost; it can never disable authentication.
-fn cookie_secure(public_url: &str) -> bool {
+///
+/// `pub(crate)`: this is the `Config`-level decision the local-admin design
+/// (§4) requires -- session cookies must get a correct `Secure` attribute
+/// regardless of which auth method is configured, so this is called directly
+/// against `AppState.public_url` by the auth flow handlers rather than
+/// through an `OidcConfig` method that would not exist in a local-admin-only
+/// deployment.
+pub(crate) fn cookie_secure(public_url: &str) -> bool {
     public_url.starts_with("https://")
 }
 
@@ -82,33 +94,142 @@ pub struct Config {
     pub agent_addr: String,
     /// SANs (hostnames/IPs) for the control plane's own agent-surface TLS leaf.
     pub agent_sans: Vec<String>,
-    /// Read by `http::serve` to build `AppState.oidc` (Task 5); the OIDC flow
-    /// handlers (Task 6) read the fields inside it.
-    pub oidc: OidcConfig,
+    /// Externally reachable base URL. Required unconditionally, independent of
+    /// whether OIDC is configured: it decides the session cookie's `Secure`
+    /// attribute for *every* login method, local admin included (local-admin
+    /// design §4). `OidcConfig.public_url` carries the same value for building
+    /// `redirect_uri`, which is genuinely OIDC-specific.
+    pub public_url: String,
+    /// Read by `http::serve` to build `AppState.oidc`; the OIDC flow handlers
+    /// read the fields inside it. `None` is a valid, boot-succeeding state --
+    /// see `oidc_from_env_values` and the boot rule in `main.rs`.
+    pub oidc: Option<OidcConfig>,
 }
 
 impl Config {
     pub fn from_env() -> Result<Self> {
         use argus_common::env;
+        let public_url = req(env::PUBLIC_URL)?;
+
+        // OIDC-configured-or-not is judged by the four OIDC-specific
+        // variables alone. `ARGUS_PUBLIC_URL` is required unconditionally
+        // (just above) because the session cookie's `Secure` attribute needs
+        // it regardless of auth method, so its mere presence can never signal
+        // "OIDC is configured" -- it is present in every config that got this
+        // far, OIDC or local-admin-only alike.
+        let oidc_issuer = std::env::var(env::OIDC_ISSUER).ok();
+        let oidc_client_id = std::env::var(env::OIDC_CLIENT_ID).ok();
+        let oidc_client_secret = std::env::var(env::OIDC_CLIENT_SECRET).ok();
+        let oidc_required_role = std::env::var(env::OIDC_REQUIRED_ROLE).ok();
+        let oidc_public_url = public_url_for_oidc(
+            &oidc_issuer,
+            &oidc_client_id,
+            &oidc_client_secret,
+            &oidc_required_role,
+            &public_url,
+        );
+
         Ok(Self {
             database_url: req(env::DATABASE_URL)?,
             field_key_b64: req(env::FIELD_KEY)?,
             http_addr: std::env::var(env::HTTP_ADDR).unwrap_or_else(|_| "0.0.0.0:8080".into()),
             agent_addr: std::env::var(env::AGENT_ADDR).unwrap_or_else(|_| "0.0.0.0:9443".into()),
             agent_sans: parse_agent_sans(std::env::var(env::AGENT_SANS).ok().as_deref()),
-            oidc: OidcConfig {
-                issuer: req(env::OIDC_ISSUER)?,
-                client_id: req(env::OIDC_CLIENT_ID)?,
-                client_secret: req(env::OIDC_CLIENT_SECRET)?,
-                required_role: parse_required_role(&req(env::OIDC_REQUIRED_ROLE)?),
-                roles_claim: std::env::var(env::OIDC_ROLES_CLAIM)
-                    .unwrap_or_else(|_| "groups".into()),
-                scopes: parse_scopes(std::env::var(env::OIDC_SCOPES).ok().as_deref()),
-                public_url: req(env::PUBLIC_URL)?,
-                ca_cert_path: std::env::var(env::OIDC_CA_CERT).ok(),
-            },
+            oidc: oidc_from_env_values(
+                oidc_issuer,
+                oidc_client_id,
+                oidc_client_secret,
+                oidc_required_role,
+                oidc_public_url,
+                std::env::var(env::OIDC_ROLES_CLAIM).ok(),
+                std::env::var(env::OIDC_SCOPES).ok(),
+                std::env::var(env::OIDC_CA_CERT).ok(),
+            )?,
+            public_url,
         })
     }
+}
+
+/// Whether to hand `ARGUS_PUBLIC_URL`'s value to `oidc_from_env_values` at
+/// all, for one call site only (`Config::from_env`).
+///
+/// Without this, a local-admin-only deployment -- which must still set
+/// `ARGUS_PUBLIC_URL` (it is required independent of OIDC, see `Config`) --
+/// would present as "1 of 5 OIDC variables set" and be rejected as a *partial*
+/// OIDC config naming `ARGUS_OIDC_ISSUER` as missing, even though the operator
+/// never intended to configure OIDC at all. OIDC intent is judged by the four
+/// genuinely OIDC-specific variables; `ARGUS_PUBLIC_URL` is only folded in
+/// once that intent already exists, matching what `oidc_from_env_values`
+/// itself expects to see for a real "all five" or "some" determination.
+fn public_url_for_oidc(
+    issuer: &Option<String>,
+    client_id: &Option<String>,
+    client_secret: &Option<String>,
+    required_role: &Option<String>,
+    public_url: &str,
+) -> Option<String> {
+    let oidc_intent = issuer.is_some()
+        || client_id.is_some()
+        || client_secret.is_some()
+        || required_role.is_some();
+    oidc_intent.then(|| public_url.to_string())
+}
+
+/// Build the OIDC settings from already-read values, so the all-or-nothing rule
+/// is testable without mutating process env (racy in parallel tests).
+///
+/// Three outcomes, and the middle one is the point:
+///   - all five required values present -> `Ok(Some(_))`
+///   - none present                     -> `Ok(None)`, a valid state for a
+///     local-admin-only deployment (design §4)
+///   - some present                     -> `Err`, naming the first missing one.
+///     A half-configured provider is a mistake, not a mode: treating it as
+///     "not configured" would let one typo silently disable SSO for everyone.
+#[allow(clippy::too_many_arguments)]
+fn oidc_from_env_values(
+    issuer: Option<String>,
+    client_id: Option<String>,
+    client_secret: Option<String>,
+    required_role: Option<String>,
+    public_url: Option<String>,
+    roles_claim: Option<String>,
+    scopes: Option<String>,
+    ca_cert_path: Option<String>,
+) -> Result<Option<OidcConfig>> {
+    use argus_common::env;
+    let required = [
+        (env::OIDC_ISSUER, &issuer),
+        (env::OIDC_CLIENT_ID, &client_id),
+        (env::OIDC_CLIENT_SECRET, &client_secret),
+        (env::OIDC_REQUIRED_ROLE, &required_role),
+        (env::PUBLIC_URL, &public_url),
+    ];
+    let present = required.iter().filter(|(_, v)| v.is_some()).count();
+    if present == 0 {
+        return Ok(None);
+    }
+    if present < required.len() {
+        let missing = required
+            .iter()
+            .find(|(_, v)| v.is_none())
+            .map(|(k, _)| *k)
+            .unwrap_or("");
+        return Err(anyhow::anyhow!(
+            "OIDC is partially configured: {missing} is missing. Set all five \
+             OIDC variables, or none of them to run with only a local admin."
+        ));
+    }
+    let take = |k: &str, v: Option<String>| -> Result<String> { reject_empty(k, v.unwrap()) };
+    Ok(Some(OidcConfig {
+        issuer: take(env::OIDC_ISSUER, issuer)?,
+        client_id: take(env::OIDC_CLIENT_ID, client_id)?,
+        client_secret: take(env::OIDC_CLIENT_SECRET, client_secret)?,
+        required_role: parse_required_role(&take(env::OIDC_REQUIRED_ROLE, required_role)?),
+        roles_claim: roles_claim.unwrap_or_else(|| "groups".into()),
+        scopes: parse_scopes(scopes.as_deref()),
+        public_url: take(env::PUBLIC_URL, public_url)?,
+        ca_cert_path,
+    }))
 }
 
 /// Read a required env var, rejecting empty and whitespace-only values.
@@ -251,5 +372,97 @@ mod tests {
             parse_scopes(Some("   ")),
             vec!["openid", "profile", "email"]
         );
+    }
+
+    use super::oidc_from_env_values;
+
+    /// All five present -> configured.
+    #[test]
+    fn complete_oidc_config_is_loaded() {
+        let got = oidc_from_env_values(
+            Some("https://idp.example".into()),
+            Some("cid".into()),
+            Some("secret".into()),
+            Some("any".into()),
+            Some("https://argus.example".into()),
+            None,
+            None,
+            None,
+        )
+        .expect("complete config must load");
+        assert!(got.is_some());
+    }
+
+    /// None present -> not configured, and NOT an error: this is the state a
+    /// local-admin-only deployment boots in.
+    #[test]
+    fn absent_oidc_config_is_none_not_an_error() {
+        let got = oidc_from_env_values(None, None, None, None, None, None, None, None)
+            .expect("absent config is a valid state");
+        assert!(got.is_none());
+    }
+
+    /// Partially present -> hard error. A half-configured IdP is a mistake, not
+    /// a mode: silently treating it as "not configured" would let a typo in one
+    /// variable quietly disable SSO for everyone.
+    #[test]
+    fn partial_oidc_config_is_rejected() {
+        let err = oidc_from_env_values(
+            Some("https://idp.example".into()),
+            Some("cid".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        )
+        .expect_err("partial config must be rejected");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("ARGUS_OIDC_CLIENT_SECRET"),
+            "the error must name a missing variable, got: {msg}"
+        );
+    }
+
+    use super::public_url_for_oidc;
+
+    /// The regression this helper exists to prevent: `ARGUS_PUBLIC_URL` is
+    /// required unconditionally (`Config::from_env`), so a local-admin-only
+    /// deployment sets it too. Without this gate, its bare presence alone
+    /// would read as "1 of 5 OIDC variables set" and `Config::from_env` would
+    /// reject a deployment that never intended to configure OIDC at all, with
+    /// a confusing "ARGUS_OIDC_ISSUER is missing" error.
+    #[test]
+    fn public_url_is_withheld_from_oidc_detection_absent_other_intent() {
+        assert_eq!(
+            public_url_for_oidc(&None, &None, &None, &None, "http://localhost:8080"),
+            None
+        );
+    }
+
+    /// The moment ANY one OIDC-specific variable is set, intent is real and
+    /// `ARGUS_PUBLIC_URL` must be folded back in so a complete config can
+    /// still be recognized as complete (and a partial one still names the
+    /// right missing variable).
+    #[test]
+    fn public_url_is_included_once_any_oidc_variable_is_set() {
+        for (issuer, client_id, client_secret, required_role) in [
+            (Some("i".to_string()), None, None, None),
+            (None, Some("c".to_string()), None, None),
+            (None, None, Some("s".to_string()), None),
+            (None, None, None, Some("r".to_string())),
+        ] {
+            assert_eq!(
+                public_url_for_oidc(
+                    &issuer,
+                    &client_id,
+                    &client_secret,
+                    &required_role,
+                    "http://localhost:8080"
+                ),
+                Some("http://localhost:8080".to_string())
+            );
+        }
     }
 }

@@ -653,12 +653,12 @@ pub async fn delete_expired_sessions(pool: &PgPool) -> Result<u64> {
     Ok(r.rows_affected())
 }
 
-// The local-admin break-glass credential (design §6). This task adds only the
-// repo layer; no provisioning verb or login handler calls into it yet (those
-// land in later tasks of the same slice), so nothing below is reachable from
-// `main` yet. Allowed per-item rather than at module level, since the rest of
-// `repo.rs` is fully wired -- matches the convention in `auth/password.rs` and
-// `agent/systemd.rs`.
+// The local-admin break-glass credential (design §6). `local_admin_exists` is
+// wired to the boot rule (`main.rs`); the rest -- the CLI provisioning verb
+// and the login handler -- land in later tasks of the same slice, so they
+// stay unreachable from `main` for now. Allowed per-item rather than at
+// module level, since the rest of `repo.rs` is fully wired -- matches the
+// convention in `auth/password.rs` and `agent/systemd.rs`.
 #[allow(dead_code)]
 pub struct LocalAdmin {
     pub username: String,
@@ -693,7 +693,6 @@ pub async fn upsert_local_admin(pool: &PgPool, username: &str, password_hash: &s
 
 /// Used by the boot rule: the control plane may start without OIDC config only
 /// if this returns true.
-#[allow(dead_code)]
 pub async fn local_admin_exists(pool: &PgPool) -> Result<bool> {
     let n = sqlx::query_scalar!("SELECT count(*) FROM local_admin")
         .fetch_one(pool)

@@ -280,22 +280,29 @@ impl OidcClient {
     }
 }
 
-fn flow_cookie(cfg: &OidcConfig, sealed: String) -> Cookie<'static> {
+/// `secure` is a plain `bool` rather than `&OidcConfig` so this builder works
+/// with no OIDC config in scope at all: the `Secure` decision is a
+/// `Config`-level fact (derived from `Config.public_url`, local-admin design
+/// §4), not an OIDC-specific one. The OIDC flow below is the only caller
+/// today, and it is only reached once `OidcConfig` is known to be present, but
+/// a local login (later task) sets a session cookie in exactly the state
+/// where no `OidcConfig` exists.
+fn flow_cookie(secure: bool, sealed: String) -> Cookie<'static> {
     Cookie::build((argus_common::FLOW_COOKIE, sealed))
         .http_only(true)
         .same_site(SameSite::Lax)
         .path("/")
-        .secure(cfg.cookie_secure())
+        .secure(secure)
         .max_age(time::Duration::seconds(argus_common::FLOW_TTL_SECS))
         .build()
 }
 
-fn session_cookie(cfg: &OidcConfig, token: String) -> Cookie<'static> {
+fn session_cookie(secure: bool, token: String) -> Cookie<'static> {
     Cookie::build((argus_common::SESSION_COOKIE, token))
         .http_only(true)
         .same_site(SameSite::Lax)
         .path("/")
-        .secure(cfg.cookie_secure())
+        .secure(secure)
         .max_age(time::Duration::hours(argus_common::SESSION_TTL_HOURS))
         .build()
 }
@@ -334,14 +341,25 @@ pub struct LoginQuery {
 /// `GET /auth/login?next=` -- redirect to the provider's authorization
 /// endpoint, having sealed `state`/`nonce`/the PKCE verifier/`next` into the
 /// flow cookie.
+///
+/// Degrades to 404 rather than panicking when OIDC is not configured
+/// (local-admin design §4): SSO is simply one of possibly zero configured
+/// login methods, not something every deployment must have.
 pub async fn login(
     State(state): State<AppState>,
     Query(q): Query<LoginQuery>,
     jar: CookieJar,
 ) -> Response {
+    let (Some(oidc), Some(oidc_client)) = (&state.oidc, &state.oidc_client) else {
+        return error_page(
+            StatusCode::NOT_FOUND,
+            "Single sign-on is not configured on this server.",
+        );
+    };
+
     let next = safe_next_path(q.next.as_deref().unwrap_or("/"));
 
-    let client = match state.oidc_client.client().await {
+    let client = match oidc_client.client().await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "oidc login: discovery failed");
@@ -361,7 +379,7 @@ pub async fn login(
             Nonce::new_random,
         )
         .set_pkce_challenge(pkce_challenge);
-    for scope in &state.oidc.scopes {
+    for scope in &oidc.scopes {
         auth_request = auth_request.add_scope(Scope::new(scope.clone()));
     }
     let (auth_url, csrf_token, nonce) = auth_request.url();
@@ -383,7 +401,10 @@ pub async fn login(
         }
     };
 
-    let jar = jar.add(flow_cookie(&state.oidc, sealed));
+    let jar = jar.add(flow_cookie(
+        crate::config::cookie_secure(&state.public_url),
+        sealed,
+    ));
     (jar, Redirect::to(auth_url.as_str())).into_response()
 }
 
@@ -400,11 +421,22 @@ pub struct CallbackQuery {
 /// Fails closed throughout: any error in state validation, token exchange,
 /// ID-token verification, or role admission returns an error page instead of
 /// ever falling through to a session.
+///
+/// Degrades to 404 rather than panicking when OIDC is not configured
+/// (local-admin design §4) -- see `login`'s doc comment; the same guard
+/// applies here for the same reason.
 pub async fn callback(
     State(state): State<AppState>,
     Query(q): Query<CallbackQuery>,
     jar: CookieJar,
 ) -> Response {
+    let (Some(oidc), Some(oidc_client)) = (&state.oidc, &state.oidc_client) else {
+        return error_page(
+            StatusCode::NOT_FOUND,
+            "Single sign-on is not configured on this server.",
+        );
+    };
+
     let Some(sealed) = jar
         .get(argus_common::FLOW_COOKIE)
         .map(|c| c.value().to_string())
@@ -458,7 +490,7 @@ pub async fn callback(
             .into_response();
     };
 
-    let mut client = match state.oidc_client.client().await {
+    let mut client = match oidc_client.client().await {
         Ok(c) => c,
         Err(e) => {
             tracing::error!(error = %e, "oidc callback: discovery failed");
@@ -472,7 +504,7 @@ pub async fn callback(
                 .into_response();
         }
     };
-    let http = state.oidc_client.http();
+    let http = oidc_client.http();
 
     let token_request = match client.exchange_code(AuthorizationCode::new(code)) {
         Ok(r) => r,
@@ -535,8 +567,8 @@ pub async fn callback(
         // design doc §10 requires key rotation to resolve itself without an
         // Argus restart. Bounded to one retry: this must not become a loop.
         tracing::warn!("oidc callback: no matching JWKS key id; re-discovering once");
-        state.oidc_client.invalidate().await;
-        client = match state.oidc_client.client().await {
+        oidc_client.invalidate().await;
+        client = match oidc_client.client().await {
             Ok(c) => c,
             Err(e) => {
                 tracing::error!(error = %e, "oidc callback: re-discovery after key-id miss failed");
@@ -593,11 +625,11 @@ pub async fn callback(
     {
         let auds: Vec<&str> = id_claims.audiences().iter().map(|a| a.as_str()).collect();
         let azp = id_claims.authorized_party().map(|p| p.as_str());
-        if !authorized_party_ok(&auds, azp, &state.oidc.client_id) {
+        if !authorized_party_ok(&auds, azp, &oidc.client_id) {
             tracing::error!(
                 audiences = ?auds,
                 authorized_party = ?azp,
-                expected = %state.oidc.client_id,
+                expected = %oidc.client_id,
                 "oidc callback: multi-audience ID token whose authorized party is not this client"
             );
             return (
@@ -676,17 +708,17 @@ pub async fn callback(
             .map(|u| u.additional_claims().extra.clone())
             .unwrap_or_default(),
     );
-    let roles = claim_at_path(&merged, &state.oidc.roles_claim)
+    let roles = claim_at_path(&merged, &oidc.roles_claim)
         .map(roles_from_claim)
         .unwrap_or_default();
 
-    if !is_admitted(&roles, &state.oidc.required_role) {
+    if !is_admitted(&roles, &oidc.required_role) {
         // Keys only, never values: claim values carry emails and other
         // personal data and must not reach the log.
         tracing::warn!(
             subject = %subject,
-            required = ?state.oidc.required_role,
-            roles_claim = %state.oidc.roles_claim,
+            required = ?oidc.required_role,
+            roles_claim = %oidc.roles_claim,
             extracted_roles = ?roles,
             available_claims = ?claim_keys(&merged),
             "login denied: required role not held"
@@ -766,7 +798,10 @@ pub async fn callback(
             .into_response();
     }
 
-    let jar = jar.add(session_cookie(&state.oidc, token_value));
+    let jar = jar.add(session_cookie(
+        crate::config::cookie_secure(&state.public_url),
+        token_value,
+    ));
     // Re-run the guard here rather than trust the sealed cookie blindly: the
     // cookie is AEAD-sealed and `login` is its only writer, so this is safe
     // either way today, but it keeps `safe_next_path` from being a single
@@ -989,9 +1024,9 @@ mod tests {
             ("http://localhost:8080", false),
             ("https://argus.lab.example", true),
         ] {
-            let cfg = test_oidc_config(public_url);
+            let secure = crate::config::cookie_secure(public_url);
 
-            let flow = flow_cookie(&cfg, "sealed-value".into());
+            let flow = flow_cookie(secure, "sealed-value".into());
             assert_eq!(flow.name(), argus_common::FLOW_COOKIE);
             assert_eq!(flow.value(), "sealed-value");
             assert_eq!(flow.http_only(), Some(true), "flow cookie must be HttpOnly");
@@ -1011,7 +1046,7 @@ mod tests {
                 Some(time::Duration::seconds(argus_common::FLOW_TTL_SECS))
             );
 
-            let session = session_cookie(&cfg, "token-value".into());
+            let session = session_cookie(secure, "token-value".into());
             assert_eq!(session.name(), argus_common::SESSION_COOKIE);
             assert_eq!(session.value(), "token-value");
             assert_eq!(
@@ -1071,18 +1106,73 @@ mod tests {
     fn test_app_state(pool: sqlx::PgPool, oidc: Arc<OidcConfig>) -> AppState {
         let oidc_client =
             Arc::new(OidcClient::seeded(oidc.clone(), test_discovered_client()).expect("seed"));
+        let public_url = oidc.public_url.clone();
         AppState {
             pool,
             hub: Arc::new(crate::hub::Hub::default()),
-            oidc,
+            oidc: Some(oidc),
             cipher: Arc::new(
                 crate::crypto::FieldCipher::from_b64_key(
                     &base64::engine::general_purpose::STANDARD.encode([5u8; 32]),
                 )
                 .expect("test cipher"),
             ),
-            oidc_client,
+            oidc_client: Some(oidc_client),
+            public_url,
         }
+    }
+
+    /// The local-admin-only state (design §4): no `OidcConfig`, no
+    /// `OidcClient`. `login`/`callback` must degrade to a 404 here rather than
+    /// unwrap or panic on the missing config.
+    fn test_app_state_no_oidc(pool: sqlx::PgPool) -> AppState {
+        AppState {
+            pool,
+            hub: Arc::new(crate::hub::Hub::default()),
+            oidc: None,
+            cipher: Arc::new(
+                crate::crypto::FieldCipher::from_b64_key(
+                    &base64::engine::general_purpose::STANDARD.encode([5u8; 32]),
+                )
+                .expect("test cipher"),
+            ),
+            oidc_client: None,
+            public_url: "http://localhost:8080".into(),
+        }
+    }
+
+    /// The property the global boot-rule constraint rests on: with OIDC
+    /// absent, hitting the SSO entry points must not panic and must not
+    /// pretend to start a flow -- it must say plainly that SSO isn't
+    /// configured, so a local-admin-only deployment's sign-in view can tell
+    /// the two states apart.
+    #[sqlx::test]
+    async fn login_and_callback_degrade_to_404_when_oidc_is_not_configured(
+        pool: sqlx::PgPool,
+    ) -> anyhow::Result<()> {
+        let state = test_app_state_no_oidc(pool);
+
+        let response = login(
+            State(state.clone()),
+            Query(LoginQuery { next: None }),
+            CookieJar::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        let response = callback(
+            State(state),
+            Query(CallbackQuery {
+                code: Some("irrelevant".into()),
+                state: Some("irrelevant".into()),
+                error: None,
+            }),
+            CookieJar::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        Ok(())
     }
 
     /// Design §11: "`/auth/login` returns 302 with `state`, `nonce` and a

@@ -40,13 +40,21 @@ use uuid::Uuid;
 pub struct AppState {
     pub pool: PgPool,
     pub hub: Arc<Hub>,
-    pub oidc: Arc<crate::config::OidcConfig>,
+    /// `None` when OIDC is not configured (local-admin design §4) -- a valid,
+    /// boot-succeeding state. `/auth/login` and `/auth/callback` degrade to a
+    /// 404 rather than unwrap it.
+    pub oidc: Option<Arc<crate::config::OidcConfig>>,
     pub cipher: Arc<crate::crypto::FieldCipher>,
-    pub oidc_client: Arc<crate::auth::oidc::OidcClient>,
+    pub oidc_client: Option<Arc<crate::auth::oidc::OidcClient>>,
+    /// `Config.public_url`, carried independently of `oidc` so the session
+    /// cookie's `Secure` attribute can be decided with no OIDC config present
+    /// at all -- a local login (later task) sets a cookie in exactly that
+    /// state (local-admin design §4).
+    pub public_url: String,
 }
 
 pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
-    let oidc = Arc::new(cfg.oidc.clone());
+    let oidc = cfg.oidc.clone().map(Arc::new);
     let cipher = Arc::new(
         crate::crypto::FieldCipher::from_b64_key(&cfg.field_key_b64)
             .context("building the field cipher for the OIDC flow cookie")?,
@@ -54,9 +62,14 @@ pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
     // Building this is local-only (an HTTP client + an optional local CA cert
     // read); discovery itself happens lazily on first login, never here, so a
     // down IdP at boot cannot delay the agent gRPC surface or health checks.
-    let oidc_client = Arc::new(
-        crate::auth::oidc::OidcClient::new(oidc.clone()).context("building the OIDC client")?,
-    );
+    // Only built when OIDC is configured at all -- otherwise there is no
+    // provider to build a client against.
+    let oidc_client = oidc
+        .clone()
+        .map(crate::auth::oidc::OidcClient::new)
+        .transpose()
+        .context("building the OIDC client")?
+        .map(Arc::new);
 
     let app = router(AppState {
         pool,
@@ -64,6 +77,7 @@ pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
         oidc,
         cipher,
         oidc_client,
+        public_url: cfg.public_url.clone(),
     });
 
     let listener = tokio::net::TcpListener::bind(&cfg.http_addr).await?;
@@ -2554,14 +2568,15 @@ mod tests {
         AppState {
             pool,
             hub: Arc::new(Hub::default()),
-            oidc,
+            oidc: Some(oidc),
             cipher: Arc::new(
                 crate::crypto::FieldCipher::from_b64_key(
                     &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
                 )
                 .expect("build test field cipher"),
             ),
-            oidc_client,
+            oidc_client: Some(oidc_client),
+            public_url: "http://localhost:8080".into(),
         }
     }
 
