@@ -771,3 +771,316 @@ instead of at the assertion that names the bug.
 > Re-verifying this rotates nothing, but note that running the gates *before* it
 > does: `cargo test --workspace -- --ignored` rewrites `ca_material` (see the
 > gotcha above), so re-enroll the agent before trying the live check.
+
+## OIDC authentication — dev setup + live verification checklist (2026-07-25)
+
+Every browser surface (`/api/*`, including the SSE log streams and the terminal
+WebSocket — cookies ride the upgrade request, so one middleware layer covers all
+three transports) now sits behind a signed-in, revocable, Postgres-backed
+session. Design of record: `docs/superpowers/specs/2026-07-25-oidc-design.md`.
+Agents are entirely unaffected: they authenticate by mTLS on the separate agent
+gRPC listener and never touch this path.
+
+### There is no "auth disabled" mode, by design
+
+`crates/server/src/config.rs::Config::from_env` reads every required OIDC field
+through the same `req()` helper as `ARGUS_DATABASE_URL`/`ARGUS_FIELD_KEY` — **the
+control plane will not boot** without `ARGUS_OIDC_ISSUER`,
+`ARGUS_OIDC_CLIENT_ID`, `ARGUS_OIDC_CLIENT_SECRET`, `ARGUS_OIDC_REQUIRED_ROLE`,
+and `ARGUS_PUBLIC_URL` all set. There is no dev-only bypass flag and no
+unauthenticated fallback: local development authenticates against a real
+provider exactly like production does (design doc §5.1).
+
+### Break-glass: recovering from a first-boot OIDC misconfiguration
+
+Because there is no auth-disabled mode, a misconfiguration you can't fix from
+the provider side alone — a trailing-slash `iss` mismatch, a redirect URI that
+was never registered, or the wrong `ARGUS_OIDC_ROLES_CLAIM` denying every
+account — locks the maintainer out of their own control plane with no
+in-product recovery. This is an **emergency recovery path that requires direct
+database access, not a routine one.** If you can fix the provider-side
+configuration or an env var instead, do that.
+
+The `sessions` table (`crates/server/migrations/0004_sessions.sql`) is:
+
+```sql
+create table sessions (
+    token_hash   bytea       primary key,  -- sha256 of the raw cookie value
+    subject      text        not null,
+    email        text,
+    display_name text,
+    created_at   timestamptz not null default now(),
+    expires_at   timestamptz not null
+);
+```
+
+Only the SHA-256 of the cookie is ever stored, so recovery means picking a raw
+token yourself, inserting its hash, and then setting a browser cookie to that
+same raw value — the same idiom used for enrollment tokens and for live check
+7 above. Concretely:
+
+```bash
+# 1. Pick a raw token (anything unguessable) and hash it:
+TOKEN=$(head -c 32 /dev/urandom | base64 | tr -d '=+/')
+HASH=$(printf '%s' "$TOKEN" | sha256sum | cut -d' ' -f1)
+
+# 2. Insert a session row directly, expiring it far enough out to get the
+#    misconfiguration fixed (here, 1 hour):
+docker exec argus-pg psql -U postgres -d argus -c \
+  "INSERT INTO sessions (token_hash, subject, email, display_name, expires_at)
+   VALUES (decode('$HASH','hex'), 'break-glass', 'break-glass@local', 'Break-glass',
+           now() + interval '1 hour');"
+
+# 3. Print the raw token — this is the cookie VALUE, not the hash:
+echo "$TOKEN"
+```
+
+Then, in the browser, set a cookie named `argus_session` (`argus_common::SESSION_COOKIE`)
+on the control plane's origin to that raw `$TOKEN` value (devtools → Application/Storage
+→ Cookies → add one), and reload. That resolves to the `sessions` row via the same
+`token_hash` lookup every other request uses, so `/api/*` — including `/api/me` — now
+authenticates as the `break-glass` identity, which is enough to reach the UI and
+diagnose the real problem (e.g. read the `available_claims` WARN log described below).
+
+Delete the row once you're done (`DELETE FROM sessions WHERE subject = 'break-glass';`)
+rather than letting it ride out its `expires_at` — it is a credential with no real
+identity behind it and should not outlive the incident.
+
+### Required configuration
+
+| Variable | Example (dev) | Meaning |
+|---|---|---|
+| `ARGUS_OIDC_ISSUER` | `https://auth.lab.example.com` | Must match the provider's `iss` claim **exactly** — a trailing-slash mismatch is the classic discovery failure. |
+| `ARGUS_OIDC_CLIENT_ID` | `argus-dev` | Client ID of the Argus app registration at the provider. |
+| `ARGUS_OIDC_CLIENT_SECRET` | *(issued by the provider)* | Confidential-client secret. |
+| `ARGUS_OIDC_REQUIRED_ROLE` | `argus-admin`, or the literal `any` | Role required for admission. `any` must be typed explicitly (§5.2) — an **unset** variable does not mean "open to everyone", it means the server refuses to start. |
+| `ARGUS_PUBLIC_URL` | `http://localhost:8080` | Externally reachable base URL. Decides the session cookie's `Secure` attribute (`https://` → set) and builds the exact `redirect_uri` (§5.3); deliberately never derived from `Host`/`X-Forwarded-Proto`, which a client controls. |
+
+Optional:
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `ARGUS_OIDC_ROLES_CLAIM` | `groups` | Dot-path into the merged claims object — see below for finding the right value per provider. |
+| `ARGUS_OIDC_SCOPES` | `openid profile email` | Space-delimited scopes; some providers need an extra one before they emit roles at all. |
+| `ARGUS_OIDC_CA_CERT` | *(unset)* | PEM path, for an IdP behind an internal CA (common in a homelab). |
+
+Session lifetime (`SESSION_TTL_HOURS = 12`, hours) and the cookie name
+(`SESSION_COOKIE = "argus_session"`) are constants in `argus-common`, not
+environment configuration — a security property of the product, not a
+per-deployment knob.
+
+### Registering the two dev redirect URIs
+
+Argus builds exactly one `redirect_uri`: `<ARGUS_PUBLIC_URL>/auth/callback`.
+Local dev has two distinct origins depending on how the frontend is served, so
+the provider's app registration needs **both** as allowed redirect URIs:
+
+- `http://localhost:8080/auth/callback` — running the server directly
+  (`cargo run -p argus-server`), which serves the built `frontend/dist`.
+- `http://localhost:5173/auth/callback` — running the frontend under
+  `npm --prefix frontend run dev` (Vite), which proxies `/api` and `/auth` to
+  `:8080`.
+
+An unregistered redirect URI fails either the initial authorize redirect or the
+token exchange (provider-dependent) with an error specific to that provider —
+if login fails immediately at the provider's own page, check this first.
+
+### The `/auth` vite dev-proxy entry
+
+`frontend/vite.config.ts`'s dev `server.proxy` carries **both** `/api`
+(object form, `ws: true` — the terminal-slice trap documented above; the string
+shorthand silently drops WebSocket upgrades) and `/auth`. Without the `/auth`
+entry, Vite's SPA fallback serves `index.html` for `/auth/callback` instead of
+proxying it to the control plane, so the login flow appears to silently bounce
+back into the bare app shell instead of erroring — both entries are already
+wired; keep both if that file is ever rewritten.
+
+### Finding the right `ARGUS_OIDC_ROLES_CLAIM` for your provider
+
+A misconfigured claim path is otherwise indistinguishable from a code bug —
+login succeeds, but every account is denied. On a role denial the server logs a
+`WARN` naming the claim **keys** it actually saw (never values, since those can
+carry emails and other personal data) and the roles it extracted
+(`crates/server/src/auth/oidc.rs`, around the `is_admitted` check):
+
+```
+WARN login denied: required role not held
+    subject=<sub> required=Named("argus-admin") roles_claim="groups"
+    extracted_roles=[] available_claims=["sub","email","name","urn:zitadel:iam:org:project:roles",...]
+```
+
+Read `available_claims` for the key that actually holds roles on your provider,
+set `ARGUS_OIDC_ROLES_CLAIM` to it (dot-path if the provider nests it, e.g.
+Keycloak), restart, and try again — `extracted_roles` on the next denial (or
+success) confirms whether the path resolved. The four provider shapes the
+extractor is unit-tested against (design doc §4.1):
+
+| Provider | `ARGUS_OIDC_ROLES_CLAIM` | Claim shape |
+|---|---|---|
+| Keycloak | `realm_access.roles` | Array of strings, nested one level under `realm_access`. |
+| Authentik, Okta | `groups` (the default) | Flat array of strings. |
+| Zitadel | `urn:zitadel:iam:org:project:roles` | **Object** whose *keys* are the role names (values are per-org metadata) — the extractor reads the keys. |
+| Auth0 | a namespaced custom claim, e.g. `https://argus.example.com/roles` | Usually an array; namespaced because Auth0 refuses to emit un-namespaced custom claims. |
+
+Claims are merged — userinfo over the ID token — **before** the path is
+resolved (§4.2), so if the target claim shows up in `available_claims` at all,
+the merge already happened; a still-empty `extracted_roles` means the
+configured dot-path just doesn't match what the log shows.
+
+### CA rotation gotcha applies here too
+
+The full gate suite (`cargo test --workspace -- --ignored`, part of the sequence
+below) rotates the dev CA and orphans the enrolled agent — see "Two operational
+gotchas" above; this is the same rotation, not a new one. Re-enroll the agent
+before running live check 9 below (agent connectivity surviving an IdP outage),
+or that check observes a machine offline for the wrong reason.
+
+### Full gate run (2026-07-25)
+
+Run against the dev Postgres (`argus-pg`), on the `oidc-slice` branch, after
+wiring `repo::delete_expired_sessions` into the `jobs::run` sweeper tick:
+
+```
+$ npm --prefix frontend run build            # exit 0
+$ cargo fmt --all --check                    # exit 0, clean
+$ SQLX_OFFLINE=true cargo clippy --workspace --all-targets -- -D warnings   # exit 0, clean
+$ cargo sqlx prepare --workspace --check -- --all-targets                  # exit 0, clean (query unchanged since Task 3)
+$ cargo test --workspace
+  argus-agent:  64 passed, 0 failed, 10 ignored
+  argus-common:  0 passed, 0 failed,  0 ignored
+  argus-proto:   0 passed, 0 failed,  0 ignored
+  argus-server: 133 passed, 0 failed,  6 ignored
+$ cargo test --workspace -- --ignored --skip live_
+  argus-server:  6 passed, 0 failed  (includes ca::tests::load_or_init_persists_and_reloads_the_same_ca — rotates ca_material, see above)
+  argus-agent/argus-common/argus-proto: 0 run (agent's ignored set is entirely live_-prefixed and filtered out, matching the CI gate)
+```
+
+All gates clean. One non-blocking observation: `npm run build` warns that the
+main chunk (`index-*.js`, 1,245.52 kB / gzip 378.92 kB) exceeds
+`build.chunkSizeWarningLimit` (750 kB, set by the frontend-design-system slice).
+That growth predates this task (already present on `oidc-slice` before this
+commit — the sign-in gate and TanStack Query auth plumbing from Task 7) and is
+a warning, not a build failure; revisit the chunk-size budget in a future
+frontend pass if it keeps growing.
+
+### Live run against Zitadel — 2026-07-25 (partial)
+
+First execution of the flow against a real provider (`https://auth.nexus.e412.in`).
+**Only the rows listed here were measured; the rest of the checklist below is
+still pending.**
+
+| §12 check | Result |
+|---|---|
+| 1 — log in through the real provider | **PASS.** Landed back on the fleet page signed in. |
+| 3 — a verb's audit row carries the identity | **PASS.** A `unit.restart` dispatched against a deliberately non-existent unit recorded `actor = verify@example.test` (a temporary session, since deleted), target `argus-nonexistent-check.service`, result `error`. The bogus target keeps the check side-effect-free while still exercising the actor path. |
+| 5 — sign out | **PASS.** `auth.logout` row written; `/api/*` then 401s. |
+| 9 — an IdP outage must not touch the agent surface | **PASS.** With `ARGUS_OIDC_ISSUER` pointed at an unreachable address (`https://127.0.0.1:9`), the control plane **booted normally** — proving discovery is lazy rather than fetched at startup — the agent stayed `online` with `last_seen_at` advancing across 40s (19:49:29 → 19:49:52 → 19:50:07), and `GET /auth/login` returned `503` gracefully rather than hanging or crashing. Restoring the real issuer restored `303`. |
+| 8 — role admission and denial | **PASS, both directions.** With `ARGUS_OIDC_REQUIRED_ROLE=argus`: the account holding the role was admitted (`auth.login | ok`), the account without it was denied (`auth.denied | denied`). Earlier, before Zitadel asserted roles at all: With `ARGUS_OIDC_REQUIRED_ROLE` set to a role the account lacks, login was denied with the explicit "lacks the required role" message, `auth.denied` recorded `{"subject": …}` in `detail`, and the WARN log printed `required`, `roles_claim`, `extracted_roles=[]` and `available_claims=["client_id","sid"]` — claim **names** only, no values. |
+| (gate) unauthenticated `/api/*` | **PASS.** `/healthz` 200, `/api/fleet` 401, `/api/me` 401, both direct and through the vite proxy. |
+| (audit) actor identity | **PASS.** `auth.login` recorded with `actor = <email>`, not `anonymous`. Session row carried subject, email and display name; TTL landed at 12h. |
+
+Not yet measured: 2, 4, 6, 7 — all minor, and each covered by an automated test.
+
+### Getting Zitadel to actually emit roles
+
+This took roughly an hour to pin down and every wrong turn looked exactly like an
+Argus bug, so the conclusion is recorded in full.
+
+**The one setting that matters is at the PROJECT level.** Zitadel emits no roles
+until **Project → General → "Assert roles on authentication"** is enabled. The
+application's **Token settings → "User roles inside ID token"** is *not*
+sufficient on its own — it governs where roles are placed once they are being
+asserted, not whether they are asserted at all. With only the app-level toggle
+on, the claim is absent from the ID token *and* from userinfo.
+
+**Things that are NOT required, tested and confirmed:**
+
+- The reserved scope `urn:zitadel:iam:org:project:roles`. It was added on a
+  hunch, changed nothing, and after project assertion was enabled the login
+  worked with it removed. Leave `ARGUS_OIDC_SCOPES` unset.
+- Anything in Argus. `ARGUS_OIDC_ROLES_CLAIM = urn:zitadel:iam:org:project:roles`
+  is correct for Zitadel throughout.
+
+**A user with no roles gets the claim omitted entirely**, not sent empty. So an
+absent claim means either "assertion is off" or "this user holds no roles", and
+the two are indistinguishable from the token alone — check the project setting
+first, then the user's grant.
+
+**Beware the SSO session when testing.** A private window gives a fresh *Argus*
+session but Zitadel keeps its own. Once signed in there, every subsequent
+`/auth/login` silently returns the same identity with no account picker, so
+"retrying with the other account" quietly re-tests the first one. Three
+consecutive runs were wasted this way, and the only reason it surfaced was the
+`subject=` field in the denial log. **Sign out of Zitadel itself**, not just
+Argus, when switching accounts.
+
+**Two users can share a display name.** The `subject` in the log is the only
+reliable identifier; the Zitadel console's user list is not.
+
+**Verified end to end, both directions:** with `ARGUS_OIDC_REQUIRED_ROLE=argus`,
+the account holding the role logged in (`auth.login | ok | <email>`) and the
+account without it was denied (`auth.denied | denied | <subject>`).
+
+Until roles are asserted, `any` is the correct setting, and it is safe precisely
+because it is explicit: an unset variable refuses to boot rather than admitting
+everyone.
+
+**This run found a real bug that no amount of review had, and it is the reason
+the live gate is not a formality.** Zitadel's ID token names more than one
+audience — this client plus a sibling application from the same project — and
+`openidconnect` correctly rejected it (`Invalid audiences: ... is not a trusted
+audience`), because OIDC Core 3.1.3.7 requires a client to reject audiences it
+does not trust.
+
+The obvious fix, trusting extra audiences, is a trap. It is safe only if the
+`azp` (authorized party) claim is verified to be this client — and
+`openidconnect` 4.0.1 **does not verify `azp`**: that code is commented out in
+`verification/mod.rs` behind a note deferring it "until a use case becomes
+apparent". Relaxing the audience check alone would therefore not have relocated
+the guarantee, it would have deleted it: `aud` would no longer distinguish a
+token minted *for* Argus from one minted for any other application in the same
+Zitadel that merely happens to list Argus. The fix does both — accept additional
+audiences, **and** implement the `azp` check the library skipped, scoped to the
+multi-audience case the spec requires it for. Regression test:
+`auth::oidc::tests::multi_audience_tokens_require_azp_to_be_this_client`.
+
+Two configuration notes from the same run:
+
+- **The issuer must not carry a trailing slash.** The discovery document reports
+  `"https://auth.nexus.e412.in"`; `.../` fails discovery in a way that reads
+  like a code bug.
+- **`ARGUS_PUBLIC_URL` must be the origin the *browser* uses**, not the server's
+  loopback. Reaching the dev UI over the LAN means `http://<lan-ip>:5173`, and
+  that exact `redirect_uri` must be registered at the provider.
+
+### Live verification checklist (design doc §12) — REMAINING ROWS PENDING
+
+**Not yet run against a real provider.** Everything above this line was
+verified: unit tests, `axum` router `oneshot` tests, and `sqlx::test` database
+tests, none of which touch a live IdP. The nine checks below need a real OIDC
+issuer, a registered client ID/secret, and access to that provider's admin
+console (to toggle a test account's roles and to stop/start the service) — none
+of which were available for this pass. **No row below has been measured. Do not
+treat any of them as passing, and do not fill in an "observed" value, until a
+maintainer has actually run it.**
+
+Prerequisites: export the five required variables above against a real
+provider, register both dev redirect URIs at the provider, then
+`cargo run -p argus-server`.
+
+| # | Check | How | Expected |
+|---|---|---|---|
+| 1 | Login round-trip | Visit `http://localhost:8080`, click sign-in, complete login at the provider. | Redirected back to the fleet page, signed in. |
+| 2 | `/api/me` | Check the network tab after step 1, or `curl -b <cookie jar> http://localhost:8080/api/me`. | `200` with `{"subject": "...", "email": "...", "display_name": "..."}` matching the account used to log in. |
+| 3 | Audit carries the real identity | Run any verb (container or unit action) while signed in, then `SELECT actor FROM audit_log ORDER BY id DESC LIMIT 1;`. | `actor` is the account's **email**, never the literal `anonymous`. |
+| 4 | Terminal WebSocket carries the cookie | Open a machine's terminal tab in the *browser* (not curl — the cookie must ride the upgrade request). | The shell opens and is interactive, proving the WS upgrade carried `argus_session`. |
+| 5 | Sign-out | Click "Sign out" (sidebar footer), then let the SPA refetch, or `GET /api/fleet` directly. | `POST /auth/logout` → `204`; the next `/api/fleet` → `401`; the SPA renders the sign-in view. |
+| 6 | Tampered cookie is rejected | In devtools, flip one character of the `argus_session` cookie value, then hit any `/api/*` route. | `401 {"error":"unauthenticated"}`. |
+| 7 | Expiry is enforced server-side, not just client-side | While signed in, copy the `argus_session` cookie value from devtools and expire that row directly (same `sha256`-then-`decode(...,'hex')` idiom the enrollment step above uses): `HASH=$(printf '<raw cookie value>' \| sha256sum \| cut -d' ' -f1); docker exec argus-pg psql -U postgres -d argus -c "UPDATE sessions SET expires_at = now() - interval '1 hour' WHERE token_hash = decode('$HASH','hex');"` — then hit any `/api/*` route. | `401` on the very next request — the cookie itself is untouched, so this proves expiry isn't a `Max-Age` artifact. |
+| 8 | Role denial | Set `ARGUS_OIDC_REQUIRED_ROLE` to a role the test account does **not** hold, restart, attempt login. | Login is denied with the explicit "does not have the role required" error page (§14) rather than a generic failure; `SELECT * FROM audit_log WHERE action='auth.denied' ORDER BY id DESC LIMIT 1;` shows a fresh row, the rejected subject in `detail`. |
+| 9 | **IdP outage does not take the fleet down** — the check most likely to regress silently | With an already-enrolled agent connected, stop the OIDC provider (or block the network path to it), then restart Argus. Watch `/api/fleet` and the agent's own logs. | The control plane boots — only configuration *presence* is validated at startup, never connectivity; discovery is lazy and cached (§10). The agent reconnects over mTLS and heartbeats normally; `/api/fleet` shows it `online`. **Only** `/auth/login` fails (discovery/token requests to the unreachable provider time out or error) — nothing else is affected. |
+
+Fill in an "Observed" note per row (or add a new dated verification section
+below this one, matching the pattern used elsewhere in this file) once a
+maintainer runs these against the real provider — do not edit this table to
+claim a result that wasn't measured.

@@ -17,8 +17,15 @@ use sqlx::PgPool;
 use std::time::Duration;
 
 /// Every 10s, flip any `online` machine not heard from in 45s (~3 missed 15s
-/// heartbeats) to `offline`. Runs for the lifetime of the process alongside the
-/// HTTP and gRPC surfaces (see `main.rs`'s `try_join!`).
+/// heartbeats) to `offline`, then sweep expired browser sessions. Runs for the
+/// lifetime of the process alongside the HTTP and gRPC surfaces (see
+/// `main.rs`'s `try_join!`).
+///
+/// The session sweep is hygiene, not enforcement: `repo::lookup_session`
+/// already filters on `expires_at > now()`, so an unswept row is never usable
+/// by `auth::require_auth`. This tick just keeps the table from growing
+/// unboundedly. No audit row is written for it -- CLAUDE.md's audit-log rule
+/// applies to verbs a principal performs, and there is no principal here.
 pub async fn run(pool: PgPool) -> Result<()> {
     let mut interval = tokio::time::interval(Duration::from_secs(10));
     loop {
@@ -27,6 +34,11 @@ pub async fn run(pool: PgPool) -> Result<()> {
             Ok(n) if n > 0 => tracing::info!(count = n, "marked stale agents offline"),
             Ok(_) => {}
             Err(e) => tracing::error!(error = %e, "offline sweep failed"),
+        }
+        match repo::delete_expired_sessions(&pool).await {
+            Ok(n) if n > 0 => tracing::info!(count = n, "deleted expired sessions"),
+            Ok(_) => {}
+            Err(e) => tracing::error!(error = %e, "session sweep failed"),
         }
     }
 }

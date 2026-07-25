@@ -42,7 +42,10 @@ export default defineConfig({
     // and served from the same origin, so no proxy is involved there.
     proxy: {
       "/api": { target: "http://localhost:8080", ws: true },
-      "/auth": "http://localhost:8080",
+      // The OIDC flow redirects the BROWSER to /auth/*, so the dev server must
+      // proxy it too -- otherwise vite's SPA fallback serves index.html and the
+      // login silently renders the app shell instead of redirecting.
+      "/auth": { target: "http://localhost:8080" },
     },
   },
 });

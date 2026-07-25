@@ -1,0 +1,45 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT actor, result, detail->>'enrollment_token' AS \"enrollment_token!\"\n               FROM audit_log WHERE action = 'agent.enroll' AND result = 'error'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "actor",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "actor"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "result",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "result"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "enrollment_token!",
+        "type_info": "Text",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false,
+      true,
+      null
+    ]
+  },
+  "hash": "0bdcd62569a4e2d5dffbbb6f651724ce0554646ae32ae343379f5b9c69132f5c"
+}

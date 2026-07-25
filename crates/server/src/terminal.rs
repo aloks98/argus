@@ -7,9 +7,10 @@
 //! socket write finally errors (on a half-open TCP connection the kernel can
 //! take ~15 min to give up). The 30-minute idle timer is the real backstop.
 
+use crate::auth::AuthUser;
 use crate::http::AppState;
 use crate::hub::Hub;
-use crate::repo;
+use crate::repo::{self, Identity};
 use axum::{
     extract::{
         ws::{CloseFrame, Message, WebSocket, WebSocketUpgrade},
@@ -28,6 +29,7 @@ pub async fn terminal_ws(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     headers: HeaderMap,
+    AuthUser(identity): AuthUser,
     ws: WebSocketUpgrade,
 ) -> Response {
     let origin = headers.get(header::ORIGIN).and_then(|v| v.to_str().ok());
@@ -35,7 +37,7 @@ pub async fn terminal_ws(
     if !origin_allowed(origin, host) {
         return (StatusCode::FORBIDDEN, "origin not allowed").into_response();
     }
-    ws.on_upgrade(move |socket| handle(state, id, socket))
+    ws.on_upgrade(move |socket| handle(state, id, identity, socket))
 }
 
 /// Same-origin check for the terminal's WS upgrade (review finding 4).
@@ -138,7 +140,7 @@ enum OpenOutcome {
 /// regression that swapped the dispatch and audit calls would make this
 /// function write an audit row for a session whose dispatch never reached
 /// the agent, which the test in this module below asserts against.
-async fn open_and_audit(state: &AppState, machine_id: Uuid) -> OpenOutcome {
+async fn open_and_audit(state: &AppState, machine_id: Uuid, identity: &Identity) -> OpenOutcome {
     let (session_id, rx, _pty_state) = state.hub.open_pty(machine_id);
     if state
         .hub
@@ -153,7 +155,7 @@ async fn open_and_audit(state: &AppState, machine_id: Uuid) -> OpenOutcome {
     let command_id = Uuid::new_v4();
     if let Err(e) = repo::audit_command(
         &state.pool,
-        "anonymous",
+        repo::Actor::User(identity),
         "terminal.open",
         Some(machine_id),
         &session_id,
@@ -202,12 +204,12 @@ impl Drop for PtyCloseGuard {
     }
 }
 
-async fn handle(state: AppState, machine_id: Uuid, socket: WebSocket) {
+async fn handle(state: AppState, machine_id: Uuid, identity: Identity, socket: WebSocket) {
     let (mut sink, mut stream) = socket.split();
 
     // Open the PTY sub-stream and dispatch PtyOpen BEFORE auditing, mirroring
     // logs.open: an offline agent leaves no `terminal.open` row.
-    let (session_id, mut rx) = match open_and_audit(&state, machine_id).await {
+    let (session_id, mut rx) = match open_and_audit(&state, machine_id, &identity).await {
         OpenOutcome::DispatchFailed => {
             let _ = sink.send(Message::Text("agent not connected".into())).await;
             let _ = sink.close().await;
@@ -388,17 +390,49 @@ async fn handle(state: AppState, machine_id: Uuid, socket: WebSocket) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine;
     use sqlx::PgPool;
 
     fn app_state_with_hub(pool: PgPool) -> (AppState, Arc<Hub>) {
         let hub = Arc::new(Hub::new());
+        let oidc = Arc::new(crate::config::OidcConfig {
+            issuer: "https://idp.invalid".into(),
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            required_role: crate::config::RequiredRole::Named("argus-admin".into()),
+            roles_claim: "groups".into(),
+            scopes: vec!["openid".into()],
+            public_url: "http://localhost:8080".into(),
+            ca_cert_path: None,
+        });
+        // Never triggers discovery: building the client is local-only, so
+        // this is cheap and touches no network.
+        let oidc_client = Arc::new(
+            crate::auth::oidc::OidcClient::new(oidc.clone()).expect("build test OIDC client"),
+        );
         (
             AppState {
                 pool,
                 hub: hub.clone(),
+                oidc,
+                cipher: Arc::new(
+                    crate::crypto::FieldCipher::from_b64_key(
+                        &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
+                    )
+                    .expect("build test field cipher"),
+                ),
+                oidc_client,
             },
             hub,
         )
+    }
+
+    fn test_identity() -> Identity {
+        Identity {
+            subject: "term-user".into(),
+            email: Some("term-user@example.com".into()),
+            display_name: None,
+        }
     }
 
     /// Drives the REAL production entry point (`open_and_audit`, the exact
@@ -419,7 +453,7 @@ mod tests {
         ).fetch_one(&pool).await?.id;
         let (state, _hub) = app_state_with_hub(pool.clone());
 
-        let outcome = open_and_audit(&state, machine_id).await;
+        let outcome = open_and_audit(&state, machine_id, &test_identity()).await;
         assert!(
             matches!(outcome, OpenOutcome::DispatchFailed),
             "no agent connected -> dispatch must fail"

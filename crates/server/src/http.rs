@@ -8,7 +8,7 @@ use crate::config::Config;
 use crate::embed::Assets;
 use crate::hub::{DispatchError, Hub, LogFilters};
 use crate::repo;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use argus_proto::v1::Verb;
 use axum::{
     extract::{Path, Query, State},
@@ -31,16 +31,40 @@ use tokio_stream::StreamExt;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-/// Shared router state: the Postgres pool backing `/api` handlers, plus the
-/// in-memory session `Hub` backing the Docker state + verb endpoints.
+/// Shared router state: the Postgres pool backing `/api` handlers, the
+/// in-memory session `Hub` backing the Docker state + verb endpoints, the
+/// OIDC config, the field cipher the OIDC flow uses to seal its pre-auth flow
+/// cookie (the same `FieldCipher` that already protects `ca_material`), and
+/// the lazily-discovering OIDC client (`crate::auth::oidc`).
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub hub: Arc<Hub>,
+    pub oidc: Arc<crate::config::OidcConfig>,
+    pub cipher: Arc<crate::crypto::FieldCipher>,
+    pub oidc_client: Arc<crate::auth::oidc::OidcClient>,
 }
 
 pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
-    let app = router(AppState { pool, hub });
+    let oidc = Arc::new(cfg.oidc.clone());
+    let cipher = Arc::new(
+        crate::crypto::FieldCipher::from_b64_key(&cfg.field_key_b64)
+            .context("building the field cipher for the OIDC flow cookie")?,
+    );
+    // Building this is local-only (an HTTP client + an optional local CA cert
+    // read); discovery itself happens lazily on first login, never here, so a
+    // down IdP at boot cannot delay the agent gRPC surface or health checks.
+    let oidc_client = Arc::new(
+        crate::auth::oidc::OidcClient::new(oidc.clone()).context("building the OIDC client")?,
+    );
+
+    let app = router(AppState {
+        pool,
+        hub,
+        oidc,
+        cipher,
+        oidc_client,
+    });
 
     let listener = tokio::net::TcpListener::bind(&cfg.http_addr).await?;
     tracing::info!(addr = %cfg.http_addr, "browser HTTP surface listening");
@@ -51,9 +75,12 @@ pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
 /// Build the router without binding a socket, so tests can drive it directly
 /// via `tower::ServiceExt::oneshot`.
 fn router(state: AppState) -> Router {
-    Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/readyz", get(readyz))
+    // Everything under /api requires a session -- including the SSE log streams
+    // and the terminal WebSocket. Building them as a separate Router and
+    // layering once is what guarantees a new /api route cannot be added
+    // unprotected by accident.
+    let api = Router::new()
+        .route("/api/me", get(me))
         .route("/api/fleet", get(fleet))
         .route("/api/machines/{id}", get(machine))
         .route("/api/machines/{id}/metrics", get(machine_metrics))
@@ -73,11 +100,34 @@ fn router(state: AppState) -> Router {
             "/api/machines/{id}/terminal",
             axum::routing::any(crate::terminal::terminal_ws),
         )
-        // TODO: nest remaining /api routes (events SSE, audit, enroll-tokens)
-        // and /auth OIDC routes here (PRD §9.1).
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            crate::auth::require_auth,
+        ));
+
+    // Public: infra endpoints (PRD §9.1 puts them outside OIDC), the OIDC flow
+    // itself, and the SPA bundle -- which must render the sign-in view BEFORE
+    // any session exists. The bundle is an empty shell; all data is behind /api.
+    Router::new()
+        .route("/healthz", get(|| async { "ok" }))
+        .route("/readyz", get(readyz))
+        .route("/auth/login", get(crate::auth::oidc::login))
+        .route("/auth/callback", get(crate::auth::oidc::callback))
+        .route("/auth/logout", post(crate::auth::oidc::logout))
+        .merge(api)
         .fallback(static_handler)
         .layer(TraceLayer::new_for_http())
         .with_state(state)
+}
+
+/// Current identity. Returns 401 when signed out, which is how the SPA detects
+/// a signed-out state -- that 401 is a normal answer, not an error.
+async fn me(crate::auth::AuthUser(id): crate::auth::AuthUser) -> impl IntoResponse {
+    Json(serde_json::json!({
+        "subject": id.subject,
+        "email": id.email,
+        "display_name": id.display_name,
+    }))
 }
 
 async fn readyz() -> impl IntoResponse {
@@ -123,8 +173,7 @@ struct SparkSeries {
 }
 
 /// `GET /api/fleet` -- list every machine with its status, for the fleet page.
-/// Intentionally UNAUTHENTICATED for the Spine slice: OIDC lands later, once
-/// the browser surface moves behind Traefik + Zitadel (PRD §9.1).
+/// Behind `require_auth` (mounted once on the whole `/api` router).
 async fn fleet(State(state): State<AppState>) -> Result<Json<Vec<FleetRow>>, StatusCode> {
     let rows = sqlx::query!(
         r#"SELECT id, hostname, os, host(primary_ip) as "primary_ip?", status,
@@ -569,6 +618,7 @@ async fn log_stream(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(q): Query<LogStreamQuery>,
+    crate::auth::AuthUser(identity): crate::auth::AuthUser,
 ) -> Response {
     if !source_is_valid(&q.source) {
         return (StatusCode::BAD_REQUEST, "invalid source").into_response();
@@ -610,7 +660,7 @@ async fn log_stream(
     let command_id = Uuid::new_v4();
     if let Err(e) = repo::audit_command(
         &state.pool,
-        "anonymous",
+        repo::Actor::User(&identity),
         "logs.open",
         Some(id),
         &audit_target(&q.source, &filters),
@@ -672,6 +722,7 @@ async fn logs_page(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
     Query(q): Query<LogPageQuery>,
+    crate::auth::AuthUser(identity): crate::auth::AuthUser,
 ) -> Response {
     // Journal only: reuse the shared validator, then reject anything but a
     // journal source (docker paging is unsupported).
@@ -722,7 +773,7 @@ async fn logs_page(
     let command_id = Uuid::new_v4();
     if let Err(e) = repo::audit_command(
         &state.pool,
-        "anonymous",
+        repo::Actor::User(&identity),
         "logs.page",
         Some(id),
         &audit_target(&q.source, &filters),
@@ -810,6 +861,7 @@ struct VerbResult {
 async fn container_action(
     State(state): State<AppState>,
     Path((id, container, action)): Path<(Uuid, String, String)>,
+    crate::auth::AuthUser(identity): crate::auth::AuthUser,
 ) -> Response {
     let verb = match action.as_str() {
         "start" => Verb::ContainerStart,
@@ -824,6 +876,7 @@ async fn container_action(
         &container,
         &format!("container.{action}"),
         VERB_TIMEOUT,
+        &identity,
     )
     .await
 }
@@ -833,6 +886,7 @@ async fn container_action(
 async fn unit_action(
     State(state): State<AppState>,
     Path((id, unit, action)): Path<(Uuid, String, String)>,
+    crate::auth::AuthUser(identity): crate::auth::AuthUser,
 ) -> Response {
     let verb = match action.as_str() {
         "start" => Verb::UnitStart,
@@ -854,13 +908,16 @@ async fn unit_action(
         &unit,
         &format!("unit.{action}"),
         VERB_TIMEOUT,
+        &identity,
     )
     .await
 }
 
 /// The shared verb pipeline for every verb family: audit-before-dispatch (fail
 /// closed), dispatch, then a bounded wait for the agent's result. `timeout` is
-/// injected so tests don't wait the full 10s.
+/// injected so tests don't wait the full 10s. `identity` is the caller
+/// authenticated by `require_auth` -- it attributes both the audit row and the
+/// `issued_by` the agent sees on the wire to the real operator.
 async fn run_verb(
     state: &AppState,
     id: Uuid,
@@ -868,8 +925,8 @@ async fn run_verb(
     target: &str,
     audit_action: &str,
     timeout: Duration,
+    identity: &repo::Identity,
 ) -> Response {
-    let actor = "anonymous";
     let command_id = Uuid::new_v4();
     let cid = command_id.to_string();
 
@@ -890,7 +947,7 @@ async fn run_verb(
     let rx = state.hub.register_pending(cid.clone(), id);
     if let Err(e) = repo::audit_command(
         &state.pool,
-        actor,
+        repo::Actor::User(identity),
         audit_action,
         Some(id),
         target,
@@ -912,7 +969,13 @@ async fn run_verb(
 
     if let Err(DispatchError::NotConnected) = state
         .hub
-        .send_command(id, cid.clone(), verb, target.to_string(), actor.to_string())
+        .send_command(
+            id,
+            cid.clone(),
+            verb,
+            target.to_string(),
+            repo::Actor::User(identity),
+        )
         .await
     {
         state.hub.abandon_pending(&cid);
@@ -998,6 +1061,7 @@ mod tests {
     use argus_proto::v1::{server_frame, CommandResult, ServerFrame};
     use axum::body::{to_bytes, Body};
     use axum::http::Request;
+    use base64::Engine;
     use tokio::sync::mpsc;
     use tonic::Status;
     use tower::ServiceExt;
@@ -1020,13 +1084,16 @@ mod tests {
         .execute(&pool)
         .await?;
 
-        let app = router(AppState {
-            pool,
-            hub: Arc::new(Hub::new()),
-        });
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool));
 
         let response = app
-            .oneshot(Request::builder().uri("/api/fleet").body(Body::empty())?)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/fleet")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
             .await?;
 
         assert_eq!(response.status(), StatusCode::OK);
@@ -1074,16 +1141,19 @@ mod tests {
             .await?;
         }
 
-        let app = router(AppState {
-            pool,
-            hub: Arc::new(Hub::new()),
-        });
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool));
 
         // /api/fleet: the seeded machine's row must carry a non-empty
         // spark_cpu ending in the latest sample.
         let response = app
             .clone()
-            .oneshot(Request::builder().uri("/api/fleet").body(Body::empty())?)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/fleet")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
             .await?;
         assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX).await?;
@@ -1099,6 +1169,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/machines/{machine_id}"))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1113,6 +1184,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/machines/{}", Uuid::new_v4()))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1124,6 +1196,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/machines/{machine_id}/metrics?range=1h"))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1143,6 +1216,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/machines/{machine_id}/metrics?range=bogus"))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1189,10 +1263,8 @@ mod tests {
         .await?
         .id;
 
-        let app = router(AppState {
-            pool,
-            hub: Arc::new(Hub::new()),
-        });
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool));
 
         for (id, expected) in [
             (null_id, serde_json::Value::Null),
@@ -1204,6 +1276,7 @@ mod tests {
                 .oneshot(
                     Request::builder()
                         .uri(format!("/api/machines/{id}"))
+                        .header("cookie", &cookie)
                         .body(Body::empty())?,
                 )
                 .await?;
@@ -1221,17 +1294,41 @@ mod tests {
 
     fn app_state_with_hub(pool: PgPool) -> (AppState, Arc<Hub>) {
         let hub = Arc::new(Hub::new());
-        (
-            AppState {
-                pool,
-                hub: hub.clone(),
-            },
-            hub,
+        let mut state = test_state(pool);
+        state.hub = hub.clone();
+        (state, hub)
+    }
+
+    /// A stand-in `Identity` for tests that call `run_verb`/`open_and_audit`
+    /// directly rather than through the router (so they never touch
+    /// `require_auth`, but the handlers themselves now take an `Identity`).
+    fn test_identity() -> repo::Identity {
+        repo::Identity {
+            subject: "test-subject".into(),
+            email: Some("test@example.com".into()),
+            display_name: None,
+        }
+    }
+
+    /// Seeds a live session and returns a `Cookie` header value, for tests
+    /// that drive `/api` routes through the router: every one of them now
+    /// sits behind `require_auth`, so a request with no cookie gets a 401
+    /// before ever reaching the handler under test.
+    async fn auth_cookie(pool: &PgPool) -> anyhow::Result<String> {
+        let (token, hash) = crate::auth::session::new_session_token();
+        repo::create_session(
+            pool,
+            &hash,
+            &test_identity(),
+            OffsetDateTime::now_utc() + time::Duration::hours(1),
         )
+        .await?;
+        Ok(format!("{}={}", argus_common::SESSION_COOKIE, token))
     }
 
     #[sqlx::test]
     async fn get_docker_returns_cached_snapshot(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
         let (state, hub) = app_state_with_hub(pool);
         let id = Uuid::new_v4();
 
@@ -1241,6 +1338,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/machines/{id}/docker"))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1266,6 +1364,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/machines/{id}/docker"))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1296,6 +1395,7 @@ mod tests {
             "web",
             "container.restart",
             Duration::from_millis(200),
+            &test_identity(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -1351,6 +1451,7 @@ mod tests {
             "web",
             "container.start",
             Duration::from_secs(5),
+            &test_identity(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1383,6 +1484,7 @@ mod tests {
             "web",
             "container.stop",
             Duration::from_millis(150),
+            &test_identity(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::ACCEPTED);
@@ -1414,6 +1516,7 @@ mod tests {
             "web",
             "container.start",
             Duration::from_millis(200),
+            &test_identity(),
         )
         .await;
         assert_eq!(
@@ -1431,6 +1534,7 @@ mod tests {
 
     #[sqlx::test]
     async fn container_action_with_unknown_action_returns_400(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
         let (state, _hub) = app_state_with_hub(pool);
         let app = router(state);
         let resp = app
@@ -1441,6 +1545,7 @@ mod tests {
                         "/api/machines/{}/docker/web/obliterate",
                         Uuid::new_v4()
                     ))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1450,6 +1555,7 @@ mod tests {
 
     #[sqlx::test]
     async fn get_systemd_returns_cached_snapshot(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
         let (state, hub) = app_state_with_hub(pool);
         let id = Uuid::new_v4();
 
@@ -1459,6 +1565,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/machines/{id}/systemd"))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1483,6 +1590,7 @@ mod tests {
             .oneshot(
                 Request::builder()
                     .uri(format!("/api/machines/{id}/systemd"))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1514,6 +1622,7 @@ mod tests {
             "nginx.service",
             "unit.restart",
             Duration::from_millis(200),
+            &test_identity(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
@@ -1575,6 +1684,7 @@ mod tests {
             "nginx.service",
             "unit.start",
             Duration::from_secs(5),
+            &test_identity(),
         )
         .await;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -1595,6 +1705,7 @@ mod tests {
 
     #[sqlx::test]
     async fn unit_action_rejects_a_malformed_unit_name(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
         let (state, _hub) = app_state_with_hub(pool);
         let app = router(state);
 
@@ -1609,6 +1720,7 @@ mod tests {
                         Uuid::new_v4(),
                         "..%2Fetc%2Fpasswd"
                     ))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1623,6 +1735,7 @@ mod tests {
 
     #[sqlx::test]
     async fn unit_action_with_unknown_action_returns_400(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
         let (state, _hub) = app_state_with_hub(pool);
         let app = router(state);
         let resp = app
@@ -1633,6 +1746,7 @@ mod tests {
                         "/api/machines/{}/units/nginx.service/obliterate",
                         Uuid::new_v4()
                     ))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1649,12 +1763,18 @@ mod tests {
         .await?
         .id;
 
+        let cookie = auth_cookie(&pool).await?;
         let (state, hub) = app_state_with_hub(pool);
 
         // No snapshot yet -> 0, never null.
         let app = router(state.clone());
         let resp = app
-            .oneshot(Request::builder().uri("/api/fleet").body(Body::empty())?)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/fleet")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
             .await?;
         let body = to_bytes(resp.into_body(), usize::MAX).await?;
         let rows: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
@@ -1682,7 +1802,12 @@ mod tests {
 
         let app = router(state);
         let resp = app
-            .oneshot(Request::builder().uri("/api/fleet").body(Body::empty())?)
+            .oneshot(
+                Request::builder()
+                    .uri("/api/fleet")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
             .await?;
         let body = to_bytes(resp.into_body(), usize::MAX).await?;
         let rows: Vec<serde_json::Value> = serde_json::from_slice(&body)?;
@@ -1693,6 +1818,7 @@ mod tests {
 
     #[sqlx::test]
     async fn log_stream_rejects_a_bad_source(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
         let (state, _hub) = app_state_with_hub(pool);
         let app = router(state);
         for bad in [
@@ -1710,6 +1836,7 @@ mod tests {
                             "/api/machines/{}/logs/stream?source={bad}",
                             Uuid::new_v4()
                         ))
+                        .header("cookie", &cookie)
                         .body(Body::empty())?,
                 )
                 .await?;
@@ -1731,6 +1858,7 @@ mod tests {
         .await?
         .id;
 
+        let cookie = auth_cookie(&pool).await?;
         let (state, _hub) = app_state_with_hub(pool.clone());
         let app = router(state);
         let resp = app
@@ -1739,6 +1867,7 @@ mod tests {
                     .uri(format!(
                         "/api/machines/{machine_id}/logs/stream?source=journal:nginx.service"
                     ))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1771,6 +1900,7 @@ mod tests {
         .await?
         .id;
 
+        let cookie = auth_cookie(&pool).await?;
         let (state, hub) = app_state_with_hub(pool.clone());
 
         // Fake agent: on LogTailStart, push one chunk then eof.
@@ -1811,6 +1941,7 @@ mod tests {
                     .uri(format!(
                         "/api/machines/{machine_id}/logs/stream?source=journal:nginx.service&tail=50"
                     ))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1884,6 +2015,7 @@ mod tests {
         .await?
         .id;
 
+        let cookie = auth_cookie(&pool).await?;
         let (state, hub) = app_state_with_hub(pool.clone());
         let (tx, mut agent_rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
         hub.register(machine_id, tx);
@@ -1906,6 +2038,7 @@ mod tests {
                     .uri(format!(
                         "/api/machines/{machine_id}/logs/stream?source=journal:nginx.service&tail=999999"
                     ))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1916,6 +2049,7 @@ mod tests {
 
     #[sqlx::test]
     async fn logs_page_rejects_a_docker_source(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
         let (state, _hub) = app_state_with_hub(pool);
         let app = router(state);
         let resp = app
@@ -1925,6 +2059,7 @@ mod tests {
                         "/api/machines/{}/logs/page?source=docker:abc&before=s%3Dx",
                         Uuid::new_v4()
                     ))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1937,6 +2072,7 @@ mod tests {
         // since_ms is Query<Option<u64>>; a non-numeric value fails axum's
         // deserialization before the handler body ever runs, so this
         // documents that the 400 comes from the extractor, not our code.
+        let cookie = auth_cookie(&pool).await?;
         let (state, _hub) = app_state_with_hub(pool);
         let app = router(state);
         let resp = app
@@ -1946,6 +2082,7 @@ mod tests {
                         "/api/machines/{}/logs/page?source=journal:ssh.service&before=s%3Dx&since_ms=abc",
                         Uuid::new_v4()
                     ))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1955,6 +2092,7 @@ mod tests {
 
     #[sqlx::test]
     async fn logs_page_requires_a_before_cursor(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
         let (state, _hub) = app_state_with_hub(pool);
         let app = router(state);
         let resp = app
@@ -1964,6 +2102,7 @@ mod tests {
                         "/api/machines/{}/logs/page?source=journal:ssh.service",
                         Uuid::new_v4()
                     ))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -1979,6 +2118,7 @@ mod tests {
         .fetch_one(&pool)
         .await?
         .id;
+        let cookie = auth_cookie(&pool).await?;
         let (state, _hub) = app_state_with_hub(pool.clone());
         let app = router(state);
         let resp = app
@@ -1987,6 +2127,7 @@ mod tests {
                     .uri(format!(
                         "/api/machines/{machine_id}/logs/page?source=journal:ssh.service&before=s%3Dx"
                     ))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -2004,6 +2145,7 @@ mod tests {
         .fetch_one(&pool)
         .await?
         .id;
+        let cookie = auth_cookie(&pool).await?;
         let (state, hub) = app_state_with_hub(pool.clone());
 
         // Fake agent: on a LogTailStart with a before_cursor, stream two page
@@ -2047,6 +2189,7 @@ mod tests {
                     .uri(format!(
                         "/api/machines/{machine_id}/logs/page?source=journal:ssh.service&before=s%3Dx&limit=500"
                     ))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -2078,10 +2221,12 @@ mod tests {
             "INSERT INTO machines (machine_id, hostname, status) VALUES ('page-prio', 'h', 'online') RETURNING id"
         )
         .fetch_one(&pool).await?.id;
+        let cookie = auth_cookie(&pool).await?;
         let (state, _hub) = app_state_with_hub(pool.clone());
         let resp = router(state)
             .oneshot(Request::builder()
                 .uri(format!("/api/machines/{machine_id}/logs/page?source=journal:ssh.service&before=s%3Dx&priority=9"))
+                .header("cookie", &cookie)
                 .body(Body::empty())?)
             .await?;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -2094,10 +2239,12 @@ mod tests {
             "INSERT INTO machines (machine_id, hostname, status) VALUES ('stream-prio', 'h', 'online') RETURNING id"
         )
         .fetch_one(&pool).await?.id;
+        let cookie = auth_cookie(&pool).await?;
         let (state, _hub) = app_state_with_hub(pool.clone());
         let resp = router(state)
             .oneshot(Request::builder()
                 .uri(format!("/api/machines/{machine_id}/logs/stream?source=journal:ssh.service&priority=8"))
+                .header("cookie", &cookie)
                 .body(Body::empty())?)
             .await?;
         assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
@@ -2110,6 +2257,7 @@ mod tests {
             "INSERT INTO machines (machine_id, hostname, status) VALUES ('page-filt', 'h', 'online') RETURNING id"
         )
         .fetch_one(&pool).await?.id;
+        let cookie = auth_cookie(&pool).await?;
         let (state, hub) = app_state_with_hub(pool.clone());
         let (tx, mut agent_rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
         hub.register(machine_id, tx);
@@ -2136,6 +2284,7 @@ mod tests {
         let resp = router(state)
             .oneshot(Request::builder()
                 .uri(format!("/api/machines/{machine_id}/logs/page?source=journal:ssh.service&before=s%3Dx&priority=4&window=boot"))
+                .header("cookie", &cookie)
                 .body(Body::empty())?)
             .await?;
         assert_eq!(resp.status(), StatusCode::OK);
@@ -2166,6 +2315,7 @@ mod tests {
         .await?
         .id;
 
+        let cookie = auth_cookie(&pool).await?;
         let (state, hub) = app_state_with_hub(pool.clone());
         let (tx, mut agent_rx) = mpsc::channel::<Result<ServerFrame, Status>>(4);
         hub.register(machine_id, tx);
@@ -2208,6 +2358,7 @@ mod tests {
                     .uri(format!(
                         "/api/machines/{machine_id}/logs/stream?source=docker:abc&priority=4&window=boot"
                     ))
+                    .header("cookie", &cookie)
                     .body(Body::empty())?,
             )
             .await?;
@@ -2381,5 +2532,213 @@ mod tests {
     #[test]
     fn an_invalid_window_is_still_rejected_even_with_since_ms() {
         assert!(resolve_log_filters_with_since(None, Some("bogus"), Some(1)).is_none());
+    }
+
+    fn test_state(pool: PgPool) -> AppState {
+        let oidc = Arc::new(crate::config::OidcConfig {
+            issuer: "https://idp.invalid".into(),
+            client_id: "cid".into(),
+            client_secret: "secret".into(),
+            required_role: crate::config::RequiredRole::Named("argus-admin".into()),
+            roles_claim: "groups".into(),
+            scopes: vec!["openid".into()],
+            public_url: "http://localhost:8080".into(),
+            ca_cert_path: None,
+        });
+        // Never triggers discovery (no test here drives /auth/login or
+        // /auth/callback): building the client is local-only, so this is
+        // cheap and does not touch the network.
+        let oidc_client = Arc::new(
+            crate::auth::oidc::OidcClient::new(oidc.clone()).expect("build test OIDC client"),
+        );
+        AppState {
+            pool,
+            hub: Arc::new(Hub::default()),
+            oidc,
+            cipher: Arc::new(
+                crate::crypto::FieldCipher::from_b64_key(
+                    &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
+                )
+                .expect("build test field cipher"),
+            ),
+            oidc_client,
+        }
+    }
+
+    /// Every route class in one test, because the risk here is a route
+    /// accidentally landing in the wrong group.
+    #[sqlx::test]
+    async fn public_routes_are_open_and_api_routes_are_not(pool: PgPool) -> anyhow::Result<()> {
+        let app = router(test_state(pool.clone()));
+
+        for path in ["/healthz", "/readyz"] {
+            let res = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty())?)
+                .await?;
+            assert_eq!(res.status(), StatusCode::OK, "{path} must stay public");
+        }
+
+        for path in ["/api/fleet", "/api/me"] {
+            let res = app
+                .clone()
+                .oneshot(Request::builder().uri(path).body(Body::empty())?)
+                .await?;
+            assert_eq!(
+                res.status(),
+                StatusCode::UNAUTHORIZED,
+                "{path} must require a session"
+            );
+        }
+        Ok(())
+    }
+
+    /// The SSE log stream is a different transport from the plain JSON
+    /// handlers above (`Sse::new(...).into_response()` rather than
+    /// `Json(...)`), and it's exactly the kind of route a future refactor
+    /// could accidentally move outside the `api` sub-router without anyone
+    /// noticing -- nothing about it visually resembles `/api/fleet`. Assert
+    /// the exact status so a regression that turned this into a 200 (started
+    /// streaming) or a 500 wouldn't be mistaken for a pass.
+    #[sqlx::test]
+    async fn logs_stream_route_requires_a_session(pool: PgPool) -> anyhow::Result<()> {
+        let app = router(test_state(pool));
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri(format!(
+                        "/api/machines/{}/logs/stream?source=journal:nginx.service",
+                        Uuid::new_v4()
+                    ))
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "the logs SSE stream route is no longer behind auth -- it must 401 \
+             before ever opening a tail on the agent, not start streaming"
+        );
+        Ok(())
+    }
+
+    /// The terminal WebSocket is the other transport that differs from a
+    /// plain JSON handler: a successful upgrade returns `101 Switching
+    /// Protocols`, not `200`. `require_auth` runs as a `Router` layer wrapping
+    /// the whole `api` sub-router, so it must reject the upgrade with `401`
+    /// BEFORE axum ever hands the connection to `WebSocketUpgrade` -- a
+    /// refactor that moved `/api/machines/{id}/terminal` outside that layer
+    /// (or reordered the layer past the WS route) would turn this into a live
+    /// unauthenticated root shell. `oneshot` never actually completes the
+    /// upgrade (there's no live socket on either end), so asserting the
+    /// response status here is sufficient to prove the layer ran first.
+    #[sqlx::test]
+    async fn terminal_websocket_upgrade_requires_a_session(pool: PgPool) -> anyhow::Result<()> {
+        let app = router(test_state(pool));
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri(format!("/api/machines/{}/terminal", Uuid::new_v4()))
+                    .header("connection", "upgrade")
+                    .header("upgrade", "websocket")
+                    .header("sec-websocket-version", "13")
+                    .header("sec-websocket-key", "dGhlIHNhbXBsZSBub25jZQ==")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(
+            res.status(),
+            StatusCode::UNAUTHORIZED,
+            "the terminal route is no longer behind auth -- a WS upgrade \
+             attempt with no session must 401, not 101 Switching Protocols"
+        );
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn an_unknown_or_expired_cookie_is_rejected(pool: PgPool) -> anyhow::Result<()> {
+        let app = router(test_state(pool.clone()));
+
+        // Well-formed but unknown token.
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me")
+                    .header(
+                        "cookie",
+                        format!("{}=not-a-real-token", argus_common::SESSION_COOKIE),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        // A real session that has expired must also be rejected -- this is the
+        // check that proves expiry is server-side, not cookie-age based.
+        let (token, hash) = crate::auth::session::new_session_token();
+        let id = repo::Identity {
+            subject: "s".into(),
+            email: None,
+            display_name: None,
+        };
+        repo::create_session(
+            &pool,
+            &hash,
+            &id,
+            OffsetDateTime::now_utc() - time::Duration::minutes(1),
+        )
+        .await?;
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me")
+                    .header(
+                        "cookie",
+                        format!("{}={}", argus_common::SESSION_COOKIE, token),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn a_valid_session_reaches_the_handler(pool: PgPool) -> anyhow::Result<()> {
+        let (token, hash) = crate::auth::session::new_session_token();
+        let id = repo::Identity {
+            subject: "sub-9".into(),
+            email: Some("op@example.com".into()),
+            display_name: Some("Op".into()),
+        };
+        repo::create_session(
+            &pool,
+            &hash,
+            &id,
+            OffsetDateTime::now_utc() + time::Duration::hours(1),
+        )
+        .await?;
+
+        let res = router(test_state(pool.clone()))
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me")
+                    .header(
+                        "cookie",
+                        format!("{}={}", argus_common::SESSION_COOKIE, token),
+                    )
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = axum::body::to_bytes(res.into_body(), 64 * 1024).await?;
+        let me: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(me["subject"], "sub-9");
+        assert_eq!(me["email"], "op@example.com");
+        Ok(())
     }
 }

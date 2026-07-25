@@ -30,6 +30,17 @@ tokio-rustls = { version = "0.26", default-features = false, features = ["ring",
 rcgen = { version = "0.14", features = ["x509-parser"] } # defaults already select ring + pem + crypto
 rustls-pemfile = "2"
 
+# OIDC for the browser surface. `default-features` are already ["reqwest",
+# "rustls-tls"]; reqwest is declared explicitly alongside it only to add
+# native-roots, so an IdP behind an internal CA (a homelab norm) is reachable.
+# NEVER enable openidconnect's `native-tls` feature -- that is OpenSSL.
+openidconnect = "4"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls-native-roots",
+    "json",
+] }
+axum-extra = { version = "0.10", features = ["cookie"] }
+
 # Browser HTTP surface + embedded frontend
 axum = { version = "0.8", features = ["ws"] }
 tower-http = { version = "0.7", features = ["trace"] }
@@ -46,6 +57,7 @@ sqlx = { version = "0.9", default-features = false, features = [
     "migrate",
     "uuid",
     "time",
+    "json",
 ] }
 
 # Utility

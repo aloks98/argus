@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT actor, result FROM audit_log WHERE action = 'agent.enroll' AND result = 'error'",
+  "query": "SELECT actor, result, detail->>'enrollment_token' AS \"enrollment_token!\"\n               FROM audit_log WHERE action = 'agent.enroll' AND result = 'ok'",
   "describe": {
     "columns": [
       {
@@ -24,6 +24,12 @@
             "name": "result"
           }
         }
+      },
+      {
+        "ordinal": 2,
+        "name": "enrollment_token!",
+        "type_info": "Text",
+        "origin": "Expression"
       }
     ],
     "parameters": {
@@ -31,8 +37,9 @@
     },
     "nullable": [
       false,
-      true
+      true,
+      null
     ]
   },
-  "hash": "8a325e2331a8be4a362785451bca2430fc7c80b57efa601ab77b6650be320d74"
+  "hash": "ac97d0edeec5c5a02085688086bcade8fe16bdccc81888a9579e81842ceaf723"
 }

@@ -2,6 +2,20 @@
 // (crates/server, Task 9). Kept dependency-free — no client library needed
 // for a single GET.
 import type { LogLine } from "./lib/logs";
+import { Unauthenticated } from "./lib/session";
+
+/**
+ * Every helper below funnels its response through this before touching the
+ * body. A 401 means the session died mid-visit, not a fetch bug -- mapping it
+ * to the same `Unauthenticated` type `/api/me` throws lets the `QueryCache`
+ * handler in `main.tsx` react to it uniformly (flip to the sign-in gate)
+ * instead of each poller rendering its own "request failed: 401" banner
+ * forever on a dead session.
+ */
+function unauthenticatedOr(r: Response): Response {
+  if (r.status === 401) throw new Unauthenticated();
+  return r;
+}
 
 export type FleetRow = {
   id: string;
@@ -19,7 +33,7 @@ export type FleetRow = {
 };
 
 export async function getFleet(): Promise<FleetRow[]> {
-  const r = await fetch("/api/fleet");
+  const r = unauthenticatedOr(await fetch("/api/fleet"));
   if (!r.ok) throw new Error(`fleet request failed: ${r.status}`);
   return r.json();
 }
@@ -64,7 +78,7 @@ export type MetricPoint = {
 };
 
 export async function getMachine(id: string): Promise<MachineDetail> {
-  const r = await fetch(`/api/machines/${id}`);
+  const r = unauthenticatedOr(await fetch(`/api/machines/${id}`));
   if (!r.ok) throw new Error(`machine ${r.status}`);
   return r.json();
 }
@@ -73,7 +87,7 @@ export async function getMetrics(
   id: string,
   range: "1h" | "6h" | "24h",
 ): Promise<MetricPoint[]> {
-  const r = await fetch(`/api/machines/${id}/metrics?range=${range}`);
+  const r = unauthenticatedOr(await fetch(`/api/machines/${id}/metrics?range=${range}`));
   if (!r.ok) throw new Error(`metrics ${r.status}`);
   return r.json();
 }
@@ -88,7 +102,7 @@ export type Container = {
 };
 
 export async function getDocker(id: string): Promise<Container[]> {
-  const r = await fetch(`/api/machines/${id}/docker`);
+  const r = unauthenticatedOr(await fetch(`/api/machines/${id}/docker`));
   if (!r.ok) throw new Error(`docker ${r.status}`);
   return r.json();
 }
@@ -118,7 +132,7 @@ export type VerbResult = {
  * distinct *unknown* it is rather than as either outcome.
  */
 async function postVerb(url: string): Promise<VerbResult> {
-  const r = await fetch(url, { method: "POST" });
+  const r = unauthenticatedOr(await fetch(url, { method: "POST" }));
   // 4xx/5xx (e.g. 409 agent offline) carry no VerbResult body.
   if (!r.ok) throw new Error(`action failed: ${r.status}`);
   const result: VerbResult = await r.json();
@@ -147,7 +161,7 @@ export type Unit = {
 };
 
 export async function getSystemd(id: string): Promise<Unit[]> {
-  const r = await fetch(`/api/machines/${id}/systemd`);
+  const r = unauthenticatedOr(await fetch(`/api/machines/${id}/systemd`));
   if (!r.ok) throw new Error(`systemd ${r.status}`);
   return r.json();
 }
@@ -264,7 +278,7 @@ export async function fetchLogPage(
   // on the SAME window as the tail; without it the server re-resolves `now` per
   // request and a view open longer than its own window pages into nothing.
   if (sinceMs !== undefined) params.set("since_ms", String(sinceMs));
-  const r = await fetch(`/api/machines/${id}/logs/page?${params.toString()}`);
+  const r = unauthenticatedOr(await fetch(`/api/machines/${id}/logs/page?${params.toString()}`));
   if (!r.ok) throw new Error(`log page ${r.status}`);
   return (await r.json()) as LogPage;
 }

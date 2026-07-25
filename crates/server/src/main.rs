@@ -8,6 +8,7 @@
 //! agent plane (CA + mTLS gRPC) and background jobs are build slice #1+ and land
 //! during implementation. Modules below carry the intended shape.
 
+mod auth;
 mod ca;
 mod config;
 mod crypto;
@@ -53,8 +54,9 @@ async fn main() -> Result<()> {
     let hub = Arc::new(hub::Hub::new());
     let agent_svc = grpc::AgentSvc::new(ca, pool.clone(), hub.clone());
 
-    // Serve the browser HTTP surface, the agent gRPC surface, the offline
-    // sweeper, and the hourly metrics-retention prune concurrently.
+    // Serve the browser HTTP surface, the agent gRPC surface, the offline +
+    // expired-session sweeper, and the hourly metrics-retention prune
+    // concurrently.
     tokio::try_join!(
         http::serve(&cfg, pool.clone(), hub.clone()),
         grpc::serve(&cfg, agent_svc, server_identity),

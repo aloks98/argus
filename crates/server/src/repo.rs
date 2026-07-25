@@ -11,6 +11,11 @@ use uuid::Uuid;
 
 /// Outcome of atomically checking + consuming an enrollment token.
 pub enum TokenCheck {
+    // `grpc::enroll` no longer uses the token's name as the audit *actor*
+    // (the closed `Actor` enum has no variant for an arbitrary token name),
+    // but it's still the only server-verified record of which token
+    // authorized the call, so `enroll` now stamps it into every
+    // `agent.enroll` row's `detail` instead (`repo::audit_with_detail`).
     Valid { token_name: String },
     Invalid,
 }
@@ -272,17 +277,54 @@ pub async fn prune_metrics(
 /// (CLAUDE.md: "a verb without an audit_log write is incomplete").
 pub async fn audit(
     executor: impl sqlx::PgExecutor<'_>,
-    actor: &str,
+    actor: Actor<'_>,
     action: &str,
     machine_id: Option<Uuid>,
     result: &str,
 ) -> Result<()> {
+    let actor = actor.as_str();
     sqlx::query!(
         "INSERT INTO audit_log (actor, action, machine_id, result) VALUES ($1, $2, $3, $4)",
-        actor,
+        actor.as_ref(),
         action,
         machine_id,
         result,
+    )
+    .execute(executor)
+    .await?;
+
+    Ok(())
+}
+
+/// Like `audit`, but also stamps a `detail` payload. For `agent.enroll`: the
+/// row's `actor` alone can't carry "which enrollment token authorized this"
+/// -- before a machine exists there is no principal but `Actor::System`, and
+/// even once one does, `agent_id` is a claim the caller made via
+/// `info.machine_id`, not a cert-verified fact (see
+/// `update_machine_inventory`'s doc comment). The token hash check IS a
+/// server-verified fact, and unlike the actor column it survives being
+/// represented in a closed enum, so it goes in `detail` instead:
+/// `{"enrollment_token": <name>}`. Without this, "which join token was used
+/// to enroll/re-enroll machine X" becomes unanswerable the moment the row is
+/// written -- `enrollment_tokens` only tracks a bare `uses` counter, with no
+/// per-use history to fall back on.
+pub async fn audit_with_detail(
+    executor: impl sqlx::PgExecutor<'_>,
+    actor: Actor<'_>,
+    action: &str,
+    machine_id: Option<Uuid>,
+    result: &str,
+    detail: serde_json::Value,
+) -> Result<()> {
+    let actor = actor.as_str();
+    sqlx::query!(
+        "INSERT INTO audit_log (actor, action, machine_id, result, detail)
+         VALUES ($1, $2, $3, $4, $5)",
+        actor.as_ref(),
+        action,
+        machine_id,
+        result,
+        detail,
     )
     .execute(executor)
     .await?;
@@ -295,17 +337,18 @@ pub async fn audit(
 /// gRPC `Command` and its eventual `CommandResult` (see `update_command_result`).
 pub async fn audit_command(
     executor: impl sqlx::PgExecutor<'_>,
-    actor: &str,
+    actor: Actor<'_>,
     action: &str,
     machine_id: Option<Uuid>,
     target_ref: &str,
     command_id: Uuid,
     result: &str,
 ) -> Result<()> {
+    let actor = actor.as_str();
     sqlx::query!(
         "INSERT INTO audit_log (actor, action, machine_id, target_ref, command_id, result)
          VALUES ($1, $2, $3, $4, $5, $6)",
-        actor,
+        actor.as_ref(),
         action,
         machine_id,
         target_ref,
@@ -513,6 +556,101 @@ pub async fn machine_detail(
     .await?;
 
     Ok(row)
+}
+
+/// An authenticated human. Minted only by the auth middleware, which is what
+/// makes `Actor::User` un-forgeable by a handler.
+#[derive(Clone, Debug)]
+pub struct Identity {
+    pub subject: String,
+    pub email: Option<String>,
+    pub display_name: Option<String>,
+}
+
+impl Identity {
+    /// Email reads better in an audit trail; `subject` is the stable identity
+    /// and is always present. Both are on the session row (PRD §7).
+    pub fn actor_str(&self) -> &str {
+        self.email.as_deref().unwrap_or(&self.subject)
+    }
+}
+
+/// Who performed an audited action. A closed set on purpose: the audit column
+/// used to be a free `&str`, and every browser-initiated verb passed the
+/// literal "anonymous". With this, a browser verb can only be recorded by
+/// producing an `Identity`, which only the auth middleware mints -- so
+/// "forgot to wire the actor through" is a compile error rather than a
+/// plausible-looking audit row.
+pub enum Actor<'a> {
+    User(&'a Identity),
+    Agent(Uuid),
+    /// No principal: e.g. an enrollment denied before any machine exists.
+    System,
+}
+
+impl Actor<'_> {
+    pub fn as_str(&self) -> std::borrow::Cow<'_, str> {
+        match self {
+            Actor::User(i) => std::borrow::Cow::Borrowed(i.actor_str()),
+            Actor::Agent(id) => std::borrow::Cow::Owned(id.to_string()),
+            Actor::System => std::borrow::Cow::Borrowed("system"),
+        }
+    }
+}
+
+pub async fn create_session(
+    pool: &PgPool,
+    token_hash: &[u8],
+    identity: &Identity,
+    expires_at: OffsetDateTime,
+) -> Result<()> {
+    sqlx::query!(
+        "INSERT INTO sessions (token_hash, subject, email, display_name, expires_at)
+         VALUES ($1, $2, $3, $4, $5)",
+        token_hash,
+        identity.subject,
+        identity.email,
+        identity.display_name,
+        expires_at,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Expiry is enforced here, in SQL. Trusting the cookie's own `Max-Age` would
+/// let a client that simply keeps sending the value stay authenticated forever.
+pub async fn lookup_session(pool: &PgPool, token_hash: &[u8]) -> Result<Option<Identity>> {
+    let row = sqlx::query!(
+        "SELECT subject, email, display_name FROM sessions
+         WHERE token_hash = $1 AND expires_at > now()",
+        token_hash,
+    )
+    .fetch_optional(pool)
+    .await?;
+
+    Ok(row.map(|r| Identity {
+        subject: r.subject,
+        email: r.email,
+        display_name: r.display_name,
+    }))
+}
+
+pub async fn delete_session(pool: &PgPool, token_hash: &[u8]) -> Result<()> {
+    sqlx::query!("DELETE FROM sessions WHERE token_hash = $1", token_hash)
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
+/// Hygiene, not enforcement: `lookup_session` already filters on
+/// `expires_at > now()`, so an unswept row is never usable. Called from the
+/// sweeper tick in `jobs::run`, after `mark_stale_offline`.
+pub async fn delete_expired_sessions(pool: &PgPool) -> Result<u64> {
+    let r = sqlx::query!("DELETE FROM sessions WHERE expires_at <= now()")
+        .execute(pool)
+        .await?;
+    Ok(r.rows_affected())
 }
 
 #[cfg(test)]
@@ -796,7 +934,7 @@ mod tests {
         let pool = test_pool().await;
         let action = format!("test.repo.audit.{}", Uuid::new_v4());
 
-        audit(&pool, "test-actor", &action, None, "ok")
+        audit(&pool, Actor::System, &action, None, "ok")
             .await
             .expect("write audit row");
 
@@ -808,7 +946,7 @@ mod tests {
         .await
         .expect("read audit row");
 
-        assert_eq!(row.actor, "test-actor");
+        assert_eq!(row.actor, "system");
         assert_eq!(row.result.as_deref(), Some("ok"));
         assert!(row.machine_id.is_none());
 
@@ -981,7 +1119,7 @@ mod tests {
 
         audit_command(
             &pool,
-            "anonymous",
+            Actor::System,
             "container.start",
             Some(machine_id),
             "web",
@@ -997,7 +1135,7 @@ mod tests {
         )
         .fetch_one(&pool)
         .await?;
-        assert_eq!(row.actor, "anonymous");
+        assert_eq!(row.actor, "system");
         assert_eq!(row.action, "container.start");
         assert_eq!(row.target_ref.as_deref(), Some("web"));
         assert_eq!(row.command_id, Some(command_id));
@@ -1349,5 +1487,113 @@ mod tests {
             "update_machine_inventory must apply an explicit new report"
         );
         Ok(())
+    }
+
+    #[sqlx::test]
+    async fn session_round_trips_and_expiry_is_enforced_in_sql(pool: PgPool) -> anyhow::Result<()> {
+        let id = Identity {
+            subject: "sub-1".into(),
+            email: Some("a@example.com".into()),
+            display_name: Some("A".into()),
+        };
+        let hash = vec![1u8; 32];
+        let future = OffsetDateTime::now_utc() + time::Duration::hours(1);
+        create_session(&pool, &hash, &id, future).await?;
+
+        let found = lookup_session(&pool, &hash).await?.expect("session exists");
+        assert_eq!(found.subject, "sub-1");
+        assert_eq!(found.email.as_deref(), Some("a@example.com"));
+
+        // An unknown token must not resolve to anyone.
+        assert!(lookup_session(&pool, &[9u8; 32]).await?.is_none());
+
+        // Expiry is enforced by the QUERY, not by cookie age -- a client that
+        // keeps presenting an old cookie must still be rejected.
+        sqlx::query!(
+            "UPDATE sessions SET expires_at = now() - interval '1 second' WHERE token_hash = $1",
+            &hash
+        )
+        .execute(&pool)
+        .await?;
+        assert!(lookup_session(&pool, &hash).await?.is_none());
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn delete_session_revokes_immediately(pool: PgPool) -> anyhow::Result<()> {
+        let id = Identity {
+            subject: "s".into(),
+            email: None,
+            display_name: None,
+        };
+        let hash = vec![2u8; 32];
+        create_session(
+            &pool,
+            &hash,
+            &id,
+            OffsetDateTime::now_utc() + time::Duration::hours(1),
+        )
+        .await?;
+        delete_session(&pool, &hash).await?;
+        assert!(lookup_session(&pool, &hash).await?.is_none());
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn sweeper_deletes_only_expired_sessions(pool: PgPool) -> anyhow::Result<()> {
+        let id = Identity {
+            subject: "s".into(),
+            email: None,
+            display_name: None,
+        };
+        let live = vec![3u8; 32];
+        let dead = vec![4u8; 32];
+        create_session(
+            &pool,
+            &live,
+            &id,
+            OffsetDateTime::now_utc() + time::Duration::hours(1),
+        )
+        .await?;
+        create_session(
+            &pool,
+            &dead,
+            &id,
+            OffsetDateTime::now_utc() - time::Duration::hours(1),
+        )
+        .await?;
+
+        assert_eq!(delete_expired_sessions(&pool).await?, 1);
+        assert!(lookup_session(&pool, &live).await?.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn actor_string_prefers_email_but_falls_back_to_subject() {
+        let with = Identity {
+            subject: "sub".into(),
+            email: Some("a@example.com".into()),
+            display_name: None,
+        };
+        assert_eq!(with.actor_str(), "a@example.com");
+        let without = Identity {
+            subject: "sub".into(),
+            email: None,
+            display_name: None,
+        };
+        assert_eq!(without.actor_str(), "sub");
+    }
+
+    #[test]
+    fn actor_renders_each_principal_kind() {
+        let id = Identity {
+            subject: "sub".into(),
+            email: Some("a@example.com".into()),
+            display_name: None,
+        };
+        assert_eq!(Actor::User(&id).as_str(), "a@example.com");
+        let m = Uuid::nil();
+        assert_eq!(Actor::Agent(m).as_str(), m.to_string());
+        assert_eq!(Actor::System.as_str(), "system");
     }
 }

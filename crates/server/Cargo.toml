@@ -31,6 +31,9 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 rcgen.workspace = true
 rustls-pemfile.workspace = true
+openidconnect.workspace = true
+reqwest.workspace = true
+axum-extra.workspace = true
 
 serde.workspace = true
 serde_json.workspace = true

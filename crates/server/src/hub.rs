@@ -6,6 +6,7 @@
 //! re-derived on reconnect — consistent with the stateless single-replica control
 //! plane.
 
+use crate::repo;
 use argus_proto::v1::{
     server_frame, Command, CommandResult, Container, LogChunk, LogTailRequest, LogTailStop,
     PtyClose, PtyFlow, PtyInput, PtyOpen, PtyResize, ServerFrame, Unit, Verb,
@@ -179,7 +180,7 @@ impl Hub {
         command_id: String,
         verb: Verb,
         target: String,
-        issued_by: String,
+        issued_by: repo::Actor<'_>,
     ) -> Result<(), DispatchError> {
         // Extract the channel + stream_id under the lock, then release it before
         // the async send (never hold a std Mutex guard across an await).
@@ -190,7 +191,7 @@ impl Hub {
                 command_id,
                 verb: verb as i32,
                 target,
-                issued_by,
+                issued_by: issued_by.as_str().into_owned(),
             })),
         };
         tx.send(Ok(frame))
@@ -745,7 +746,7 @@ mod tests {
                 "cmd-1".into(),
                 Verb::ContainerStart,
                 "c1".into(),
-                "anonymous".into(),
+                repo::Actor::System,
             )
             .await;
         assert!(matches!(res, Err(DispatchError::NotConnected)));
@@ -762,7 +763,7 @@ mod tests {
             "cmd-9".into(),
             Verb::ContainerRestart,
             "web".into(),
-            "anonymous".into(),
+            repo::Actor::System,
         )
         .await
         .expect("dispatch");

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT actor, result FROM audit_log WHERE action = 'agent.enroll' AND result = 'ok'",
+  "query": "SELECT actor, result, detail FROM audit_log WHERE action = 'agent.enroll' AND result = 'denied'",
   "describe": {
     "columns": [
       {
@@ -24,6 +24,17 @@
             "name": "result"
           }
         }
+      },
+      {
+        "ordinal": 2,
+        "name": "detail",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "audit_log",
+            "name": "detail"
+          }
+        }
       }
     ],
     "parameters": {
@@ -31,8 +42,9 @@
     },
     "nullable": [
       false,
-      true
+      true,
+      false
     ]
   },
-  "hash": "35fb638f0fdb010212de0732447e7a9f15e60cb86707672a55c0af442effd3aa"
+  "hash": "517ff6affc19ed2e4f502365bc68543b17931e9e1c979524c0e136ff5c98f9e2"
 }

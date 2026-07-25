@@ -65,6 +65,23 @@ impl AgentService for AgentSvc {
             .await
             .map_err(|e| internal_error("beginning enroll transaction", &e.into()))?;
 
+        // The token's `name` no longer has anywhere to go AS THE ACTOR: with
+        // `actor` now a closed `Actor` enum, there is no principal to
+        // attribute an unauthenticated `Enroll` call to but `Actor::System`
+        // -- true of the denied/error paths below (invalid token, missing
+        // info.machine_id, a failed write), since at that point a client
+        // cert (the only other thing that could mint an `Actor::Agent`)
+        // doesn't exist yet and no machine has been committed either. It is
+        // NOT true of the success path further down: once `agent_id` is
+        // committed inside this still-open transaction, that row mints
+        // `Actor::Agent(agent_id)` instead (see the comment there). Either
+        // way, `Actor::System` (denied/error) is still the only
+        // server-verified fact those calls have this early, so every
+        // `agent.enroll` row from here on carries the token name in `detail`
+        // too (`audit_with_detail`) -- without that, "which join token was
+        // used" becomes permanently unanswerable the moment the row is
+        // written: `enrollment_tokens` keeps no per-use history, only a bare
+        // `uses` counter.
         let token_name = match repo::consume_enrollment_token(&mut *tx, &req.join_token)
             .await
             .map_err(|e| internal_error("checking enrollment token", &e))?
@@ -72,9 +89,17 @@ impl AgentService for AgentSvc {
             TokenCheck::Valid { token_name } => token_name,
             TokenCheck::Invalid => {
                 drop(tx);
-                repo::audit(&self.pool, "system", "agent.enroll", None, "denied")
-                    .await
-                    .map_err(|e| internal_error("writing audit log", &e))?;
+                // No token was ever resolved here, so unlike the paths below
+                // there is no name to put in `detail` either.
+                repo::audit(
+                    &self.pool,
+                    repo::Actor::System,
+                    "agent.enroll",
+                    None,
+                    "denied",
+                )
+                .await
+                .map_err(|e| internal_error("writing audit log", &e))?;
                 return Err(Status::unauthenticated(
                     "invalid or exhausted enrollment token",
                 ));
@@ -85,9 +110,16 @@ impl AgentService for AgentSvc {
             Some(info) if !info.machine_id.is_empty() => info,
             _ => {
                 drop(tx);
-                repo::audit(&self.pool, &token_name, "agent.enroll", None, "denied")
-                    .await
-                    .map_err(|e| internal_error("writing audit log", &e))?;
+                repo::audit_with_detail(
+                    &self.pool,
+                    repo::Actor::System,
+                    "agent.enroll",
+                    None,
+                    "denied",
+                    serde_json::json!({ "enrollment_token": token_name }),
+                )
+                .await
+                .map_err(|e| internal_error("writing audit log", &e))?;
                 return Err(Status::invalid_argument(
                     "info.machine_id is required for enrollment",
                 ));
@@ -130,16 +162,37 @@ impl AgentService for AgentSvc {
             Ok(pair) => pair,
             Err(status) => {
                 drop(tx);
-                repo::audit(&self.pool, &token_name, "agent.enroll", None, "error")
-                    .await
-                    .map_err(|e| internal_error("writing audit log", &e))?;
+                repo::audit_with_detail(
+                    &self.pool,
+                    repo::Actor::System,
+                    "agent.enroll",
+                    None,
+                    "error",
+                    serde_json::json!({ "enrollment_token": token_name }),
+                )
+                .await
+                .map_err(|e| internal_error("writing audit log", &e))?;
                 return Err(status);
             }
         };
 
-        repo::audit(&mut *tx, &token_name, "agent.enroll", Some(agent_id), "ok")
-            .await
-            .map_err(|e| internal_error("writing audit log", &e))?;
+        // By this point `agent_id` is committed inside the still-open `tx`, so
+        // unlike the denied/error paths above, there IS a machine to attribute
+        // this to: the agent enrolling itself. `Actor::Agent(agent_id)` alone
+        // only records the CLAIM (`info.machine_id`, self-reported and not yet
+        // cert-verified -- see `update_machine_inventory`'s doc comment); the
+        // enrollment token's name in `detail` is what records the CREDENTIAL
+        // that actually authorized it.
+        repo::audit_with_detail(
+            &mut *tx,
+            repo::Actor::Agent(agent_id),
+            "agent.enroll",
+            Some(agent_id),
+            "ok",
+            serde_json::json!({ "enrollment_token": token_name }),
+        )
+        .await
+        .map_err(|e| internal_error("writing audit log", &e))?;
 
         tx.commit()
             .await
@@ -252,7 +305,7 @@ async fn handle_agent_frame(
             repo::mark_online(pool, machine_id).await?;
             repo::audit(
                 pool,
-                &machine_id.to_string(),
+                repo::Actor::Agent(machine_id),
                 "agent.online",
                 Some(machine_id),
                 "ok",
@@ -557,11 +610,19 @@ mod tests {
         assert_eq!(cert_row.machine_id, machine.id);
 
         let audit_row = sqlx::query!(
-            "SELECT actor, result FROM audit_log WHERE action = 'agent.enroll' AND result = 'ok'"
+            r#"SELECT actor, result, detail->>'enrollment_token' AS "enrollment_token!"
+               FROM audit_log WHERE action = 'agent.enroll' AND result = 'ok'"#
         )
         .fetch_one(&pool)
         .await?;
-        assert_eq!(audit_row.actor, "dev-token");
+        // The actor is the newly-minted agent itself (Actor::Agent), not the
+        // enrollment token's name -- the token has no representation in the
+        // closed Actor enum, and by this point a machine genuinely exists.
+        assert_eq!(audit_row.actor, machine.id.to_string());
+        // But the token IS the server-verified credential that authorized
+        // this enrollment, unlike the self-reported `agent_id` -- it must
+        // still be recoverable, from `detail`.
+        assert_eq!(audit_row.enrollment_token, "dev-token");
 
         Ok(())
     }
@@ -588,11 +649,58 @@ mod tests {
         assert_eq!(result.unwrap_err().code(), tonic::Code::Unauthenticated);
 
         let audit_row = sqlx::query!(
-            "SELECT actor, result FROM audit_log WHERE action = 'agent.enroll' AND result = 'denied'"
+            "SELECT actor, result, detail FROM audit_log WHERE action = 'agent.enroll' AND result = 'denied'"
         )
         .fetch_one(&pool)
         .await?;
         assert_eq!(audit_row.actor, "system");
+        // Unlike the missing-`info.machine_id` denial below, no token was
+        // ever resolved on this path (the hash never matched a row), so
+        // there is no name to have put in `detail` -- it stays the `'{}'`
+        // default.
+        assert_eq!(audit_row.detail, serde_json::json!({}));
+
+        Ok(())
+    }
+
+    /// The OTHER `agent.enroll`/`denied` path: unlike a bad token (above),
+    /// the token here IS valid and consumed -- the request itself is what's
+    /// rejected (no usable `info.machine_id`). Regression coverage for the
+    /// audit-detail fix: this row previously carried zero identifying
+    /// information (actor `system`, every other column `NULL`), making
+    /// "which join token was presented" permanently unanswerable.
+    #[sqlx::test]
+    async fn enroll_with_missing_machine_id_is_denied_and_audited(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let cipher = FieldCipher::from_b64_key(&STANDARD.encode([11u8; 32]))?;
+        let ca = Arc::new(CertAuthority::load_or_init(&pool, &cipher).await?);
+        let svc = AgentSvc::new(ca, pool.clone(), Arc::new(crate::hub::Hub::new()));
+
+        seed_token(&pool, "missing-info-token", "missing-info").await;
+
+        let result = svc
+            .enroll(Request::new(EnrollRequest {
+                join_token: "missing-info-token".to_string(),
+                csr_pem: make_csr(),
+                info: None,
+            }))
+            .await;
+
+        assert!(result.is_err());
+        assert_eq!(result.unwrap_err().code(), tonic::Code::InvalidArgument);
+
+        let audit_row = sqlx::query!(
+            r#"SELECT actor, result, detail->>'enrollment_token' AS "enrollment_token!"
+               FROM audit_log WHERE action = 'agent.enroll' AND result = 'denied'"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(audit_row.actor, "system");
+        // The still-valid, still-consumed token is the one piece of
+        // server-verified identifying information this row has; it must
+        // survive in `detail` even though the request itself was rejected.
+        assert_eq!(audit_row.enrollment_token, "missing-info");
 
         Ok(())
     }
@@ -647,11 +755,16 @@ mod tests {
         );
 
         let audit_row = sqlx::query!(
-            "SELECT actor, result FROM audit_log WHERE action = 'agent.enroll' AND result = 'error'"
+            r#"SELECT actor, result, detail->>'enrollment_token' AS "enrollment_token!"
+               FROM audit_log WHERE action = 'agent.enroll' AND result = 'error'"#
         )
         .fetch_one(&pool)
         .await?;
-        assert_eq!(audit_row.actor, "single-use");
+        // No machine survives the rollback, so this is Actor::System, not the
+        // burned token's name -- same reasoning as the denied path. The
+        // burned token's name is still recoverable from `detail`, though.
+        assert_eq!(audit_row.actor, "system");
+        assert_eq!(audit_row.enrollment_token, "single-use");
 
         let cert_count = sqlx::query!("SELECT count(*) AS count FROM agent_certs")
             .fetch_one(&pool)

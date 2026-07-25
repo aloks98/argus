@@ -52,6 +52,19 @@ pub const PTY_LOW_WATER: usize = 256 << 10; // 256 KiB buffered -> resume
 /// Per-read chunk size on the agent's blocking PTY reader.
 pub const PTY_READ_BUF: usize = 64 << 10; // 64 KiB
 
+/// Browser session lifetime. A security property of the product rather than a
+/// per-deployment knob, which is why it lives here beside the other timeouts
+/// instead of in the environment.
+pub const SESSION_TTL_HOURS: i64 = 12;
+
+/// Cookie holding the opaque session token. Only its sha256 is ever stored.
+pub const SESSION_COOKIE: &str = "argus_session";
+
+/// Short-lived cookie holding the sealed in-flight login (state, nonce, PKCE
+/// verifier, return path). Ten minutes; expires by itself, so it needs no table.
+pub const FLOW_COOKIE: &str = "argus_login";
+pub const FLOW_TTL_SECS: i64 = 600;
+
 /// Capability names reported by the agent on `AgentInfo` and stored in
 /// `machines.capabilities`. Both binaries import these so a capability is never
 /// spelled as a string literal on either side of the wire.
@@ -73,6 +86,20 @@ pub mod env {
     /// Comma-separated SANs for the control plane's own agent-surface TLS leaf
     /// (hostnames/IPs agents dial). Defaults to localhost.
     pub const AGENT_SANS: &str = "ARGUS_AGENT_SANS";
+    /// OIDC issuer URL; every endpoint is read from its discovery document.
+    pub const OIDC_ISSUER: &str = "ARGUS_OIDC_ISSUER";
+    pub const OIDC_CLIENT_ID: &str = "ARGUS_OIDC_CLIENT_ID";
+    pub const OIDC_CLIENT_SECRET: &str = "ARGUS_OIDC_CLIENT_SECRET";
+    /// Role required for admission, or the literal `any`.
+    pub const OIDC_REQUIRED_ROLE: &str = "ARGUS_OIDC_REQUIRED_ROLE";
+    /// Dot-path to the roles claim (Keycloak nests: `realm_access.roles`).
+    pub const OIDC_ROLES_CLAIM: &str = "ARGUS_OIDC_ROLES_CLAIM";
+    pub const OIDC_SCOPES: &str = "ARGUS_OIDC_SCOPES";
+    /// PEM for an IdP behind an internal CA.
+    pub const OIDC_CA_CERT: &str = "ARGUS_OIDC_CA_CERT";
+    /// Externally reachable base URL; builds the redirect URI and decides the
+    /// session cookie's `Secure` attribute.
+    pub const PUBLIC_URL: &str = "ARGUS_PUBLIC_URL";
 
     // ---- Agent ----
     /// Control-plane agent endpoint, e.g. `https://agents.argus.lab.example`.

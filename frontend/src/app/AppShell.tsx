@@ -1,5 +1,12 @@
+import { useState } from "react";
 import { Link, NavLink, matchPath, useLocation } from "react-router-dom";
+import { useQueryClient } from "@tanstack/react-query";
+import { LogOut } from "lucide-react";
 import {
+  Alert,
+  AlertDescription,
+  AlertTitle,
+  Button,
   Sidebar,
   SidebarContent,
   SidebarFooter,
@@ -18,6 +25,7 @@ import {
 } from "@e412/rnui-react";
 import ThemeToggle from "../components/ThemeToggle";
 import { useFleet } from "../lib/queries";
+import { logout, useMe } from "../lib/session";
 import { navSections } from "./routes";
 
 /**
@@ -27,9 +35,27 @@ import { navSections } from "./routes";
  * `SidebarProvider` for free) rather than a hand-rolled `<aside>`.
  */
 export default function AppShell({ children }: { children: React.ReactNode }) {
+  // Lifted above the sidebar rather than kept local to AccountFooter: at rail
+  // width the footer is ~3rem wide, nowhere near enough to show an error
+  // message, so this renders as a full-width banner instead -- the operator
+  // must be able to tell sign-out failed regardless of sidebar state.
+  const [signOutError, setSignOutError] = useState<string | null>(null);
+
   return (
     <SidebarProvider>
-      <FleetSidebar />
+      {signOutError !== null && (
+        <Alert
+          variant="destructive"
+          className="fixed inset-x-0 top-0 z-50 rounded-none border-x-0 border-t-0"
+        >
+          <AlertTitle>Sign-out failed</AlertTitle>
+          <AlertDescription>
+            {signOutError} Your session is still active on this server -- you are
+            NOT signed out. Try again before walking away from this browser.
+          </AlertDescription>
+        </Alert>
+      )}
+      <FleetSidebar onSignOutError={setSignOutError} />
       {/* min-w-0 + overflow-x-hidden are load-bearing for wide content (the
           units table runs ~130 rows with 90-char unit names): SidebarInset is a
           flex child, and a flex item defaults to `min-width: auto`, so without
@@ -70,6 +96,84 @@ function TopBar() {
 }
 
 /**
+ * Identity + sign-out, beside `ThemeToggle` in the sidebar footer.
+ *
+ * At rail width there is no room for both an identity string and two
+ * controls, so — matching the nav labels above — the identity disappears
+ * entirely rather than being clipped with CSS (which would still size its
+ * parent), and the two controls stack vertically instead of sitting side by
+ * side: two `size-8` squares plus a gap don't fit the ~3rem rail.
+ */
+function AccountFooter({
+  rail,
+  onSignOutError,
+}: {
+  rail: boolean;
+  onSignOutError: (message: string | null) => void;
+}) {
+  const { data } = useMe();
+  const queryClient = useQueryClient();
+  const identity = data?.display_name ?? data?.email ?? data?.subject ?? null;
+
+  const handleSignOut = () => {
+    onSignOutError(null);
+    void logout()
+      .then(async () => {
+        // Invalidating an ACTIVELY OBSERVED query notifies its observer (the
+        // Gate, mounted for the app's whole lifetime) directly and
+        // immediately -- that's what actually flips the shell to <SignIn/>.
+        // This has to run, and be awaited, BEFORE `clear()`: `clear()` removes
+        // the ["me"] query object from the cache entirely, and nothing then
+        // forces Gate's observer to notice it's gone (a bug caught empirically
+        // while fixing this -- `clear()` alone left the shell stuck showing
+        // the previous session's data through several 401'd polls).
+        await queryClient.invalidateQueries({ queryKey: ["me"] });
+        // Now that the gate has flipped (unmounting the pages that owned
+        // fleet/machine/docker/systemd queries), drop everything else too, so
+        // the next sign-in on this browser starts from a clean cache instead
+        // of flashing the previous operator's stale rows for up to a poll
+        // interval.
+        queryClient.clear();
+      })
+      .catch((err: unknown) => {
+        // `logout()` throws when the server responded with anything but
+        // 2xx. The server fails closed on a delete error (it does NOT clear
+        // the cookie), so the session is still live -- do NOT invalidate or
+        // clear the query cache here, or the shell flips to <SignIn/> while
+        // the operator is actually still signed in.
+        const message = err instanceof Error ? err.message : "Sign-out failed.";
+        onSignOutError(message);
+      });
+  };
+
+  return (
+    <>
+      {!rail && identity !== null && (
+        <div
+          title={identity}
+          className="w-full truncate font-mono text-[10px] uppercase tracking-widest text-muted-foreground"
+        >
+          {identity}
+        </div>
+      )}
+      <div className={rail ? "flex flex-col items-center gap-1" : "flex w-full items-center justify-between gap-2"}>
+        <ThemeToggle showLabel={!rail} />
+        <Button
+          variant="outline"
+          size="sm"
+          aria-label="Sign out"
+          title="Sign out"
+          className="size-8 justify-center p-0"
+          onClick={handleSignOut}
+        >
+          <LogOut className="size-4" />
+        </Button>
+      </div>
+    </>
+  );
+}
+
+/**
  * Split out from `AppShell` so it can call `useSidebar` — the hook needs a
  * `SidebarProvider` above it, and `AppShell` is what renders one.
  *
@@ -78,7 +182,11 @@ function TopBar() {
  * which elements exist at all, not how they are styled: a label hidden with CSS
  * still sizes its parent.
  */
-function FleetSidebar() {
+function FleetSidebar({
+  onSignOutError,
+}: {
+  onSignOutError: (message: string | null) => void;
+}) {
   const location = useLocation();
   const { state, isMobile } = useSidebar();
   // The mobile sheet always shows full-width content, so it is never "rail".
@@ -160,11 +268,11 @@ function FleetSidebar() {
       <SidebarFooter
         className={
           rail
-            ? "items-center border-t border-border px-0 py-2"
-            : "flex-row items-center border-t border-border px-3 py-2"
+            ? "items-center gap-1 border-t border-border px-0 py-2"
+            : "gap-1 border-t border-border px-3 py-2"
         }
       >
-        <ThemeToggle showLabel={!rail} />
+        <AccountFooter rail={rail} onSignOutError={onSignOutError} />
       </SidebarFooter>
 
       {/* Draggable edge strip: toggling from the sidebar's own border, in
