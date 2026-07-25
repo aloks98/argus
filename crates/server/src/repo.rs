@@ -1667,10 +1667,24 @@ mod tests {
         assert_eq!(a.username, "admin");
         assert_eq!(a.password_hash, "$argon2id$first");
 
-        // Rotation replaces the hash in place rather than adding a row.
+        let updated_at_after_first = sqlx::query_scalar!("SELECT updated_at FROM local_admin")
+            .fetch_one(&pool)
+            .await?;
+
+        // Rotation replaces the hash in place rather than adding a row, and
+        // design §14 requires `updated_at` to advance along with it -- not
+        // just the hash.
         upsert_local_admin(&pool, "admin", "$argon2id$second").await?;
         let b = get_local_admin(&pool).await?.expect("row");
         assert_eq!(b.password_hash, "$argon2id$second");
+
+        let updated_at_after_second = sqlx::query_scalar!("SELECT updated_at FROM local_admin")
+            .fetch_one(&pool)
+            .await?;
+        assert!(
+            updated_at_after_second > updated_at_after_first,
+            "rotation must bump updated_at, not just the hash"
+        );
 
         let count = sqlx::query_scalar!("SELECT count(*) FROM local_admin")
             .fetch_one(&pool)
@@ -1685,14 +1699,40 @@ mod tests {
         pool: PgPool,
     ) -> anyhow::Result<()> {
         upsert_local_admin(&pool, "admin", "$argon2id$x").await?;
+
         // Bypass the repo helper to prove the SCHEMA enforces single-row, not
-        // just our upsert. Without the constraint this insert would succeed.
-        let second = sqlx::query!(
+        // just our upsert. Two different constraints are in play, and both
+        // need their own row to be proven:
+
+        // 1. `id = true` collides with the existing row's PRIMARY KEY. This
+        //    alone would be rejected even if `local_admin_single_row` (the
+        //    `check (id)` constraint) did not exist.
+        let same_id = sqlx::query!(
             "INSERT INTO local_admin (id, username, password_hash) VALUES (true, 'other', 'y')"
         )
         .execute(&pool)
         .await;
-        assert!(second.is_err(), "the schema must reject a second row");
+        assert!(
+            same_id.is_err(),
+            "a second id = true row must collide on the primary key"
+        );
+
+        // 2. `id = false` is a DISTINCT primary key value, so the PK alone
+        //    permits it -- only `local_admin_single_row`'s `check (id)`
+        //    blocks it. This is the constraint's actual job: without it, a
+        //    row with id = false would sit in the table, invisible to
+        //    `get_local_admin` (which filters `WHERE id = true`), while
+        //    every other test in this file kept passing.
+        let other_id = sqlx::query!(
+            "INSERT INTO local_admin (id, username, password_hash) VALUES (false, 'other', 'y')"
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            other_id.is_err(),
+            "the check constraint must reject id = false"
+        );
+
         Ok(())
     }
 
