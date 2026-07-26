@@ -118,7 +118,18 @@ export default function UnitsCard({
         </Alert>
       )}
 
-      <div className="flex flex-wrap items-center gap-3 pb-2">
+      {/* A real `form` rather than a bare div: these two controls are a search,
+          `role="search"` exposes them as a landmark, and the explicit
+          `preventDefault` makes Enter a deliberate no-op instead of an
+          incidental one. Filtering is live on change, so there is nothing to
+          submit — but a text field that silently swallows Enter reads as broken
+          unless the element it sits in says why. Keeping the same flex classes
+          means the layout is unchanged; `form` is a block box like the div was. */}
+      <form
+        role="search"
+        className="flex flex-wrap items-center gap-3 pb-2"
+        onSubmit={(e) => e.preventDefault()}
+      >
         <Input
           type="search"
           value={filter}
@@ -140,7 +151,7 @@ export default function UnitsCard({
             Failed only
           </label>
         </div>
-      </div>
+      </form>
 
       {/* 129 units is a very tall table, and without a height bound the page
           takes the scroll — the machine header, tabs and filter all disappear

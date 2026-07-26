@@ -57,13 +57,25 @@ export default function SignIn() {
             window.location.href = `/auth/login?next=${encodeURIComponent(next)}`;
           }}
         >
-          Sign in
+          Sign in with SSO
         </Button>
 
         <Collapsible>
-          <CollapsibleTrigger className="group flex w-full items-center justify-center gap-1.5 font-mono text-[11px] uppercase tracking-widest text-muted-foreground hover:text-foreground">
-            <ChevronDown className="size-3.5 transition-transform group-data-[panel-open]:rotate-180" />
+          {/* Rendered AS a Button so the two ways in read as two affordances of
+              equal weight, rather than a button plus a piece of small print.
+              That matters here: in a local-admin-only deployment SSO is the
+              route that does not work, and an operator mid-outage should not
+              have to notice a text link to find the one that does.
+
+              `render` is base-ui's composition prop — the same one AppShell
+              uses to render a menu button as a NavLink. The trigger keeps its
+              own click handling and `data-panel-open` state and simply borrows
+              the Button's styling, so `group-data-[panel-open]` still drives
+              the chevron. `outline` rather than the default keeps SSO visually
+              primary without demoting this one out of sight. */}
+          <CollapsibleTrigger className="group w-full" render={<Button variant="outline" />}>
             Use a local account
+            <ChevronDown className="size-3.5 transition-transform group-data-[panel-open]:rotate-180" />
           </CollapsibleTrigger>
           <CollapsibleContent>
             <LocalSignInForm />
