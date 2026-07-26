@@ -1155,6 +1155,18 @@ behave identically to an OIDC-sourced session — there is no second session
 concept, and the browser surface's `require_auth` middleware, expiry, and
 logout all work unchanged.
 
+**In the browser**, the same credentials go in via `frontend/src/components/SignIn.tsx`:
+open the app, and beneath the SSO "Sign in" button there is a collapsed **"Use
+a local account"** disclosure — click it to reveal the username/password
+fields, then submit the generated credentials from step 1 above. This is
+deliberately not the first thing on the page (SSO stays primary, design §12),
+so during a real incident it is easy to glance at the sign-in screen, see only
+the SSO button, and assume the recovery path isn't there — it is, one click
+down. A live click-through of this exact form (not just the `curl` equivalent
+above) is still worth doing once, the same way the OIDC section above has
+rows it flags as not yet run against a real browser — **not done in this
+pass**; everything measured in this task went through `curl` only.
+
 ### CA rotation gotcha applies here too
 
 Same rotation as the OIDC section above ("CA rotation gotcha applies here
