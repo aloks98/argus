@@ -1,26 +1,27 @@
 import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
+import { zodResolver } from "@hookform/resolvers/zod";
+import { Controller, useForm } from "react-hook-form";
+import * as z from "zod";
 import {
   Alert,
   AlertDescription,
   AlertTitle,
   Button,
-  Collapsible,
-  CollapsibleContent,
-  CollapsibleTrigger,
   Field,
+  FieldError,
   FieldGroup,
   FieldLabel,
   Input,
   Spinner,
 } from "@e412/rnui-react";
-import { ChevronDown } from "lucide-react";
+import { ArrowLeft } from "lucide-react";
 import { RateLimited, localLogin } from "../api";
 
 /**
- * Full-page gate. Always shows BOTH affordances -- the SSO button and the
- * local-account disclosure -- rather than probing `/auth/login` to hide
- * whichever isn't configured.
+ * Full-page gate, in two stages: pick a method, then use it. Both methods are
+ * always offered -- this never probes `/auth/login` to hide whichever isn't
+ * configured.
  *
  * That probe was tried and reverted: `GET /auth/login` is not a status
  * check, it is the start of a real OIDC flow (design §8/§13) -- every hit
@@ -40,59 +41,82 @@ import { RateLimited, localLogin } from "../api";
  */
 export default function SignIn() {
   const next = window.location.pathname + window.location.search;
+  // Two stages rather than a disclosure: picking a method replaces the choice
+  // instead of growing beneath it. One decision on screen at a time, and the
+  // form is never competing for attention with a button that would abandon it.
+  const [stage, setStage] = useState<"choose" | "local">("choose");
 
   return (
     <div className="flex min-h-screen flex-col items-center justify-center gap-6 bg-background p-6">
       <div className="text-center">
         <div className="font-display text-2xl tracking-widest">ARGUS</div>
         <p className="mt-2 font-mono text-[11px] uppercase tracking-widest text-muted-foreground">
-          Sign in to continue
+          {stage === "choose" ? "Sign in to continue" : "Local account"}
         </p>
       </div>
 
       <div className="flex w-full max-w-xs flex-col gap-4">
-        <Button
-          className="w-full"
-          onClick={() => {
-            window.location.href = `/auth/login?next=${encodeURIComponent(next)}`;
-          }}
-        >
-          Sign in with SSO
-        </Button>
-
-        <Collapsible>
-          {/* Rendered AS a Button so the two ways in read as two affordances of
-              equal weight, rather than a button plus a piece of small print.
-              That matters here: in a local-admin-only deployment SSO is the
-              route that does not work, and an operator mid-outage should not
-              have to notice a text link to find the one that does.
-
-              `render` is base-ui's composition prop — the same one AppShell
-              uses to render a menu button as a NavLink. The trigger keeps its
-              own click handling and `data-panel-open` state and simply borrows
-              the Button's styling, so `group-data-[panel-open]` still drives
-              the chevron. `outline` rather than the default keeps SSO visually
-              primary without demoting this one out of sight. */}
-          <CollapsibleTrigger className="group w-full" render={<Button variant="outline" />}>
-            Use a local account
-            <ChevronDown className="size-3.5 transition-transform group-data-[panel-open]:rotate-180" />
-          </CollapsibleTrigger>
-          <CollapsibleContent>
+        {stage === "choose" ? (
+          <>
+            <Button
+              className="w-full"
+              onClick={() => {
+                window.location.href = `/auth/login?next=${encodeURIComponent(next)}`;
+              }}
+            >
+              Sign in with SSO
+            </Button>
+            {/* Outline keeps SSO the primary route without demoting this one
+                into small print. In a local-admin-only deployment SSO is the
+                route that does NOT work, and an operator mid-outage should not
+                have to hunt for the one that does. */}
+            <Button variant="outline" className="w-full" onClick={() => setStage("local")}>
+              Use a local account
+            </Button>
+          </>
+        ) : (
+          <>
+            {/* Above the form, not below it: the way back is the first thing
+                you should find if you picked this by mistake. */}
+            <Button
+              variant="ghost"
+              className="w-full justify-start"
+              onClick={() => setStage("choose")}
+            >
+              <ArrowLeft className="size-3.5" />
+              Back
+            </Button>
             <LocalSignInForm />
-          </CollapsibleContent>
-        </Collapsible>
+          </>
+        )}
       </div>
     </div>
   );
 }
 
+/**
+ * Deliberately validates only PRESENCE. A rule like "at least 24 characters"
+ * would mirror what `generate_password` happens to produce today, so it would
+ * reject a still-valid credential the moment that length changes — and it
+ * would tell an unauthenticated visitor the shape of the secret. Whether the
+ * password is *correct* is the server's business, and the server answers every
+ * wrong answer identically on purpose (design §11).
+ */
+const localSignInSchema = z.object({
+  username: z.string().min(1, "Enter your username."),
+  password: z.string().min(1, "Enter your password."),
+});
+
 function LocalSignInForm() {
   const queryClient = useQueryClient();
-  const [username, setUsername] = useState("");
-  const [password, setPassword] = useState("");
+  const form = useForm<z.infer<typeof localSignInSchema>>({
+    resolver: zodResolver(localSignInSchema),
+    defaultValues: { username: "", password: "" },
+  });
 
   const mutation = useMutation({
-    mutationFn: () => localLogin(username, password),
+    mutationFn: (values: z.infer<typeof localSignInSchema>) =>
+      localLogin(values.username, values.password),
     onSuccess: () => {
       // The server already set the session cookie; invalidating `["me"]` is
       // all that's needed for the `Gate` in main.tsx to re-evaluate and swap
@@ -110,11 +134,9 @@ function LocalSignInForm() {
 
   return (
     <form
-      className="mt-1 flex flex-col gap-3 border-t border-border pt-3"
-      onSubmit={(e) => {
-        e.preventDefault();
-        mutation.mutate();
-      }}
+      className="flex flex-col gap-3"
+      noValidate
+      onSubmit={form.handleSubmit((values) => mutation.mutate(values))}
     >
       {rateLimited !== null && (
         <Alert variant="warning">
@@ -128,30 +150,44 @@ function LocalSignInForm() {
         </Alert>
       )}
 
+      {/* `noValidate` on the form above is deliberate: without it the browser's
+          own bubble fires first and the inline FieldError never gets a chance
+          to render, so the two validation systems would fight and the native
+          one would always win. */}
       <FieldGroup>
-        <Field>
-          <FieldLabel htmlFor="local-username">Username</FieldLabel>
-          <Input
-            id="local-username"
-            name="username"
-            autoComplete="username"
-            value={username}
-            onChange={(e) => setUsername(e.target.value)}
-            required
-          />
-        </Field>
-        <Field>
-          <FieldLabel htmlFor="local-password">Password</FieldLabel>
-          <Input
-            id="local-password"
-            name="password"
-            type="password"
-            autoComplete="current-password"
-            value={password}
-            onChange={(e) => setPassword(e.target.value)}
-            required
-          />
-        </Field>
+        <Controller
+          name="username"
+          control={form.control}
+          render={({ field, fieldState }) => (
+            <Field data-invalid={fieldState.invalid}>
+              <FieldLabel htmlFor="local-username">Username</FieldLabel>
+              <Input
+                {...field}
+                id="local-username"
+                autoComplete="username"
+                aria-invalid={fieldState.invalid}
+              />
+              {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+            </Field>
+          )}
+        />
+        <Controller
+          name="password"
+          control={form.control}
+          render={({ field, fieldState }) => (
+            <Field data-invalid={fieldState.invalid}>
+              <FieldLabel htmlFor="local-password">Password</FieldLabel>
+              <Input
+                {...field}
+                id="local-password"
+                type="password"
+                autoComplete="current-password"
+                aria-invalid={fieldState.invalid}
+              />
+              {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+            </Field>
+          )}
+        />
       </FieldGroup>
 
       <Button type="submit" variant="outline" className="w-full" disabled={mutation.isPending}>
