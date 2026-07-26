@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useState } from "react";
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import {
   Alert,
@@ -18,53 +18,28 @@ import { ChevronDown } from "lucide-react";
 import { RateLimited, localLogin } from "../api";
 
 /**
- * Probes whether SSO is configured, so the primary button isn't a dead click
- * when it isn't (local-admin design §12 nuance: `/auth/login` now 404s when
- * OIDC is absent, a supported deployment shape).
+ * Full-page gate. Always shows BOTH affordances -- the SSO button and the
+ * local-account disclosure -- rather than probing `/auth/login` to hide
+ * whichever isn't configured.
  *
- * `GET /auth/login` redirects (302/303) to the IdP when OIDC IS configured,
- * and answers 404 when it is not (`crate::auth::oidc::login`). A
- * `redirect: "manual"` fetch turns the redirect case into an opaque,
- * unreadable response instead of following it -- that opacity is exactly the
- * signal used below to tell the two cases apart without ever starting a real
- * login flow or leaving this page.
+ * That probe was tried and reverted: `GET /auth/login` is not a status
+ * check, it is the start of a real OIDC flow (design §8/§13) -- every hit
+ * runs discovery, mints a fresh CSRF token/nonce/PKCE verifier, and sets a
+ * live 10-minute flow cookie, which the design explicitly documents as
+ * reachable only by top-level navigation. Firing it from a background
+ * `fetch` on every sign-in-page mount silently started an unrequested OAuth
+ * flow for every signed-out visitor, and -- because the flow cookie is
+ * per-origin and shared across tabs -- a probe in one tab could stomp the
+ * flow cookie of a legitimate SSO login in flight in another, breaking its
+ * CSRF/nonce/PKCE check on return to the callback.
+ *
+ * So: no probe. When SSO isn't configured, a visitor who clicks "Sign in"
+ * gets the server's own friendly "single sign-on is not configured" page --
+ * a fine outcome that costs nothing, and the only way to know that requires
+ * no request to be made from here at all.
  */
-function useSsoAvailable(): boolean | null {
-  const [available, setAvailable] = useState<boolean | null>(null);
-
-  useEffect(() => {
-    let cancelled = false;
-    fetch("/auth/login", { redirect: "manual" })
-      .then((r) => {
-        if (!cancelled) setAvailable(r.type === "opaqueredirect" || r.status !== 404);
-      })
-      .catch(() => {
-        // A network hiccup while probing should not hide the primary
-        // sign-in path -- fail open.
-        if (!cancelled) setAvailable(true);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, []);
-
-  return available;
-}
-
-/** Full-page gate. The SSO flow leaves the SPA entirely, so that button is a
- *  plain navigation rather than anything router-aware. Local sign-in is an
- *  ordinary fetch that never navigates -- see `LocalSignInForm` below. */
 export default function SignIn() {
   const next = window.location.pathname + window.location.search;
-  const ssoAvailable = useSsoAvailable();
-  const [localOpen, setLocalOpen] = useState(false);
-
-  // If SSO turns out not to be configured, the disclosure IS the only route
-  // in -- open it automatically instead of leaving the operator to discover
-  // that a collapsed section is their only option.
-  useEffect(() => {
-    if (ssoAvailable === false) setLocalOpen(true);
-  }, [ssoAvailable]);
 
   return (
     <div className="flex min-h-screen flex-col items-center justify-center gap-6 bg-background p-6">
@@ -76,26 +51,18 @@ export default function SignIn() {
       </div>
 
       <div className="flex w-full max-w-xs flex-col gap-4">
-        {ssoAvailable === false ? (
-          <p className="text-center font-mono text-[11px] uppercase tracking-widest text-muted-foreground">
-            Single sign-on is not configured on this server.
-          </p>
-        ) : (
-          <Button
-            className="w-full"
-            onClick={() => {
-              window.location.href = `/auth/login?next=${encodeURIComponent(next)}`;
-            }}
-          >
-            Sign in
-          </Button>
-        )}
+        <Button
+          className="w-full"
+          onClick={() => {
+            window.location.href = `/auth/login?next=${encodeURIComponent(next)}`;
+          }}
+        >
+          Sign in
+        </Button>
 
-        <Collapsible open={localOpen} onOpenChange={setLocalOpen}>
-          <CollapsibleTrigger className="flex w-full items-center justify-center gap-1.5 font-mono text-[11px] uppercase tracking-widest text-muted-foreground hover:text-foreground">
-            <ChevronDown
-              className={`size-3.5 transition-transform ${localOpen ? "rotate-180" : ""}`}
-            />
+        <Collapsible>
+          <CollapsibleTrigger className="group flex w-full items-center justify-center gap-1.5 font-mono text-[11px] uppercase tracking-widest text-muted-foreground hover:text-foreground">
+            <ChevronDown className="size-3.5 transition-transform group-data-[panel-open]:rotate-180" />
             Use a local account
           </CollapsibleTrigger>
           <CollapsibleContent>
