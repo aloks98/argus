@@ -177,6 +177,11 @@ rescue the operator: an attacker unable to guess the password could still deny
 the recovery path. An escalating-but-capped delay costs an attacker effectively
 everything while costing the legitimate user seconds.
 
+This prevents a permanent lock, not *starvation*: under a sustained flood
+exactly one attempt is admitted per window globally, and the legitimate
+operator competes with the attacker for that slot. The out is that the counter
+is in memory (§10.3), so restarting the process clears it.
+
 ### 10.3 Why in memory
 
 One replica, and an attacker cannot force the restart that would reset the
@@ -240,3 +245,14 @@ in one test — if it passes, the recovery path works.
   by rotation, which needs an existing session or host access.
 - **Boot-rule regression.** The startup query is the only thing standing between
   "no auth configured" and a running control plane; its tests are not optional.
+- **In-app rotation provisions the credential, not only rotates it.** `POST
+  /api/local-admin/rotate` calls the same `reset_local_admin` the CLI uses; when
+  `local_admin` is empty it *creates* the row rather than refusing, falling back
+  to username `admin`. In an OIDC-only deployment this means any signed-in user
+  can mint a break-glass credential that did not exist before — and the
+  resulting password keeps working after that user is removed from the identity
+  provider, through a path the IdP cannot revoke. This is accepted behaviour,
+  not a defect: the action is authenticated and audited (`local_admin.rotate`
+  names the actor), and it is no worse in kind than rotating an existing row.
+  `local_admin.rotate` in the audit log, plus `last_login_at`, are how you
+  detect its use.

@@ -2846,6 +2846,13 @@ mod tests {
             )
             .await?;
         assert_eq!(me.status(), StatusCode::OK);
+        let me_body = axum::body::to_bytes(me.into_body(), 64 * 1024).await?;
+        let me_json: serde_json::Value = serde_json::from_slice(&me_body)?;
+        // Design §8: the `local:` prefix namespaces the subject so it can
+        // never collide with a provider's `sub`. Nothing else asserts this --
+        // pin it so a future refactor that drops or reshapes the prefix
+        // fails here instead of silently opening a collision path.
+        assert_eq!(me_json["subject"], "local:admin");
 
         // CLAUDE.md: every verb goes through the audit log from the start,
         // and design §9 requires `method` be explicit on the row -- nothing

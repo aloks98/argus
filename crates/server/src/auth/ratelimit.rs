@@ -101,6 +101,25 @@ impl LoginLimiter {
             bucket.last_attempt = Some(now);
             return None;
         }
+        if bucket.consecutive_failures == BURST {
+            // The one place a sustained brute force becomes visible in the
+            // logs at all: the throttled path below writes no audit row (by
+            // design -- consulting the limiter first is what keeps a
+            // hammering caller from costing the database anything), so
+            // without this, five `auth.denied` rows are followed by complete
+            // silence no matter how long the attack continues.
+            //
+            // Logged exactly once per streak, not once per throttled
+            // request: `consecutive_failures` equals `BURST` only on the
+            // very first call that lands in this branch. Every later
+            // admission (once the delay elapses) pushes the count past
+            // `BURST`, and a call that arrives while still delayed (the
+            // `else` arm below) leaves the count untouched entirely -- so
+            // this can't re-fire on every poll of a caller hammering the
+            // endpoint, only when throttling actually begins for a fresh
+            // streak (i.e. after a `record_success` reset it to zero).
+            tracing::warn!("local admin login rate limiter: burst exhausted, now throttling");
+        }
         let delay = Self::delay_for(bucket.consecutive_failures);
         let Some(last) = bucket.last_attempt else {
             // Unreachable in practice (`consecutive_failures >= BURST > 0`

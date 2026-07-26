@@ -106,6 +106,16 @@ async fn run_local_admin_cli(args: &[String]) -> Result<()> {
                     )
                 })?;
             let pool = db::connect_url(&database_url).await?;
+            // Migrations are idempotent (CLAUDE.md) and embedded, so running
+            // them here is free on an already-current database -- but on a
+            // genuinely fresh one (a from-scratch deployment, or a restored
+            // volume with an empty schema) this is what stands between
+            // `local-admin reset` working at all and it dying on a raw
+            // `relation "local_admin" does not exist`. `main`'s normal boot
+            // path already does this before serving; the CLI path skips
+            // `main`'s boot entirely (by design -- see `run_local_admin_cli`'s
+            // doc comment), so it needs its own call.
+            db::migrate(&pool).await?;
             let password = auth::local::reset_local_admin(&pool, &username).await?;
 
             // Every verb goes through the audit log from the start (CLAUDE.md).

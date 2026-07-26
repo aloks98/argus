@@ -1136,6 +1136,24 @@ Either one alone is enough to start. The refusal names the fix:
 Error: no authentication is configured: set the OIDC variables, or create a local admin with `argus local-admin reset`
 ```
 
+### In-app rotation provisions the credential, not only rotates it
+
+`POST /api/local-admin/rotate` (authenticated, reachable while signed in by
+either method) calls `reset_local_admin` — the same function the CLI calls —
+and that function does not require a `local_admin` row to already exist: when
+the table is empty, rotation *creates* the account (falling back to username
+`admin`) and hands the caller its password, same as if it had rotated an
+existing one.
+
+In an OIDC-only deployment, that means any signed-in user can mint a
+break-glass local credential that did not exist before — and the resulting
+password keeps working after that user is removed from the identity provider,
+through a path the IdP cannot revoke. This is accepted behaviour (design
+§15), not a defect: the action is authenticated and audited
+(`local_admin.rotate` names the actor via `Actor::User`), and it is no worse
+in kind than rotating an existing row. `local_admin.rotate` in the audit log,
+plus `last_login_at`, are how you detect its use.
+
 ### Signing in with no identity provider configured at all
 
 Unlike OIDC, `POST /auth/local` is a plain JSON endpoint — no browser redirect
@@ -1158,7 +1176,8 @@ logout all work unchanged.
 **In the browser**, the same credentials go in via `frontend/src/components/SignIn.tsx`:
 open the app, and beneath the SSO "Sign in" button there is a collapsed **"Use
 a local account"** disclosure — click it to reveal the username/password
-fields, then submit the generated credentials from step 1 above. This is
+fields, then submit the credentials from the `argus local-admin reset` output
+above. This is
 deliberately not the first thing on the page (SSO stays primary, design §12),
 so during a real incident it is easy to glance at the sign-in screen, see only
 the SSO button, and assume the recovery path isn't there — it is, one click

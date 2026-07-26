@@ -24,9 +24,23 @@ use time::OffsetDateTime;
 /// Generate a new password, store only its hash, and return the password for
 /// one-time display. Shared by the CLI and the in-app rotation endpoint so
 /// there is exactly one implementation of "rotate".
+///
+/// `hash_password` (argon2id, ~100ms, ~19 MiB) runs inside `spawn_blocking`
+/// HERE -- not at either call site -- so both the CLI and the authenticated
+/// `rotate` endpoint inherit it automatically and the defect class that
+/// `login` already guards against (pinning a tokio worker thread for the
+/// whole hash) cannot reappear at a future call site that forgets to wrap it.
+/// `rotate` is reached from an authenticated request, so this is not the same
+/// unauthenticated-DoS risk `login` faces -- but it is the same cost paid on
+/// the same kind of worker thread, so it gets the same treatment.
 pub async fn reset_local_admin(pool: &PgPool, username: &str) -> Result<String> {
     let password = crate::auth::password::generate_password();
-    let hash = crate::auth::password::hash_password(&password)?;
+    let hash = {
+        let password = password.clone();
+        tokio::task::spawn_blocking(move || crate::auth::password::hash_password(&password))
+            .await
+            .map_err(|e| anyhow::anyhow!("argon2 hash task panicked: {e}"))??
+    };
     crate::repo::upsert_local_admin(pool, username, &hash).await?;
     Ok(password)
 }
@@ -255,6 +269,14 @@ pub async fn rotate(
         }
     };
 
+    // Deliberately fails OPEN here, unlike `login`'s audit write forty lines
+    // above (which fails closed by revoking the session it just created):
+    // rotation has already destroyed the old credential by this point, so
+    // withholding the one-time-display replacement over an unrelated logging
+    // failure would be the worst outcome -- the caller would be left with no
+    // working credential at all and no way to see the new one again. The CLI
+    // (`main.rs`'s `run_local_admin_cli`) makes the identical call for the
+    // identical reason; see the comment there.
     if let Err(e) = repo::audit(
         &state.pool,
         Actor::User(&identity),
@@ -303,11 +325,21 @@ mod tests {
     /// `login` leaves every status/body/cookie assertion in `http.rs`
     /// unchanged -- the only observable difference is elapsed time. The real
     /// gap without the dummy verify is ~1000x (microseconds vs. argon2id's
-    /// ~100ms); a 2x ("50%") tolerance is nowhere near tight enough to flake
-    /// under CI jitter but is nowhere near loose enough to hide a skipped
-    /// verify either.
+    /// ~100ms), so a 2x tolerance is nowhere near tight enough to flake under
+    /// CI jitter but is nowhere near loose enough to hide a skipped verify.
+    ///
+    /// Deliberately ONE-SIDED: only "no-admin is much FASTER than
+    /// wrong-password" carries security meaning (that's the leak design §11
+    /// exists to prevent). "No-admin is much slower" carries none, and would
+    /// be a false failure here regardless -- case 1 runs first and pays
+    /// one-time costs case 2 does not (the first `spawn_blocking` thread
+    /// spawn, the first 19 MiB argon2 arena), which biases elapsed time
+    /// toward exactly that direction. A two-sided bound would flake on that
+    /// bias for no security benefit; asserting only the direction that
+    /// matters gets the same sensitivity to the real defect with half the
+    /// flake surface.
     #[sqlx::test]
-    async fn no_admin_and_wrong_password_cost_about_the_same_time(
+    async fn no_admin_path_is_not_much_faster_than_wrong_password(
         pool: PgPool,
     ) -> anyhow::Result<()> {
         // Case 1: nothing configured at all -- the dummy-hash path.
@@ -338,15 +370,17 @@ mod tests {
         .await;
         let wrong_password_elapsed = t1.elapsed();
 
-        let (a, b) = (
+        let (no_admin, wrong_password) = (
             no_admin_elapsed.as_secs_f64(),
             wrong_password_elapsed.as_secs_f64(),
         );
-        let ratio = a.max(b) / a.min(b).max(f64::EPSILON);
+        // How many times slower wrong-password is than no-admin. A skipped
+        // dummy verify would make this ~1000x; a real one keeps it near 1x.
+        let ratio = wrong_password / no_admin.max(f64::EPSILON);
         assert!(
             ratio <= 2.0,
-            "no-admin ({no_admin_elapsed:?}) and wrong-password ({wrong_password_elapsed:?}) \
-             paths must cost about the same -- a {ratio:.1}x gap suggests the dummy \
+            "no-admin ({no_admin_elapsed:?}) must not be much faster than wrong-password \
+             ({wrong_password_elapsed:?}) -- a {ratio:.1}x gap suggests the dummy \
              verification was skipped"
         );
 

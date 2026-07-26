@@ -121,11 +121,17 @@ impl Config {
         let oidc_client_id = std::env::var(env::OIDC_CLIENT_ID).ok();
         let oidc_client_secret = std::env::var(env::OIDC_CLIENT_SECRET).ok();
         let oidc_required_role = std::env::var(env::OIDC_REQUIRED_ROLE).ok();
+        let oidc_roles_claim = std::env::var(env::OIDC_ROLES_CLAIM).ok();
+        let oidc_scopes = std::env::var(env::OIDC_SCOPES).ok();
+        let oidc_ca_cert = std::env::var(env::OIDC_CA_CERT).ok();
         let oidc_public_url = public_url_for_oidc(
             &oidc_issuer,
             &oidc_client_id,
             &oidc_client_secret,
             &oidc_required_role,
+            &oidc_roles_claim,
+            &oidc_scopes,
+            &oidc_ca_cert,
             &public_url,
         );
 
@@ -141,9 +147,9 @@ impl Config {
                 oidc_client_secret,
                 oidc_required_role,
                 oidc_public_url,
-                std::env::var(env::OIDC_ROLES_CLAIM).ok(),
-                std::env::var(env::OIDC_SCOPES).ok(),
-                std::env::var(env::OIDC_CA_CERT).ok(),
+                oidc_roles_claim,
+                oidc_scopes,
+                oidc_ca_cert,
             )?,
             public_url,
         })
@@ -157,21 +163,34 @@ impl Config {
 /// `ARGUS_PUBLIC_URL` (it is required independent of OIDC, see `Config`) --
 /// would present as "1 of 5 OIDC variables set" and be rejected as a *partial*
 /// OIDC config naming `ARGUS_OIDC_ISSUER` as missing, even though the operator
-/// never intended to configure OIDC at all. OIDC intent is judged by the four
-/// genuinely OIDC-specific variables; `ARGUS_PUBLIC_URL` is only folded in
-/// once that intent already exists, matching what `oidc_from_env_values`
-/// itself expects to see for a real "all five" or "some" determination.
+/// never intended to configure OIDC at all. OIDC intent is judged by ANY
+/// `ARGUS_OIDC_*` variable being present -- the four required ones AND the
+/// three optional ones (`ROLES_CLAIM`, `SCOPES`, `CA_CERT`). Leaving the
+/// optional three out of this check would let `ARGUS_OIDC_ROLES_CLAIM=foo`
+/// alone boot with SSO silently off instead of naming the missing required
+/// variables -- the exact "one typo disables SSO for everyone" outcome the
+/// partial-config guard in `oidc_from_env_values` exists to prevent.
+/// `ARGUS_PUBLIC_URL` is only folded in once that intent already exists,
+/// matching what `oidc_from_env_values` itself expects to see for a real
+/// "all five" or "some" determination.
+#[allow(clippy::too_many_arguments)]
 fn public_url_for_oidc(
     issuer: &Option<String>,
     client_id: &Option<String>,
     client_secret: &Option<String>,
     required_role: &Option<String>,
+    roles_claim: &Option<String>,
+    scopes: &Option<String>,
+    ca_cert_path: &Option<String>,
     public_url: &str,
 ) -> Option<String> {
     let oidc_intent = issuer.is_some()
         || client_id.is_some()
         || client_secret.is_some()
-        || required_role.is_some();
+        || required_role.is_some()
+        || roles_claim.is_some()
+        || scopes.is_some()
+        || ca_cert_path.is_some();
     oidc_intent.then(|| public_url.to_string())
 }
 
@@ -215,8 +234,10 @@ fn oidc_from_env_values(
             .map(|(k, _)| *k)
             .unwrap_or("");
         return Err(anyhow::anyhow!(
-            "OIDC is partially configured: {missing} is missing. Set all five \
-             OIDC variables, or none of them to run with only a local admin."
+            "OIDC is partially configured: {missing} is missing. Set all four \
+             ARGUS_OIDC_* variables (ARGUS_OIDC_ISSUER, ARGUS_OIDC_CLIENT_ID, \
+             ARGUS_OIDC_CLIENT_SECRET, ARGUS_OIDC_REQUIRED_ROLE), or none of \
+             them, to run with only a local admin."
         ));
     }
     let take = |k: &str, v: Option<String>| -> Result<String> { reject_empty(k, v.unwrap()) };
@@ -436,7 +457,16 @@ mod tests {
     #[test]
     fn public_url_is_withheld_from_oidc_detection_absent_other_intent() {
         assert_eq!(
-            public_url_for_oidc(&None, &None, &None, &None, "http://localhost:8080"),
+            public_url_for_oidc(
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                &None,
+                "http://localhost:8080"
+            ),
             None
         );
     }
@@ -444,14 +474,45 @@ mod tests {
     /// The moment ANY one OIDC-specific variable is set, intent is real and
     /// `ARGUS_PUBLIC_URL` must be folded back in so a complete config can
     /// still be recognized as complete (and a partial one still names the
-    /// right missing variable).
+    /// right missing variable). Covers all seven `ARGUS_OIDC_*` variables --
+    /// the four required ones AND the three optional ones (`ROLES_CLAIM`,
+    /// `SCOPES`, `CA_CERT`) -- because setting only an optional one (e.g.
+    /// `ARGUS_OIDC_ROLES_CLAIM=foo` with nothing else) must also register as
+    /// OIDC intent, not boot with SSO silently off.
     #[test]
     fn public_url_is_included_once_any_oidc_variable_is_set() {
-        for (issuer, client_id, client_secret, required_role) in [
-            (Some("i".to_string()), None, None, None),
-            (None, Some("c".to_string()), None, None),
-            (None, None, Some("s".to_string()), None),
-            (None, None, None, Some("r".to_string())),
+        for (issuer, client_id, client_secret, required_role, roles_claim, scopes, ca_cert) in [
+            (Some("i".to_string()), None, None, None, None, None, None),
+            (None, Some("c".to_string()), None, None, None, None, None),
+            (None, None, Some("s".to_string()), None, None, None, None),
+            (None, None, None, Some("r".to_string()), None, None, None),
+            (
+                None,
+                None,
+                None,
+                None,
+                Some("groups".to_string()),
+                None,
+                None,
+            ),
+            (
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("openid".to_string()),
+                None,
+            ),
+            (
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                Some("/etc/argus/idp-ca.pem".to_string()),
+            ),
         ] {
             assert_eq!(
                 public_url_for_oidc(
@@ -459,6 +520,9 @@ mod tests {
                     &client_id,
                     &client_secret,
                     &required_role,
+                    &roles_claim,
+                    &scopes,
+                    &ca_cert,
                     "http://localhost:8080"
                 ),
                 Some("http://localhost:8080".to_string())
