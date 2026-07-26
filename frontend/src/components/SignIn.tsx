@@ -77,10 +77,17 @@ export default function SignIn() {
         ) : (
           <>
             {/* Above the form, not below it: the way back is the first thing
-                you should find if you picked this by mistake. */}
+                you should find if you picked this by mistake.
+
+                `self-start` rather than the column's default stretch, so it
+                sizes to its own content -- a full-width Back reads as heavy as
+                the submit button and competes with it. `-ml-2` cancels the
+                ghost variant's own padding so the label lines up with the
+                field labels below rather than sitting inset from them. */}
             <Button
               variant="ghost"
-              className="w-full justify-start"
+              size="sm"
+              className="-ml-2 self-start"
               onClick={() => setStage("choose")}
             >
               <ArrowLeft className="size-3.5" />
