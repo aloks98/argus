@@ -345,15 +345,84 @@ fn removed_cookie(name: &'static str) -> Cookie<'static> {
 /// not an API call), and detail is logged server-side rather than returned
 /// (design doc §14). `message` is always a fixed string this module controls,
 /// never request input, so no escaping is needed.
+/// A standalone HTML page for the auth failures that happen *outside* the SPA.
+///
+/// These are reached by a top-level browser navigation mid-redirect, so the
+/// React bundle and its stylesheet are not in play — the page has to carry its
+/// own styling. The colours below are the same tokens `frontend/src/index.css`
+/// defines (`--background`, `--foreground`, `--muted-foreground`, `--border`,
+/// `--primary`, `--destructive`), inlined rather than imported, and the
+/// `prefers-color-scheme` block mirrors the app's `.dark` values so this does
+/// not flash white on a product that is dark by default.
+///
+/// Duplicating six hex values is the deliberate trade: the alternative is
+/// serving a stylesheet to unauthenticated callers purely for error states, and
+/// these values change roughly never. `--radius: 0rem` is why nothing here is
+/// rounded — square corners are the identity, not an oversight.
 fn error_page(status: StatusCode, message: &str) -> Response {
+    // The heading follows the status, because not every one of these is a
+    // failed sign-in: a 404 is "this server has no SSO configured", which is a
+    // statement about the deployment rather than about the attempt.
+    let heading = match status {
+        StatusCode::NOT_FOUND => "Not available",
+        StatusCode::SERVICE_UNAVAILABLE => "Temporarily unavailable",
+        _ => "Sign-in failed",
+    };
     let body = format!(
         r#"<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Sign-in failed - Argus</title></head>
-<body style="font-family: system-ui, sans-serif; max-width: 32rem; margin: 4rem auto; padding: 0 1rem; color: #222;">
-<h1>Sign-in failed</h1>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{heading} — Argus</title>
+<style>
+  :root {{
+    --bg: #FFFFFF; --fg: #0A0A0B; --muted: #6B6B70;
+    --border: #D4D4D8; --accent: #14161A; --alert: #FF1744;
+  }}
+  @media (prefers-color-scheme: dark) {{
+    :root {{
+      --bg: #000000; --fg: #F5F5F5; --muted: #8A8A8A;
+      --border: #242424; --accent: #FFE600; --alert: #FF1744;
+    }}
+  }}
+  * {{ box-sizing: border-box; }}
+  body {{
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 1.5rem; padding: 1.5rem;
+    background: var(--bg); color: var(--fg);
+    font-family: ui-monospace, "IBM Plex Mono", SFMono-Regular, Menlo, monospace;
+  }}
+  .mark {{
+    font-size: 1.5rem; letter-spacing: 0.16em; font-weight: 800;
+  }}
+  .panel {{
+    width: 100%; max-width: 24rem; border: 1px solid var(--border);
+    border-left: 3px solid var(--alert); padding: 1rem 1.25rem;
+  }}
+  h1 {{
+    margin: 0 0 0.5rem; font-size: 0.6875rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.16em; color: var(--alert);
+  }}
+  p {{ margin: 0; font-size: 0.8125rem; line-height: 1.5; }}
+  nav {{ display: flex; gap: 1.25rem; }}
+  a {{
+    color: var(--muted); font-size: 0.6875rem; text-transform: uppercase;
+    letter-spacing: 0.16em; text-decoration: none; text-underline-offset: 2px;
+  }}
+  a:hover {{ color: var(--fg); text-decoration: underline; }}
+</style>
+</head>
+<body>
+<div class="mark">ARGUS</div>
+<div class="panel">
+<h1>{heading}</h1>
 <p>{message}</p>
-<p><a href="/auth/login">Try again</a></p>
+</div>
+<nav>
+<a href="/auth/login">Try again</a>
+<a href="/">Back to sign-in</a>
+</nav>
 </body>
 </html>"#
     );
