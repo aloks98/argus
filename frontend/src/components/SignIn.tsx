@@ -7,6 +7,12 @@ import {
   Alert,
   AlertDescription,
   AlertTitle,
+  Breadcrumb,
+  BreadcrumbItem,
+  BreadcrumbLink,
+  BreadcrumbList,
+  BreadcrumbPage,
+  BreadcrumbSeparator,
   Button,
   Field,
   FieldError,
@@ -15,7 +21,6 @@ import {
   Input,
   Spinner,
 } from "@e412/rnui-react";
-import { ArrowLeft } from "lucide-react";
 import { RateLimited, localLogin } from "../api";
 
 /**
@@ -51,7 +56,7 @@ export default function SignIn() {
       <div className="text-center">
         <div className="font-display text-2xl tracking-widest">ARGUS</div>
         <p className="mt-2 font-mono text-[11px] uppercase tracking-widest text-muted-foreground">
-          {stage === "choose" ? "Sign in to continue" : "Local account"}
+          Sign in to continue
         </p>
       </div>
 
@@ -76,23 +81,31 @@ export default function SignIn() {
           </>
         ) : (
           <>
-            {/* Above the form, not below it: the way back is the first thing
-                you should find if you picked this by mistake.
+            {/* A breadcrumb rather than a Back button: it says where you are
+                as well as how to leave, and a button here read as heavy as the
+                submit button below it -- two equally-weighted controls in a
+                form with one action.
 
-                `self-start` rather than the column's default stretch, so it
-                sizes to its own content -- a full-width Back reads as heavy as
-                the submit button and competes with it. `-ml-2` cancels the
-                ghost variant's own padding so the label lines up with the
-                field labels below rather than sitting inset from them. */}
-            <Button
-              variant="ghost"
-              size="sm"
-              className="-ml-2 self-start"
-              onClick={() => setStage("choose")}
-            >
-              <ArrowLeft className="size-3.5" />
-              Back
-            </Button>
+                `render` puts a real <button> inside BreadcrumbLink, because
+                this navigates component state rather than a URL; an <a> with
+                no href would be neither focusable nor announced as a control.
+                Same markup shape as MachineDetailPage's breadcrumb otherwise. */}
+            <Breadcrumb>
+              <BreadcrumbList className="font-mono text-[11px]">
+                <BreadcrumbItem>
+                  <BreadcrumbLink
+                    render={<button type="button" onClick={() => setStage("choose")} />}
+                    className="text-muted-foreground underline-offset-2 hover:underline"
+                  >
+                    Sign in
+                  </BreadcrumbLink>
+                </BreadcrumbItem>
+                <BreadcrumbSeparator />
+                <BreadcrumbItem>
+                  <BreadcrumbPage>Local account</BreadcrumbPage>
+                </BreadcrumbItem>
+              </BreadcrumbList>
+            </Breadcrumb>
             <LocalSignInForm />
           </>
         )}
