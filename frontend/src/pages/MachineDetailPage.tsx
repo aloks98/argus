@@ -32,6 +32,7 @@ import ContainersCard from "../components/ContainersCard";
 import LogDialog from "../components/LogDialog";
 import LogFilterBar from "../components/LogFilterBar";
 import LogViewer from "../components/LogViewer";
+import MachineIdentity from "../components/MachineIdentity";
 import SpecStrip from "../components/SpecStrip";
 import type { SpecItem } from "../components/SpecStrip";
 import StatusBadge from "../components/StatusBadge";
@@ -41,6 +42,7 @@ import type { ChartSeries } from "../components/TimeSeriesChart";
 import UnitsCard from "../components/UnitsCard";
 import { BOOT_LOGS, CAP_DOCKER, CAP_JOURNAL, CAP_SYSTEMD, SYSTEM_JOURNAL } from "../api";
 import { cn } from "../lib/cn";
+import { displayName } from "../lib/fleet";
 import { useLogFilters } from "../lib/logFilters";
 import { formatBytesPerSec, formatRelative } from "../lib/format";
 import {
@@ -269,9 +271,25 @@ export default function MachineDetailPage() {
           </BreadcrumbList>
         </Breadcrumb>
 
-        <h1 className="mt-2 mb-3 font-display text-2xl uppercase tracking-tight">
-          {machine.hostname}
+        {/* Renamed machines show the operator-set name as the headline, with
+            the hostname demoted to a muted mono line beneath — same pairing
+            FleetPage's Name column uses (AssetTag + hostname), so a renamed
+            machine reads the same way whether you're scanning the fleet
+            table or looking at its detail page. Un-renamed machines (the
+            common case) show just the hostname, unchanged from before. */}
+        <h1
+          className={cn(
+            "mt-2 font-display text-2xl uppercase tracking-tight",
+            machine.display_name === null && "mb-3",
+          )}
+        >
+          {displayName(machine)}
         </h1>
+        {machine.display_name !== null && (
+          <p className="mt-0.5 mb-3 font-mono text-[11px] text-muted-foreground">
+            {machine.hostname}
+          </p>
+        )}
 
         <SpecStrip items={specItems} />
       </div>
@@ -326,7 +344,9 @@ export default function MachineDetailPage() {
         )}
 
         <TabsContent value="overview" className="mt-4">
-          <div className="flex flex-wrap items-center justify-between gap-2">
+          <MachineIdentity machine={machine} />
+
+          <div className="mt-6 flex flex-wrap items-center justify-between gap-2">
             <h2 className="font-display text-sm uppercase tracking-widest">Metrics</h2>
             <ButtonGroup>
               {RANGES.map((r) => (

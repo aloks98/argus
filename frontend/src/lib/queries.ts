@@ -13,9 +13,10 @@ import {
   getMachine,
   getMetrics,
   getSystemd,
+  patchMachine,
   unitAction,
 } from "../api";
-import type { ContainerAction, UnitAction } from "../api";
+import type { ContainerAction, MachinePatchBody, UnitAction } from "../api";
 
 /** Polling cadences (ms). Fleet is the scan view, so it refreshes faster. */
 const FLEET_INTERVAL = 5_000;
@@ -45,6 +46,27 @@ export function useMachine(id: string) {
     queryKey: qk.machine(id),
     queryFn: () => getMachine(id),
     refetchInterval: MACHINE_INTERVAL,
+  });
+}
+
+/**
+ * Identity edits (display name, tags, notes) — Task 8's `MachineIdentity`
+ * card. Unlike the verb mutations below, success writes the server's
+ * refreshed `MachineDetail` straight into the cache rather than
+ * invalidating: `patchMachine` already returns the authoritative post-write
+ * row (server-normalized tags included), so a direct cache write skips a
+ * redundant refetch. The fleet list can't be patched the same way (its rows
+ * are `FleetRow`, a different shape) so that one is just invalidated — it
+ * also refetches on its own 5s interval regardless.
+ */
+export function useUpdateMachine(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (patch: MachinePatchBody) => patchMachine(id, patch),
+    onSuccess: (data) => {
+      qc.setQueryData(qk.machine(id), data);
+      void qc.invalidateQueries({ queryKey: qk.fleet });
+    },
   });
 }
 
