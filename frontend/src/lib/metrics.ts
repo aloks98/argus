@@ -12,10 +12,10 @@ export function buildCpuSeries(points: MetricPoint[]): ChartPoint[] {
     .map((p) => ({ ts: p.ts, value: p.cpu_pct! }));
 }
 
-// Absolute bytes used, not a derived percentage (user decision: "%" hid the
-// real numbers). Total is effectively constant per machine, so the chart
-// shape is identical to the old percent series — only the axis becomes
-// meaningful. Points missing the counter are skipped rather than plotted as 0.
+// Absolute bytes used, not a derived percentage — a percentage hides the real
+// numbers. Total is effectively constant per machine, so the chart shape is
+// the same either way; only the axis becomes meaningful. Points missing the
+// counter are skipped rather than plotted as 0.
 export function buildMemUsedSeries(points: MetricPoint[]): ChartPoint[] {
   return points
     .filter((p) => p.mem_used !== null)

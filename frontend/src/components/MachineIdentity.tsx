@@ -1,7 +1,7 @@
 // Identity editing for one machine: display name, tags, notes. All three
 // commit through PATCH /api/machines/:id with an explicit Save — nothing
-// saves on blur, so a stray edit can't persist silently (design "Machine
-// detail"). Tags use an autocomplete-suggested free-text input with the
+// saves on blur, so a stray edit can't persist silently. Tags use an
+// autocomplete-suggested free-text input with the
 // fleet-wide vocabulary as suggestions; free entry stays allowed (this is a
 // free-form tag field, not a curated list) — see the note on `TagsField`
 // below for why this isn't rnui's Combobox chips surface.
@@ -105,8 +105,8 @@ export default function MachineIdentity({
     // No Card here — this component is dialog-only (MachineDetailPage.tsx
     // mounts it inside DialogContent, which already supplies the frame and
     // the visible heading via DialogTitle/DialogDescription). A Card wrapper
-    // previously nested its own border inside the dialog's, rendering as a
-    // visible double border.
+    // would nest its own border inside the dialog's, rendering as a visible
+    // double border.
     <>
       {mutation.error !== null && (
         <Alert variant="destructive" className="mb-4">
@@ -201,40 +201,26 @@ export default function MachineIdentity({
 }
 
 /**
- * A tags chip field built from `Badge` + rnui's `Autocomplete` rather than
- * `Combobox`'s chips surface (`ComboboxChips`/`ComboboxChipsInput`).
- *
- * Why: `Combobox`'s multi-select chips are built on selecting *items from
- * `items`* — base-ui's own docs (`@base-ui/react/docs/react/components/
- * combobox.md`, "Creatable items") show that committing text which doesn't
- * match any item requires a bespoke creation flow (a confirmation `Dialog`,
- * a `creatable` sentinel item, pending-query plumbing) — there's no
- * `freeSolo`-style prop. That's real weight for a field whose whole point is
- * "type anything, autocomplete is just a shortcut," and it's not
- * verifiable from types alone — the compiled-probe lesson this task calls
- * out.
- *
- * `Autocomplete.Root` is the better fit for that exact job: `value` IS the
- * raw input text (no selection model to fight), `items` only drive the
- * suggestion popup, and free text is the default rather than an opt-in.
- * Base UI's `AutocompleteRoot` defaults `fillInputOnItemPress: true`
- * (verified in the compiled `AutocompleteRoot.mjs`, not just the `.d.ts`),
- * so picking a suggestion fires `onValueChange` with `reason: "item-press"` —
- * that's the signal this component uses to commit immediately.
+ * A tags chip field built from `Badge` + rnui's `Autocomplete`, not
+ * `Combobox`'s chips surface: `Combobox`'s multi-select chips select *items
+ * from `items`* and have no `freeSolo`-style prop, so committing arbitrary
+ * typed text needs a bespoke creation flow — too much weight for a field
+ * whose whole point is "type anything, autocomplete is just a shortcut."
+ * `Autocomplete.Root` fits instead: `value` IS the raw input text, `items`
+ * only drive the suggestion popup, and free text is the default. Base UI's
+ * `AutocompleteRoot` defaults `fillInputOnItemPress: true`, so picking a
+ * suggestion fires `onValueChange` with `reason: "item-press"` — the signal
+ * this component uses to commit immediately.
  *
  * Enter must never commit something other than what's visibly
  * highlighted/typed, so this does NOT unconditionally intercept Enter.
  * `ComboboxInput.js` (which `Autocomplete.Input` is built on) already does
- * exactly the right thing on its own: when an item is highlighted it calls
- * `stopEvent` and clicks that item (firing the `item-press` path above); when
- * nothing is highlighted its own comment says "Allow form submission when no
- * item is highlighted" and it deliberately does NOT preventDefault. So this
- * component only needs to cover that second case — commit the raw typed text
- * and preventDefault so Enter doesn't submit the surrounding form — and
- * tracks "is anything highlighted right now" itself via `onItemHighlighted`
- * (a ref, not state: it has to be current at the moment the Enter keydown is
- * read, not delayed a render). When a highlight exists, this component's
- * `onKeyDown` does nothing at all and lets Base UI's own path run.
+ * the right thing alone: with an item highlighted it selects it (firing the
+ * `item-press` path above); with nothing highlighted it deliberately does
+ * NOT preventDefault, to allow form submission. So this component only
+ * covers that second case — commit the raw typed text and preventDefault —
+ * tracking "is anything highlighted" itself via `onItemHighlighted` (a ref,
+ * not state: it must be current at the moment the Enter keydown is read).
  */
 function TagsField({
   id,
@@ -322,12 +308,8 @@ function TagsField({
           placeholder="Add a tag…"
           aria-invalid={invalid}
           onKeyDown={(e) => {
-            // Only handle Enter ourselves when NOTHING is highlighted.
-            // When something IS highlighted, do nothing here — Base UI's own
-            // Enter handling (in ComboboxInput.js) selects it, which fires
-            // `onValueChange` with reason "item-press" above. Committing the
-            // raw `query` in that case would add whatever's literally typed
-            // instead of the visibly-selected suggestion.
+            // Only handle Enter when nothing is highlighted — see this
+            // component's doc comment above for why.
             if (e.key === "Enter" && highlightedRef.current === undefined) {
               e.preventDefault();
               commit(query);

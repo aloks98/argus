@@ -1,7 +1,7 @@
-// The Enroll page (fleet-identity slice, Task 9): mint a join token for a new
-// agent, show the raw secret exactly once, and manage existing tokens
-// (usage/expiry/revoke). Mirrors SignIn.tsx's form structure (react-hook-form
-// + zod via Controller + rnui Field/FieldLabel/FieldError, `noValidate`).
+// The Enroll page: mint a join token for a new agent, show the raw secret
+// exactly once, and manage existing tokens (usage/expiry/revoke). Mirrors
+// SignIn.tsx's form structure (react-hook-form + zod via Controller + rnui
+// Field/FieldLabel/FieldError, `noValidate`).
 import { useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm } from "react-hook-form";
@@ -55,7 +55,6 @@ import { formatRelative } from "../lib/format";
 import { useEnrollmentTokens, useMintToken, useRevokeToken } from "../lib/queries";
 import { tokenState, tokenTone } from "../lib/status";
 
-/** Given verbatim by the brief. */
 const mintSchema = z.object({
   name: z.string().min(1, "Enter a label.").max(64, "At most 64 characters."),
   display_name: z.string().max(64, "At most 64 characters.").optional(),
@@ -88,22 +87,18 @@ function toMintBody(values: MintFormValues): MintTokenBody {
     name: values.name.trim(),
     ...(display_name ? { display_name } : {}),
     tags,
-    // Sent explicitly either way — an explicit 1/24 rather than an absent
-    // field, since the form always has a value here. The server treats
-    // "absent" and "explicit default" identically for the non-null case, so
-    // this is only observable in the unlimited/never-expires branch, where
-    // the explicit `null` is what actually means unlimited/never.
+    // Sent explicitly either way: the server treats absent and explicit-default
+    // the same for non-null values, but explicit `null` is what means
+    // unlimited/never — only observable in the unlimited/never-expires branch.
     max_uses: values.unlimited_uses ? null : (values.max_uses ?? 1),
     expires_in_hours: values.never_expires ? null : (values.expires_in_hours ?? 24),
   };
 }
 
 export default function EnrollPage() {
-  // Owns the one `useMintToken()` instance and both dialogs' open state at
-  // the page level — the "Mint a token" trigger lives in PageHeader's
-  // `actions` slot (browser-review: "move it into the header, far right"),
-  // a sibling of `MintDialogs` rather than a descendant, so nothing here can
-  // live inside a single subtree the way it used to.
+  // Owns the one `useMintToken()` instance and both dialogs' open state at the
+  // page level — the "Mint a token" trigger lives in PageHeader's `actions`
+  // slot, a sibling of `MintDialogs` rather than a descendant.
   const mintMutation = useMintToken();
   const [mintOpen, setMintOpen] = useState(false);
   const [resultOpen, setResultOpen] = useState(false);
@@ -138,15 +133,14 @@ export default function EnrollPage() {
 }
 
 /**
- * The two mint dialogs (form + result) only — the "Mint a token" trigger
- * that used to open them from here now lives in PageHeader's actions slot.
- * State (including the shared `useMintToken()` mutation) is owned by
- * `EnrollPage` and threaded down as props so the header button and these
- * dialogs — no longer in the same subtree — stay in sync without a portal.
- * The mutation still has to live above whichever dialog is currently
- * mounted so `mintMutation.data` survives the form dialog closing (its
- * content, `MintTokenForm`, unmounts on close — see the Dialog below) long
- * enough for the result dialog to read it.
+ * The two mint dialogs (form + result) only — the "Mint a token" trigger lives
+ * in PageHeader's `actions` slot. State (including the shared `useMintToken()`
+ * mutation) is owned by `EnrollPage` and threaded down as props so the header
+ * button and these dialogs, not in the same subtree, stay in sync without a
+ * portal. The mutation must live above whichever dialog is mounted so
+ * `mintMutation.data` survives the form dialog closing (`MintTokenForm`
+ * unmounts on close — see the Dialog below) long enough for the result dialog
+ * to read it.
  */
 function MintDialogs({
   mintMutation,
@@ -191,49 +185,30 @@ function MintDialogs({
         </DialogContent>
       </Dialog>
 
-      {/* Dialog 2: the result. The raw token is shown exactly once (design
-          "Enroll page") — an accidental Esc or outside click must not eat
-          it, so this is an AlertDialog with an `onOpenChange` guard on top,
-          not a plain Dialog:
-            - AlertDialog forces `disablePointerDismissal` internally
-              (base-ui's `useRenderDialogRoot`: `isAlertDialog ||
-              disablePointerDismissalProp`), which already blocks
-              outside-press.
-            - Escape is NOT gated by that same flag, though — base-ui's
-              dismiss wiring (`useDialogRoot`'s `DialogInteractions`) passes
-              `escapeKey: isTopmost` unconditionally to `useDismiss`, so an
-              AlertDialog closes on Escape exactly like a plain Dialog unless
-              something cancels the attempt. Verified by reading both
-              `useDialogRoot.js` and `useDismiss.js` in
-              `@base-ui/react` — this is not the "AlertDialog blocks Escape
-              too" behavior it's easy to assume from the name.
-          The guard below calls `eventDetails.cancel()` for every close
-          attempt, which base-ui checks *before* touching its own open state
-          (`applyPopupOpenChange`: `onOpenChange` runs, then `if
-          (eventDetails.isCanceled) return;`), so a canceled Escape/outside
+      {/* Dialog 2: the result. The raw token is shown exactly once, so an
+          accidental Esc or outside click must not close it — hence AlertDialog
+          (which blocks outside-press via `disablePointerDismissal`) plus an
+          `onOpenChange` guard that cancels every close attempt: AlertDialog does
+          NOT block Escape on its own, easy to assume from the name but base-ui
+          only gates outside-press that way. Canceling in `onOpenChange` runs
+          before base-ui touches its own open state, so a canceled Escape/outside
           press never starts an exit transition — no flicker back open. The
-          "Done" button below sets `resultOpen` directly, which changes the
-          controlled `open` prop rather than going through this dismiss flow
-          at all, so it's the only path that actually closes the dialog. */}
+          "Done" button sets `resultOpen` directly instead, bypassing this guard
+          entirely, so it's the only path that actually closes the dialog. */}
       <AlertDialog
         open={resultOpen}
         onOpenChange={(open, eventDetails) => {
           if (!open) eventDetails.cancel();
         }}
       >
-        {/* `AlertDialogContent`'s own width classes are
-            `data-[size=default]:max-w-xs data-[size=sm]:max-w-xs
-            data-[size=default]:sm:max-w-sm` — a compound `data-[size=...]`
-            modifier chain, not the plain `sm:` chain a Dialog's width classes
-            use. A bare `sm:max-w-lg` override (what this used to say) has a
-            *different* modifier chain, so tailwind-merge can't tell it
-            conflicts with the base and won't dedupe it — both classes ship,
-            and which one wins is down to stylesheet emission order, not
-            source order (this is the cascade trap docs/DEV.md's frontend
-            design-system section calls out: "write your override with the
-            same modifier the base uses"). Spelled with the matching
-            `data-[size=default]:` chain here so tailwind-merge actually
-            drops the base and this wins deterministically. */}
+        {/* `AlertDialogContent`'s own width classes use a compound
+            `data-[size=default]:...` modifier chain, not a plain `sm:` chain — an
+            override like `sm:max-w-lg` uses a different chain, so tailwind-merge
+            can't tell it conflicts with the base and won't dedupe it; both classes
+            ship and stylesheet emission order (not source order) decides which
+            wins (the cascade trap docs/DEV.md's frontend design-system section
+            calls out). Match the base's `data-[size=default]:` chain here so
+            tailwind-merge drops the base and this wins deterministically. */}
         <AlertDialogContent className="data-[size=default]:max-w-sm data-[size=default]:sm:max-w-2xl">
           <AlertDialogHeader>
             <AlertDialogTitle>Token minted</AlertDialogTitle>
@@ -484,13 +459,12 @@ function MintTokenForm({
 }
 
 function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
-  // `--config` reads the same four keys from an env-file (`KEY=VALUE` per
-  // line — a subset of systemd's `EnvironmentFile=` syntax) instead of the
-  // process environment (docs/DEV.md, "Enroll an agent" § Alternative). That
-  // file survives a reboot, unlike the old `sudo -n env VAR=... ./argus-agent`
-  // one-shot, and doubles as a systemd unit's `EnvironmentFile=` unchanged
-  // later — the reason this block writes the file first rather than passing
-  // the same four values as env vars directly.
+  // `--config` reads the same four keys from an env-file (`KEY=VALUE` per line
+  // — a subset of systemd's `EnvironmentFile=` syntax) instead of the process
+  // environment (docs/DEV.md, "Enroll an agent" § Alternative). The file
+  // survives a reboot and doubles unchanged as a systemd unit's
+  // `EnvironmentFile=` later — why this block writes the file first rather
+  // than passing the four values as env vars directly.
   const runBlock = [
     "sudo tee /etc/argus/agent.env <<'EOF'",
     "ARGUS_AGENT_ENDPOINT=https://<agent-endpoint>:9443",
@@ -510,16 +484,13 @@ function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
     // renders inside the result AlertDialog, which already supplies the
     // frame and the "Token minted" heading via AlertDialogHeader.
     //
-    // `min-w-0` here (and `max-w-full` on the boxes below) so this column
-    // can never force the dialog wider than its own `max-w-*` — a flex/grid
-    // item's default min-width is its content's intrinsic width, which for
-    // an unbroken string (the raw token) or a code block is wide enough to
-    // blow past the panel and overflow it regardless of how the dialog
-    // itself is sized. `CodeBlock` already wraps its code in its own
-    // `overflow-x-auto` div and gives its outer wrapper `overflow-hidden`
-    // (see @e412/rnui-react's code-block.tsx), which is the other standard
-    // fix for this same problem, so the command block below doesn't need a
-    // second scrolling wrapper on top of it.
+    // `min-w-0` here (and `max-w-full` on the boxes below) stops this column
+    // forcing the dialog wider than its own `max-w-*`: a flex/grid item's
+    // default min-width is its content's intrinsic width, and an unbroken
+    // token string or code block is wide enough to overflow the panel
+    // regardless of dialog sizing. `CodeBlock` already wraps its code in
+    // `overflow-x-auto` with `overflow-hidden` on its outer wrapper, so the
+    // command block below doesn't need a second scrolling wrapper.
     <div className="flex min-w-0 flex-col gap-4">
       <div className="flex max-w-full items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2">
         <code className="min-w-0 flex-1 select-all break-all font-mono text-sm">

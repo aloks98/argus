@@ -53,8 +53,7 @@ export default function CommandPalette({
           useSyncExternalStore(store.subscribe, ...) — with no root, store is
           undefined and the first open throws "Cannot read properties of
           undefined (reading 'subscribe')", unmounting the entire app to a
-          black page. Verified against rnui's compiled $i/CommandDialog and
-          cmdk's source; there is no type error either way, only the crash. */}
+          black page. There is no type error either way, only the crash. */}
       <Command>
         <CommandInput placeholder="Jump to a machine…" />
         <CommandList>

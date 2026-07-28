@@ -153,14 +153,14 @@ export default function UnitsCard({
         </div>
       </form>
 
-      {/* 129 units is a very tall table, and without a height bound the page
-          takes the scroll — the machine header, tabs and filter all disappear
-          while you're reading rows, and you lose the column headers too.
-          The cap has to go on rnui's OWN `data-slot="table-container"` (its
-          `overflow-x-auto` already makes it the scroll container; a wrapper
-          here would just nest a second one, and `sticky` would then resolve
-          against the inner container and never move). With the height on that
-          element, the header below can stick to it. */}
+      {/* A tall table needs a height bound, or the page takes the scroll — the
+          machine header, tabs and filter all disappear while you're reading
+          rows, and the column headers go too. The cap has to go on rnui's OWN
+          `data-slot="table-container"` (its `overflow-x-auto` already makes it
+          the scroll container; a wrapper here would nest a second one, and
+          `sticky` would then resolve against the inner container and never
+          move). With the height on that element, the header below can stick
+          to it. */}
       <div className="border border-border [&>[data-slot=table-container]]:max-h-[65vh]">
         {units.length === 0 ? (
           <EmptyState
@@ -183,7 +183,7 @@ export default function UnitsCard({
                 {/* Hidden on phones with the same reasoning as Sub/Description: the
                     AssetTag's tone already encodes active-vs-failed, and the
                     ~110px this column costs is exactly what pushed Restart off
-                    a 390px screen (measured). */}
+                    a 390px screen. */}
                 <TableHead className="hidden md:table-cell">Active</TableHead>
                 <TableHead className="hidden md:table-cell">Sub</TableHead>
                 <TableHead className="hidden md:table-cell">Description</TableHead>

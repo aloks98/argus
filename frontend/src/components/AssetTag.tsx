@@ -6,10 +6,11 @@ import { cn } from "../lib/cn";
  * A hostname (or container name) rendered as a solid stencilled asset tag whose
  * fill is its status — the design's signature element.
  *
- * Built on rnui's `Badge`. Text colour is black on every fill, verified against
- * WCAG AA 4.5:1: ok #00E676 12.58:1 · warn #FF6D00 7.44:1 · fail #FF1744 5.46:1 ·
- * idle #8A8A8A 6.08:1. (White on fail would be only 3.85:1 — saturated reds read
- * better with black.) `Badge`'s own `success`/`warning`/`destructive` variants
+ * Built on rnui's `Badge`. Text colour is black on every fill: WCAG AA requires
+ * 4.5:1, and black clears it on every fill — ok #00E676 12.58:1 · warn #FF6D00
+ * 7.44:1 · fail #FF1744 5.46:1 · idle #8A8A8A 6.08:1. (White on fail would be
+ * only 3.85:1 — saturated reds read better with black.) `Badge`'s own
+ * `success`/`warning`/`destructive` variants
  * render white text (`text-white`), so `text-black` is forced via `className` on
  * every tone to hold that contrast rule regardless of the base variant's default.
  * `idle` additionally forces its theme-invariant `--idle` fill rather than relying

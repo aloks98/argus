@@ -1,5 +1,5 @@
-// The machine detail page (Metrics slice, Task 9). Polls GET /api/machines/:id
-// and GET /api/machines/:id/metrics?range=... every 10s and renders a header
+// The machine detail page. Polls GET /api/machines/:id and GET
+// /api/machines/:id/metrics?range=... every 10s and renders a header
 // (hostname/os/ip/status/tags/last-seen) plus cpu%/mem%/load1/net-rate charts
 // for the selected time range, tabbed against the container list. Mirrors
 // FleetPage's polling idioms.
@@ -126,8 +126,6 @@ export default function MachineDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [range, setRange] = useState<Range>("1h");
 
-  // The identity editor lives in a Dialog, not inline in the Overview tab
-  // (Task 8 fix round 1 — the user rejected the inline-card placement).
   const [editOpen, setEditOpen] = useState(false);
 
   // The active tab lives in the URL (`?tab=units`) rather than component state,
@@ -268,10 +266,9 @@ export default function MachineDetailPage() {
   // page and SystemCard read the inventory/resource fields added this slice.
   const uptime = machine.boot_time != null ? formatUptime(machine.boot_time) : "";
 
-  // Slimmed to five items (live review: the nine-item version was too
-  // crowded) — Kernel/Arch/Agent/Processor/Virtualization/Disk/Memory/Swap
-  // moved to the System tab (SystemCard). Uptime stays: tiny and ops-useful
-  // at a glance.
+  // Five items only — Kernel/Arch/Agent/Processor/Virtualization/Disk/Memory/Swap
+  // moved to the System tab (SystemCard). Uptime stays: tiny and ops-useful at a
+  // glance.
   const specItems: SpecItem[] = [
     {
       label: "Status",
@@ -310,22 +307,19 @@ export default function MachineDetailPage() {
           </BreadcrumbList>
         </Breadcrumb>
 
-        {/* Renamed machines show the operator-set name as the headline, with
-            the hostname demoted to a muted mono line beneath — same pairing
-            FleetPage's Name column uses (AssetTag + hostname), so a renamed
-            machine reads the same way whether you're scanning the fleet
-            table or looking at its detail page. Un-renamed machines (the
-            common case) show just the hostname, unchanged from before. The
-            Edit control sits in this same row rather than in SpecStrip —
-            editing identity isn't "a fact about the machine" the way OS/IP/
-            kernel are.
+        {/* Renamed machines show the operator-set name as the headline, with the
+            hostname demoted to a muted mono line beneath — same pairing FleetPage's
+            Name column uses (AssetTag + hostname), so a renamed machine reads the
+            same way in the fleet table and on its detail page. Un-renamed machines
+            show just the hostname. The Edit control sits in this row rather than in
+            SpecStrip — editing identity isn't "a fact about the machine" the way
+            OS/IP/kernel are.
 
-            Tags live here too, as chips, rather than comma-joined in
-            SpecStrip (browser-review decision) — same `Badge
-            variant="outline"` FleetPage's Tags column uses, so a machine's
-            tags read identically whether you're scanning the fleet table or
-            its own detail page. Omitted entirely when the machine has none,
-            same as every other conditional line in this block. */}
+            Tags live here too, as chips, rather than comma-joined in SpecStrip —
+            same `Badge variant="outline"` FleetPage's Tags column uses, so a
+            machine's tags read identically in both places. Omitted entirely when
+            the machine has none, same as every other conditional line in this
+            block. */}
         <div className="mt-2 mb-3">
           <div className="flex flex-wrap items-center gap-3">
             <h1 className="font-display text-2xl uppercase tracking-tight">
@@ -355,19 +349,18 @@ export default function MachineDetailPage() {
         <SpecStrip items={specItems} />
       </div>
 
-      {/* Identity editing lives in a Dialog rather than inline on the page
-          (Task 8 fix round 1) — LogDialog is the in-repo precedent for a
-          Dialog whose content depends on this page's own state/params.
-          `MachineIdentity` itself is otherwise unchanged by this; only its
-          host is — `onSaved` is the one seam added so the dialog can close
-          itself on a successful PATCH, while staying open on a validation/
-          server error so the Alert inside it is visible.
+      {/* Identity editing lives in a Dialog rather than inline on the page —
+          LogDialog is the in-repo precedent for a Dialog whose content depends on
+          this page's own state/params. `MachineIdentity` itself is otherwise
+          unchanged by this; only its host is — `onSaved` is the one seam added so
+          the dialog can close itself on a successful PATCH, while staying open on
+          a validation/server error so the Alert inside it is visible.
 
-          The dialog owns the ONE heading (Task 8 fix round 2): `MachineIdentity`
-          no longer renders its own Card/CardHeader — nesting a bordered Card
-          inside DialogContent's own bordered popup rendered as a visible
-          double border, and two headings ("Identity" from the Card, an
-          sr-only one here) was one too many anyway. */}
+          The dialog owns the ONE heading: `MachineIdentity` no longer renders its
+          own Card/CardHeader — nesting a bordered Card inside DialogContent's own
+          bordered popup renders as a visible double border, and two headings
+          ("Identity" from the Card, an sr-only one here) would be one too many
+          anyway. */}
       <Dialog open={editOpen} onOpenChange={setEditOpen}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
@@ -387,18 +380,17 @@ export default function MachineDetailPage() {
               disabled={t.disabled}
               title={t.reason}
               aria-describedby={t.disabled && t.reason ? `tab-reason-${t.key}` : undefined}
-              // Only the selected colour is overridden — rnui's sizing, spacing
-              // and disabled treatment are kept.
+              // Only the selected colour is overridden — rnui's sizing, spacing and
+              // disabled treatment are kept.
               //
-              // The `dark:` copies are NOT redundant. rnui's base carries BOTH
-              // `data-active:bg-background` AND `dark:data-active:bg-input/30`.
-              // tailwind-merge only dedupes classes whose modifier chains match,
-              // so a bare `data-active:bg-primary` beats the first and loses to
-              // the second — the override would work in light mode and silently
-              // do nothing in dark. The tokens themselves already flip per mode
-              // (`--primary` is hazard yellow in dark, near-black in light), so
-              // the same utility is correct in both; it just has to be spelled
-              // once per modifier chain the library uses.
+              // The `dark:` copies are NOT redundant: rnui's base carries both
+              // `data-active:bg-background` and `dark:data-active:bg-input/30`, and
+              // tailwind-merge only dedupes classes whose modifier chains match — a
+              // bare `data-active:bg-primary` beats the first but loses to the
+              // second, so it would work in light mode and silently do nothing in
+              // dark. The tokens already flip per mode, so the same utility is
+              // correct in both; it just has to be spelled once per modifier chain
+              // the library uses.
               className={cn(
                 "data-active:bg-primary data-active:text-primary-foreground",
                 "dark:data-active:bg-primary dark:data-active:text-primary-foreground",
@@ -536,11 +528,11 @@ export default function MachineDetailPage() {
         </TabsContent>
 
         <TabsContent value="logs" className="mt-4">
-          {/* The sizing chain lives on this inner div, not on TabsContent.
-              LazyLog is virtua-backed and derives its height from its parent,
-              so it collapses to zero rows if any link in the chain does not
-              resolve to a real height — putting the flex column on the panel
-              itself left the viewer rendered but empty. */}
+          {/* The sizing chain lives on this inner div, not on TabsContent. LazyLog
+              is virtua-backed and derives its height from its parent, so it
+              collapses to zero rows if any link in the chain does not resolve to a
+              real height — putting the flex column on the panel itself renders the
+              viewer but leaves it empty. */}
           <div className="flex h-[70vh] min-h-0 flex-col">
             <LogFilterBar value={logFilters} onChange={setLogFilters} />
             <div className="min-h-0 flex-1">

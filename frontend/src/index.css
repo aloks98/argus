@@ -197,10 +197,10 @@
   font-weight: var(--shiki-dark-font-weight);
 }
 
-/* uPlot legend, restyled to the app's idiom (user-reported: the stock
-   legend looked foreign). uPlot renders it as table.u-legend.u-inline when
-   `live: false`; markers carry the series stroke as an inline border color,
-   so only shape/size/typography are overridden here. */
+/* uPlot legend, restyled to the app's idiom. uPlot renders it as
+   table.u-legend.u-inline when `live: false`; markers carry the series
+   stroke as an inline border color, so only shape/size/typography are
+   overridden here. */
 table.u-legend.u-inline {
   margin-top: 0.5rem;
 }

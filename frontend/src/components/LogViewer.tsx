@@ -79,20 +79,16 @@ export default function LogViewer({
     setAnchorLine(undefined);
     const es = new EventSource(logStreamUrl(machineId, source, filters));
     sinceMsRef.current = undefined;
-    // Named events do NOT reach `onmessage`, so this cannot collide with the
-    // NDJSON log frames. The browser's EventSource auto-reconnects on a
-    // dropped connection (routine — the server ends the SSE stream whenever an
-    // agent session tears down), and the server re-resolves and re-announces a
-    // fresh cutoff on every such reconnect. But the line buffer is NOT cleared
-    // on a reconnect — only this effect clears it, on machine/source/filter
-    // change — so adopting that fresh cutoff here would pair a newer cutoff
-    // with an older buffer: `loadOlder` would then send a cutoff newer than
-    // the anchor already in view, `finalize_page` would truncate the page to
+    // Named events do NOT reach `onmessage`, so this can't collide with the
+    // NDJSON log frames. The server re-announces a fresh cutoff on every
+    // reconnect (routine — it ends the SSE stream whenever an agent session
+    // tears down), but the line buffer is NOT cleared on a reconnect, only on
+    // machine/source/filter change — so adopting a later cutoff here would pair
+    // it with an older buffer: `loadOlder` would send a cutoff newer than the
+    // anchor already in view, `finalize_page` would truncate the page to
     // nothing, and the viewer would report "beginning of window" while still
-    // showing an older span. So only adopt the announced cutoff the FIRST time
-    // for this buffer's lifetime; a later reconnect's cutoff is discarded and
-    // the buffer keeps paging against the cutoff it started with, exactly as
-    // long as the buffer itself survives.
+    // showing an older span. So only the FIRST announced cutoff for this
+    // buffer's lifetime is adopted; later reconnects' cutoffs are discarded.
     es.addEventListener("meta", (e) => {
       if (sinceMsRef.current !== undefined) return;
       try {

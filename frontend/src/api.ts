@@ -1,6 +1,6 @@
 // Thin fetch wrapper around the control plane's read-only fleet endpoint
-// (crates/server, Task 9). Kept dependency-free — no client library needed
-// for a single GET.
+// (crates/server). Kept dependency-free — no client library needed for a
+// single GET.
 import type { LogLine } from "./lib/logs";
 import { Unauthenticated } from "./lib/session";
 

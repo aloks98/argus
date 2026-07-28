@@ -111,12 +111,11 @@ function TopBar({ onOpenPalette }: { onOpenPalette: () => void }) {
           {summary}
         </span>
       )}
-      {/* Search + theme controls live in the header (user decision — moved
-          out of the sidebar footer, which is a sheet on mobile and a ~3rem
-          rail when collapsed: the header is the one place these are always
-          one tap away). `ml-auto` sits on the summary when it
-          renders, else on this cluster, so the group is right-aligned in
-          both states. */}
+      {/* Search + theme controls live in the header — moved out of the sidebar
+          footer, which is a sheet on mobile and a ~3rem rail when collapsed: the
+          header is the one place these are always one tap away. `ml-auto` sits
+          on the summary when it renders, else on this cluster, so the group is
+          right-aligned in both states. */}
       <div className={summary === null ? "ml-auto flex items-center gap-2" : "flex items-center gap-2"}>
         <CommandPaletteTrigger onOpen={onOpenPalette} />
         <ThemeToggle showLabel={false} />
@@ -127,12 +126,11 @@ function TopBar({ onOpenPalette }: { onOpenPalette: () => void }) {
 
 /**
  * The Ctrl/Cmd+K trigger, in the top bar — styled as a search FIELD rather
- * than a button (user decision: "make it a search bar type"). It is still a
- * real <button> (it opens the palette, it doesn't accept typing), dressed in
- * the same idiom as the app's filter inputs: bordered, mono, muted
- * placeholder text. The Kbd hint and the wide field are md+ only; on phones
- * it shrinks to an icon-sized tap target since there's no hardware keyboard
- * to honor the hint anyway.
+ * than a button. It is still a real <button> (it opens the palette, it
+ * doesn't accept typing), dressed in the same idiom as the app's filter
+ * inputs: bordered, mono, muted placeholder text. The Kbd hint and the wide
+ * field are md+ only; on phones it shrinks to an icon-sized tap target since
+ * there's no hardware keyboard to honor the hint anyway.
  */
 function CommandPaletteTrigger({ onOpen }: { onOpen: () => void }) {
   return (
@@ -176,11 +174,11 @@ function AccountFooter({
         // Invalidating an ACTIVELY OBSERVED query notifies its observer (the
         // Gate, mounted for the app's whole lifetime) directly and
         // immediately -- that's what actually flips the shell to <SignIn/>.
-        // This has to run, and be awaited, BEFORE `clear()`: `clear()` removes
+        // This must run, and be awaited, BEFORE `clear()`: `clear()` removes
         // the ["me"] query object from the cache entirely, and nothing then
-        // forces Gate's observer to notice it's gone (a bug caught empirically
-        // while fixing this -- `clear()` alone left the shell stuck showing
-        // the previous session's data through several 401'd polls).
+        // forces Gate's observer to notice it's gone -- `clear()` alone leaves
+        // the shell stuck showing the previous session's data through several
+        // 401'd polls.
         await queryClient.invalidateQueries({ queryKey: ["me"] });
         // Now that the gate has flipped (unmounting the pages that owned
         // fleet/machine/docker/systemd queries), drop everything else too, so
@@ -210,10 +208,10 @@ function AccountFooter({
 
   return (
     <>
-      {/* One row (user decision): identity truncating on the left, the two
-          account actions on the right — not stacked. `min-w-0 flex-1` is what
-          lets the identity string yield space instead of pushing the buttons
-          to a second line. ThemeToggle lives in the TopBar now. */}
+      {/* One row: identity truncating on the left, the two account actions on
+          the right — not stacked. `min-w-0 flex-1` is what lets the identity
+          string yield space instead of pushing the buttons to a second line.
+          ThemeToggle lives in the TopBar now. */}
       <div className={rail ? "flex flex-col items-center gap-1" : "flex w-full items-center gap-2"}>
         {!rail && identity !== null && (
           <div
@@ -279,9 +277,8 @@ function FleetSidebar({
     // quietly reintroduce that trap the next time this width changes.
     <Sidebar collapsible="icon" className="group-data-[side=left]:border-r border-border">
       {/* border-b + fixed h-12 on the wordmark: the TopBar across the inset is
-          exactly h-12 with its own border-b, and the two lines must meet at
-          the sidebar edge — the previous py-3 sizing left the yellow block a
-          few pixels short of the header line (user-reported). */}
+          exactly h-12 with its own border-b, and the two lines must meet at the
+          sidebar edge — a shorter block leaves it short of the header line. */}
       <SidebarHeader className="gap-0 border-b border-border p-0">
         <Link
           to="/machines"

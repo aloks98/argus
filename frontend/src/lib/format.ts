@@ -1,6 +1,6 @@
-// Shared formatting helpers for both screens. `formatLastSeen` used to exist
-// byte-identically in FleetPage and MachineDetailPage; this is its single
-// home now, renamed `formatRelative` since it's no longer last-seen-specific.
+// Shared formatting helpers for both screens — a single home for logic that
+// would otherwise duplicate across FleetPage and MachineDetailPage, named
+// `formatRelative` since it isn't last-seen-specific.
 const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto", style: "narrow" });
 
 const UNITS: [Intl.RelativeTimeFormatUnit, number][] = [

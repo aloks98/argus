@@ -1,9 +1,7 @@
 // The System tab's full inventory: everything the strip doesn't have room
-// for (Task 4 redesign — the strip slimmed to five items after live review
-// found the original nine-item version too crowded). Pure/presentational —
-// no fetching, no local state — so it's a plain function of the same
-// `machine`/`resources`/`memNow` values MachineDetailPage already derives
-// for the strip and the Memory chart.
+// for. Pure/presentational — no fetching, no local state — so it's a plain
+// function of the same `machine`/`resources`/`memNow` values MachineDetailPage
+// already derives for the strip and the Memory chart.
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@e412/rnui-react";
 import type { MachineDetail } from "../api";
 import { formatBytes, formatDateTime, formatUptime } from "../lib/format";
@@ -15,9 +13,8 @@ type Row = { label: string; value: string };
  * The card's ONE omission rule, as a function: a nullish or empty value
  * means no row — never a blank or an "undefined" pretending to be a fact.
  * `== null` (loose) is deliberate: these are additive proto fields, so a
- * frontend newer than its server sees `undefined`, not `null`, and strict
- * equality would let it through (this rendered "undefined · undefined
- * cores" live during this slice's own rollout).
+ * frontend newer than its server sees `undefined`, not `null` — strict
+ * equality would let it through and render "undefined · undefined cores".
  */
 function row(label: string, value: string | null | undefined): Row | null {
   return value == null || value === "" ? null : { label, value };
@@ -57,7 +54,7 @@ export default function SystemCard({
         ? `${formatBytes(swap.used)} / ${formatBytes(swap.total)}`
         : null,
     ),
-    // Identity facts, always present (predate this slice).
+    // Identity facts, always present.
     row("Machine ID", machine.machine_id),
     row("Enrolled", formatDateTime(machine.enrolled_at)),
   ].filter((r): r is Row => r !== null);

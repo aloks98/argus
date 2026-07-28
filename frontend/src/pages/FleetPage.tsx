@@ -1,7 +1,6 @@
-// The fleet page — the first real UI screen (Spine slice, Task 10). Polls
-// GET /api/fleet and renders a table of enrolled machines with a status
-// column per row, plus an amber "reconnecting…" hint for rows that were
-// online/pending but have gone quiet.
+// The fleet page. Polls GET /api/fleet and renders a table of enrolled
+// machines with a status column per row, plus an amber "reconnecting…" hint
+// for rows that were online/pending but have gone quiet.
 //
 // Search, tag filter and group-by are all URL state (`q`, `tags`, `group`)
 // so a filtered view is linkable and survives a reload — same contract as
@@ -141,9 +140,9 @@ function FleetTable({ rows }: { rows: FleetRow[] }) {
 }
 
 /**
- * Phone rendering of one fleet row: the whole card is a single tap target
- * (design "Fleet: card list below md"). Same data, same helpers as the
- * table — this is a second renderer, not a second data path.
+ * Phone rendering of one fleet row: the whole card is a single tap target.
+ * Same data, same helpers as the table — this is a second renderer, not a
+ * second data path.
  *
  * Kept in its own bordered wrapper, same as `FleetTable`'s, so either
  * renderer presents the same surface at the call site — the swap below
@@ -213,7 +212,7 @@ export default function FleetPage() {
   const group = rawGroup !== null && rawGroup.trim() !== "" ? rawGroup.trim().toLowerCase() : null;
 
   // One updater so every control writes URL state the same way; deleting
-  // empty params keeps URLs canonical (absent = default, per the design).
+  // empty params keeps URLs canonical (absent = default).
   function setParam(key: string, value: string) {
     setParams(
       (prev) => {
@@ -278,12 +277,10 @@ export default function FleetPage() {
           aria-label="Filter machines"
           className="max-w-xs font-mono text-xs"
         />
-        {/* Replaces the old Flat/Grouped ToggleGroup (browser-review
-            decision) — a single dropdown whose trigger names the active
-            group, with per-tag counts moved here (off the filter chips
-            above). `DropdownMenuContent`/`DropdownMenuSubContent` already
-            wrap their own Portal+Positioner (rnui's dropdown-menu.tsx), so
-            no manual Portal here. */}
+        {/* A single dropdown whose trigger names the active group, with per-tag
+            counts moved here (off the filter chips above). `DropdownMenuContent`/
+            `DropdownMenuSubContent` already wrap their own Portal+Positioner
+            (rnui's dropdown-menu.tsx), so no manual Portal here. */}
         <DropdownMenu>
           <DropdownMenuTrigger render={<Button variant="outline" size="sm" className="ml-auto" />}>
             {`Group by: ${group ?? "none"}`}

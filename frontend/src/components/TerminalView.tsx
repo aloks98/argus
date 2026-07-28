@@ -154,44 +154,39 @@ export default function TerminalView({ machineId }: { machineId: string }) {
       </div>
       {/* The border is load-bearing, not decoration: the terminal surface is
           always `bg-black`, and in dark mode the page background is #000000
-          too — without an edge the terminal is invisible against the page and
-          the prompt appears to float in empty space. `--border` resolves to
-          #242424 in dark and #D4D4D8 in light, so one border works for both.
-          `bg-black` and the padding live here too, so the inset gap reads as
-          part of the terminal surface rather than as a gap showing the page
-          through — and, like the border, padding on the mount div itself
-          would corrupt FitAddon's measurement, whereas padding here is
-          outside the box it measures.
-          It lives on THIS wrapper, one level above the div xterm mounts
-          into, deliberately: `FitAddon.proposeDimensions()` measures
-          `term.element.parentElement` via `getComputedStyle(...).height`/
-          `.width`, and under this app's global `box-sizing: border-box`
-          reset that computed value INCLUDES the element's own border. Put
-          the border directly on the mount div and FitAddon would overcount
-          the available space by the border's thickness on each axis (it
-          only subtracts the xterm-rendered element's padding, never a
-          border on its own parent), nudging cols/rows up by a fraction of a
-          cell and clipping the last row/column against `overflow-hidden`.
-          Keeping the mount div itself borderless — sized to fill this
-          wrapper's content box via h-full/w-full — keeps that measurement
-          exact in both normal and maximized layout. */}
+          too — without an edge the terminal is invisible against the page.
+          `--border` resolves to #242424 in dark and #D4D4D8 in light, so one
+          border works for both. `bg-black` and the padding live here too, so
+          the inset gap reads as part of the terminal surface rather than the
+          page showing through.
+
+          Both the border AND the padding must live on THIS wrapper, one level
+          above the div xterm mounts into, not on the mount div itself:
+          `FitAddon.proposeDimensions()` measures `term.element.parentElement`
+          via `getComputedStyle(...).height/.width`, and under this app's
+          global `box-sizing: border-box` reset that computed value INCLUDES
+          the parent's own border (it only subtracts the xterm-rendered
+          element's padding). A border directly on the mount div would nudge
+          cols/rows up by a fraction of a cell and clip the last row/column
+          against `overflow-hidden`. Keeping the mount div itself borderless —
+          sized via h-full/w-full — keeps the measurement exact in both
+          normal and maximized layout. */}
       <div className="relative min-h-0 flex-1 overflow-hidden border border-border bg-black p-2">
         <div ref={hostRef} className="h-full w-full" />
-        {/* A dead shell otherwise looks exactly like a live one — same text,
-            same cursor — and the only tell is a line of small print in the
-            header. Blurring the scrollback makes "this is over" the first
-            thing you see, and puts both next moves on the thing you are
-            looking at.
+        {/* A dead shell otherwise looks exactly like a live one — same text, same
+            cursor — and the only tell is a line of small print in the header.
+            Blurring the scrollback makes "this is over" the first thing you see,
+            with both next moves on the thing you're looking at.
 
-            Absolutely positioned so it never enters FitAddon's measurement:
-            it sizes from this wrapper's computed box, which an out-of-flow
-            child does not affect.
+            Absolutely positioned so it never enters FitAddon's measurement: it
+            sizes from this wrapper's computed box, which an out-of-flow child does
+            not affect.
 
-            Deliberately NOT themed. Everything under it is the terminal's
-            `bg-black` surface in light mode and dark mode alike, so the
-            contrast this needs is against black in both — a scrim keyed to
-            `--background` would be near-invisible in dark mode and would
-            fight the black surface in light mode. */}
+            Deliberately NOT themed — everything under it is the terminal's
+            `bg-black` surface in both modes, so the contrast needed is against
+            black either way; a scrim keyed to `--background` would be
+            near-invisible in dark mode and fight the black surface in light
+            mode. */}
         {closed && !dismissed && (
           <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 bg-black/60 backdrop-blur-[3px]">
             <span className="font-mono text-xs uppercase tracking-widest text-white/90">

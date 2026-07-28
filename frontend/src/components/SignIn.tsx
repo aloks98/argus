@@ -20,19 +20,18 @@ import { RateLimited, localLogin } from "../api";
 
 /**
  * Full-page gate, in two stages: pick a method, then use it. Both methods are
- * always offered -- this never probes `/auth/login` to hide whichever isn't
- * configured.
+ * always offered -- this must never probe `/auth/login` to hide whichever
+ * isn't configured.
  *
- * That probe was tried and reverted: `GET /auth/login` is not a status
- * check, it is the start of a real OIDC flow (design §8/§13) -- every hit
- * runs discovery, mints a fresh CSRF token/nonce/PKCE verifier, and sets a
- * live 10-minute flow cookie, which the design explicitly documents as
- * reachable only by top-level navigation. Firing it from a background
- * `fetch` on every sign-in-page mount silently started an unrequested OAuth
- * flow for every signed-out visitor, and -- because the flow cookie is
- * per-origin and shared across tabs -- a probe in one tab could stomp the
- * flow cookie of a legitimate SSO login in flight in another, breaking its
- * CSRF/nonce/PKCE check on return to the callback.
+ * `GET /auth/login` is not a status check, it is the start of a real OIDC flow
+ * (design §8/§13): every hit runs discovery, mints a fresh CSRF
+ * token/nonce/PKCE verifier, and sets a live 10-minute flow cookie that the
+ * design documents as reachable only by top-level navigation. Firing it from
+ * a background `fetch` on every sign-in-page mount would silently start an
+ * unrequested OAuth flow for every signed-out visitor -- and because the flow
+ * cookie is per-origin and shared across tabs, a probe in one tab could stomp
+ * the flow cookie of a legitimate SSO login in flight in another, breaking
+ * its CSRF/nonce/PKCE check on return to the callback.
  *
  * So: no probe. When SSO isn't configured, a visitor who clicks "Sign in"
  * gets the server's own friendly "single sign-on is not configured" page --

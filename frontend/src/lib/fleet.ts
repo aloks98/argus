@@ -10,11 +10,10 @@ export function displayName(m: Pick<FleetRow, "display_name" | "hostname">): str
 }
 
 /**
- * Case-insensitive substring match on display name, hostname and tags.
- * (The multi-tag AND filter this once carried was removed with the fleet
- * page's chip row — user decision: search matches tags and the Group-by
- * dropdown shows per-tag groups, so chips were a third path to the same
- * result.)
+ * Case-insensitive substring match on display name, hostname and tags. No
+ * multi-tag AND filter: search already matches tags, and the Group-by
+ * dropdown shows per-tag groups, so a chip-based multi-tag filter would be a
+ * third path to the same result.
  */
 export function visibleFleet(rows: FleetRow[], q: string): FleetRow[] {
   const needle = q.trim().toLowerCase();

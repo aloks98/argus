@@ -57,14 +57,13 @@ export function unitTone(activeState: string): Tone {
  * fields (there is no `state` column on the wire). Order matters: a revoked
  * token reads "revoked" even if it's also past its expiry or used up.
  *
- * "used up" deliberately folds into "expired" (browser-review decision): a
- * token that has spent all its uses is, for every purpose an operator cares
- * about, no longer usable — same as one past its time expiry — and the two
- * read the same way (`warn` tone) rather than as separate states. The uses
- * column (`t.uses`/`t.max_uses`) still shows `1/1` on the row, so which kind
- * of "expired" it is isn't lost, just not surfaced as its own label. Revoke
- * button visibility (active-only) is unaffected — it was never state-gated
- * on "used up" specifically.
+ * "used up" deliberately folds into "expired": a token that has spent all its
+ * uses is, for every purpose an operator cares about, no longer usable — same
+ * as one past its time expiry — so both read the same way (`warn` tone). The
+ * uses column (`t.uses`/`t.max_uses`) still shows `1/1` on the row, so which
+ * kind of "expired" it is isn't lost, just not its own label. Revoke button
+ * visibility (active-only) is unaffected — it was never gated on "used up"
+ * specifically.
  */
 export type TokenState = "revoked" | "expired" | "active";
 
