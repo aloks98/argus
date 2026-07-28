@@ -359,6 +359,12 @@ fn removed_cookie(name: &'static str) -> Cookie<'static> {
 /// serving a stylesheet to unauthenticated callers purely for error states, and
 /// these values change roughly never. `--radius: 0rem` is why nothing here is
 /// rounded — square corners are the identity, not an oversight.
+///
+/// Deliberately no ARGUS wordmark. The app sets it in Archivo Black, and this
+/// page cannot have that face without also serving font files to
+/// unauthenticated callers — so it would render in a substitute and read as
+/// subtly wrong every time. The heading and message carry the page on their
+/// own; a mark that is almost right is worse than none.
 fn error_page(status: StatusCode, message: &str) -> Response {
     // The heading follows the status, because not every one of these is a
     // failed sign-in: a 404 is "this server has no SSO configured", which is a
@@ -393,9 +399,6 @@ fn error_page(status: StatusCode, message: &str) -> Response {
     background: var(--bg); color: var(--fg);
     font-family: ui-monospace, "IBM Plex Mono", SFMono-Regular, Menlo, monospace;
   }}
-  .mark {{
-    font-size: 1.5rem; letter-spacing: 0.16em; font-weight: 800;
-  }}
   .panel {{
     width: 100%; max-width: 24rem; border: 1px solid var(--border);
     border-left: 3px solid var(--alert); padding: 1rem 1.25rem;
@@ -414,7 +417,6 @@ fn error_page(status: StatusCode, message: &str) -> Response {
 </style>
 </head>
 <body>
-<div class="mark">ARGUS</div>
 <div class="panel">
 <h1>{heading}</h1>
 <p>{message}</p>
