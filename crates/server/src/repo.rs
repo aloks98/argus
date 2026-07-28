@@ -4,6 +4,7 @@
 //! `sqlx::query!`/`query_as!` against the live dev Postgres (`DATABASE_URL`).
 
 use anyhow::Result;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -69,6 +70,126 @@ pub async fn consume_enrollment_token(
         },
         None => TokenCheck::Invalid,
     })
+}
+
+/// 32-character alphanumeric enrollment token, generated the same way
+/// `auth::password::generate_password` builds its credential (an index drawn
+/// per character via `rand::rng().random_range`), but over the full
+/// `[A-Za-z0-9]` alphabet rather than password.rs's ambiguous-char-excluding
+/// one: an enrollment token is copy-pasted into a join command, never
+/// hand-transcribed from a screen under pressure, so the 0/O/1/l/I collision
+/// risk that motivates password.rs's narrower alphabet doesn't apply here.
+const TOKEN_LEN: usize = 32;
+const TOKEN_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+fn generate_token() -> String {
+    let alphabet: Vec<char> = TOKEN_ALPHABET.chars().collect();
+    let mut rng = rand::rng();
+    (0..TOKEN_LEN)
+        .map(|_| alphabet[rng.random_range(0..alphabet.len())])
+        .collect()
+}
+
+/// One `enrollment_tokens` row as returned to the browser -- never the hash,
+/// never the raw token (the raw token exists only in
+/// `mint_enrollment_token`'s return value, once).
+pub struct TokenRow {
+    pub id: Uuid,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub tags: Vec<String>,
+    pub max_uses: Option<i32>,
+    pub uses: i32,
+    pub expires_at: Option<OffsetDateTime>,
+    pub revoked: bool,
+    pub created_by: Option<String>,
+    pub created_at: OffsetDateTime,
+}
+
+/// Newest-first, for the enrollment-tokens admin table.
+pub async fn list_enrollment_tokens(executor: impl sqlx::PgExecutor<'_>) -> Result<Vec<TokenRow>> {
+    let rows = sqlx::query_as!(
+        TokenRow,
+        r#"
+        SELECT id, name, display_name, tags as "tags!", max_uses, uses, expires_at,
+               revoked, created_by, created_at
+        FROM enrollment_tokens
+        ORDER BY created_at DESC
+        "#
+    )
+    .fetch_all(executor)
+    .await?;
+    Ok(rows)
+}
+
+/// Mint a new join token: generate the raw 32-char credential, store only its
+/// sha256, and compute the expiry in SQL. `expires_in_hours: None` stores
+/// "never" -- confirmed against the dev DB
+/// (`SELECT now() + make_interval(hours => NULL)` -> `NULL`; `make_interval`
+/// propagates a NULL argument straight to a NULL result), so passing the
+/// `Option<i32>` through to `make_interval(hours => $6)` needs no extra
+/// `CASE`.
+pub async fn mint_enrollment_token(
+    executor: impl sqlx::PgExecutor<'_>,
+    name: &str,
+    display_name: Option<&str>,
+    tags: &[String],
+    max_uses: Option<i32>,
+    // `int4` (Postgres `make_interval`'s `hours` parameter is `int`, not
+    // `bigint`) -- 8760 (the handler's upper clamp, one year) fits
+    // comfortably, so this is not a real range restriction.
+    expires_in_hours: Option<i32>,
+    created_by: &str,
+) -> Result<(TokenRow, String)> {
+    let raw = generate_token();
+    let token_hash = Sha256::digest(raw.as_bytes()).to_vec();
+    let row = sqlx::query_as!(
+        TokenRow,
+        r#"
+        INSERT INTO enrollment_tokens (name, token_hash, display_name, tags, max_uses, expires_at, created_by)
+        VALUES ($1, $2, $3, $4, $5, now() + make_interval(hours => $6), $7)
+        RETURNING id, name, display_name, tags as "tags!", max_uses, uses, expires_at, revoked, created_by, created_at
+        "#,
+        name,
+        token_hash,
+        display_name,
+        tags,
+        max_uses,
+        expires_in_hours,
+        created_by,
+    )
+    .fetch_one(executor)
+    .await?;
+    Ok((row, raw))
+}
+
+/// Look up an enrollment token's `name` by id -- used by the revoke handler
+/// to fetch the name BEFORE revoking (inside the same transaction as the
+/// revoke), so the `enroll_token.revoke` audit row's detail can name the
+/// token without a second round trip after the mutation.
+pub async fn enrollment_token_name(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: Uuid,
+) -> Result<Option<String>> {
+    let name = sqlx::query_scalar!("SELECT name FROM enrollment_tokens WHERE id = $1", id)
+        .fetch_optional(executor)
+        .await?;
+    Ok(name)
+}
+
+/// Revoke a token by id. `true` iff a row with this id existed (revoking an
+/// already-revoked token still returns `true` -- idempotent, not an error).
+pub async fn revoke_enrollment_token(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: Uuid,
+) -> Result<bool> {
+    let res = sqlx::query!(
+        "UPDATE enrollment_tokens SET revoked = true WHERE id = $1",
+        id,
+    )
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected() == 1)
 }
 
 /// Insert-or-update a machine's inventory row by `machine_id` (the stable

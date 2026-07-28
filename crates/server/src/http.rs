@@ -17,7 +17,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use sqlx::PgPool;
@@ -124,6 +124,11 @@ fn router(state: AppState) -> Router {
         // `require_auth` layer and `SameSite=Lax` cookie as every other verb,
         // not under the public `/auth/*` prefix.
         .route("/api/local-admin/rotate", post(crate::auth::local::rotate))
+        .route("/api/enrollment-tokens", get(list_tokens).post(mint_token))
+        .route("/api/enrollment-tokens/{id}", delete(revoke_token))
+        // Not secret (PRD §5), but nothing under /api is served unauthenticated;
+        // see `ca_pem`'s doc comment.
+        .route("/api/ca.pem", get(ca_pem))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_auth,
@@ -347,12 +352,18 @@ struct MachinePatch {
     tags: Option<Vec<String>>,
 }
 
-fn double_option<'de, D>(d: D) -> Result<Option<Option<String>>, D::Error>
+/// Generic over `T` so both `MachinePatch` (`Option<Option<String>>`) and the
+/// enrollment-token mint body (`Option<Option<i32>>` / `Option<Option<i64>>`)
+/// can share this: absent key vs. explicit JSON `null` carry different
+/// meanings in both bodies, and plain `Option<T>` cannot represent that
+/// difference after serde.
+fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
 {
     use serde::Deserialize;
-    Ok(Some(Option::<String>::deserialize(d)?))
+    Ok(Some(Option::<T>::deserialize(d)?))
 }
 
 /// `PATCH /api/machines/{id}` -- display name / notes / tags. Only the fields
@@ -466,6 +477,250 @@ async fn patch_machine(
         Ok(None) => StatusCode::NOT_FOUND.into_response(),
         Err(err) => {
             tracing::error!(error = %err, "failed to reload machine detail");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+// === Enrollment tokens (fleet-identity slice, Task 4) ===
+
+/// One `enrollment_tokens` row for the browser. `token` is `None` -- and
+/// thus omitted via `skip_serializing_if` -- on every path except the mint
+/// response, where it carries the raw credential exactly once: never
+/// persisted, never returned again.
+#[derive(serde::Serialize)]
+struct TokenDto {
+    id: Uuid,
+    name: String,
+    display_name: Option<String>,
+    tags: Vec<String>,
+    max_uses: Option<i32>,
+    uses: i32,
+    #[serde(with = "time::serde::rfc3339::option")]
+    expires_at: Option<OffsetDateTime>,
+    revoked: bool,
+    created_by: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+}
+
+impl From<repo::TokenRow> for TokenDto {
+    fn from(r: repo::TokenRow) -> Self {
+        TokenDto {
+            id: r.id,
+            name: r.name,
+            display_name: r.display_name,
+            tags: r.tags,
+            max_uses: r.max_uses,
+            uses: r.uses,
+            expires_at: r.expires_at,
+            revoked: r.revoked,
+            created_by: r.created_by,
+            created_at: r.created_at,
+            token: None,
+        }
+    }
+}
+
+/// `GET /api/enrollment-tokens` -- newest first. Never the hash or raw token.
+async fn list_tokens(State(state): State<AppState>) -> Response {
+    match repo::list_enrollment_tokens(&state.pool).await {
+        Ok(rows) => Json(rows.into_iter().map(TokenDto::from).collect::<Vec<_>>()).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to list enrollment tokens");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Body of `POST /api/enrollment-tokens`. `max_uses`/`expires_in_hours` reuse
+/// `double_option`: an absent key takes the default (`1` use / 24h), an
+/// explicit JSON `null` means unlimited/never, and an explicit number is
+/// clamped into range. `tags` has no such tri-state -- there is no existing
+/// row to "leave alone" on a create -- so an absent key is simply "no tags".
+#[derive(serde::Deserialize)]
+struct MintTokenBody {
+    name: String,
+    display_name: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    max_uses: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "double_option")]
+    expires_in_hours: Option<Option<i64>>,
+}
+
+/// `POST /api/enrollment-tokens` -- mint a join token. Absent `max_uses` ⇒
+/// 1, absent `expires_in_hours` ⇒ 24h; explicit JSON `null` for either ⇒
+/// unlimited/never; an explicit number is clamped into range rather than
+/// rejected.
+///
+/// The insert and its `enroll_token.create` audit row share one transaction
+/// -- the same fail-closed convention `patch_machine` established (see its
+/// doc comment): a minted-but-unaudited token is exactly the gap CLAUDE.md's
+/// audit rule rules out, so a failed audit write rolls the mint back with it.
+async fn mint_token(
+    State(state): State<AppState>,
+    crate::auth::AuthUser(identity): crate::auth::AuthUser,
+    Json(body): Json<MintTokenBody>,
+) -> Response {
+    // Validate everything BEFORE touching the database.
+    let name = match crate::identity::normalize_display_name(&body.name) {
+        Ok(Some(n)) => n,
+        Ok(None) => return (StatusCode::BAD_REQUEST, "name must not be empty").into_response(),
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    let display_name = match body.display_name.as_deref() {
+        None => None,
+        Some(raw) => match crate::identity::normalize_display_name(raw) {
+            Ok(v) => v,
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        },
+    };
+    let tags = match crate::identity::normalize_tags(&body.tags) {
+        Ok(v) => v,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    let max_uses = match body.max_uses {
+        None => Some(1),
+        Some(None) => None,
+        Some(Some(n)) => Some(n.max(1)),
+    };
+    // Clamped in i64 first (an arbitrarily large JSON number must not
+    // overflow before it's brought into range), then narrowed to i32 for
+    // Postgres's `make_interval(hours => ...)`, whose parameter is `int4`.
+    let expires_in_hours: Option<i32> = match body.expires_in_hours {
+        None => Some(24),
+        Some(None) => None,
+        Some(Some(n)) => Some(n.clamp(1, 8760) as i32),
+    };
+
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to begin enrollment token mint transaction");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let (row, raw) = match repo::mint_enrollment_token(
+        &mut *tx,
+        &name,
+        display_name.as_deref(),
+        &tags,
+        max_uses,
+        expires_in_hours,
+        identity.actor_str(),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to mint enrollment token");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    if let Err(err) = repo::audit_with_detail(
+        &mut *tx,
+        repo::Actor::User(&identity),
+        "enroll_token.create",
+        None,
+        "ok",
+        serde_json::json!({ "name": name }),
+    )
+    .await
+    {
+        tracing::error!(error = %err, "failed to audit enroll_token.create; rolling back the mint");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(err) = tx.commit().await {
+        tracing::error!(error = %err, "failed to commit enrollment token mint");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let mut dto = TokenDto::from(row);
+    dto.token = Some(raw);
+    (StatusCode::CREATED, Json(dto)).into_response()
+}
+
+/// `DELETE /api/enrollment-tokens/{id}` -- revoke a join token. 404 when
+/// `id` doesn't match any token; the only way to learn that before the
+/// UPDATE runs is to fetch the name up front, which conveniently is also
+/// what the audit detail needs (brief's "fetch the name before revoking").
+/// Same share-one-transaction, fail-closed convention as `mint_token` /
+/// `patch_machine`.
+async fn revoke_token(
+    State(state): State<AppState>,
+    crate::auth::AuthUser(identity): crate::auth::AuthUser,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to begin enrollment token revoke transaction");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let name = match repo::enrollment_token_name(&mut *tx, id).await {
+        Ok(Some(n)) => n,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to look up enrollment token before revoke");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    match repo::revoke_enrollment_token(&mut *tx, id).await {
+        Ok(true) => {}
+        // Only reachable via a race with a concurrent delete of the same row
+        // between the lookup above and this UPDATE -- the name lookup already
+        // confirmed existence, but nothing holds a lock across the gap.
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to revoke enrollment token");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    if let Err(err) = repo::audit_with_detail(
+        &mut *tx,
+        repo::Actor::User(&identity),
+        "enroll_token.revoke",
+        None,
+        "ok",
+        serde_json::json!({ "name": name }),
+    )
+    .await
+    {
+        tracing::error!(error = %err, "failed to audit enroll_token.revoke; rolling back the revoke");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(err) = tx.commit().await {
+        tracing::error!(error = %err, "failed to commit enrollment token revoke");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// The CA certificate for the enroll page's download button. Behind auth like
+/// the rest of `/api` (the cert is not secret, but nothing here is served
+/// unauthenticated). 503 when the CA hasn't been initialized yet.
+async fn ca_pem(State(state): State<AppState>) -> Response {
+    match sqlx::query_scalar!("SELECT cert_pem FROM ca_material WHERE id = 1")
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(Some(pem)) => ([(header::CONTENT_TYPE, "text/plain")], pem).into_response(),
+        Ok(None) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to load CA cert");
             StatusCode::INTERNAL_SERVER_ERROR.into_response()
         }
     }
@@ -1535,6 +1790,190 @@ mod tests {
             )
             .await
             .unwrap()
+    }
+
+    /// Drives an authenticated, bodyless request straight through the router
+    /// -- the `GET`/`DELETE` counterpart to `request_json` above, for the
+    /// enrollment-token endpoints' list/revoke tests.
+    async fn request(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        cookie: &str,
+    ) -> axum::http::Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Parses a response body as JSON, consuming the response. Pairs with
+    /// `request`/`request_json` so token tests can go straight from response
+    /// to `serde_json::Value` without repeating the `to_bytes` dance.
+    async fn body_json<T: serde::de::DeserializeOwned>(
+        res: axum::http::Response<Body>,
+    ) -> anyhow::Result<T> {
+        let body = to_bytes(res.into_body(), usize::MAX).await?;
+        Ok(serde_json::from_slice(&body)?)
+    }
+
+    #[sqlx::test]
+    async fn token_mint_defaults_and_raw_once(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool.clone()));
+        let res = request_json(
+            &app,
+            "POST",
+            "/api/enrollment-tokens",
+            &cookie,
+            serde_json::json!({ "name": "pve1-media", "tags": ["media"] }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body: serde_json::Value = body_json(res).await?;
+        let raw = body["token"].as_str().unwrap();
+        assert_eq!(raw.len(), 32);
+        assert_eq!(body["max_uses"], 1);
+        assert!(!body["expires_at"].is_null()); // ~now+24h
+
+        // The raw token is NOT in the list payload -- only in the mint response.
+        let list = request(&app, "GET", "/api/enrollment-tokens", &cookie).await;
+        let rows: serde_json::Value = body_json(list).await?;
+        assert!(rows[0].get("token").is_none());
+        assert!(rows[0].get("token_hash").is_none());
+
+        // The minted token actually works against the consume path.
+        let check = repo::consume_enrollment_token(&pool, raw).await?;
+        assert!(matches!(check, repo::TokenCheck::Valid { .. }));
+        // ...and, being single-use, only once.
+        let again = repo::consume_enrollment_token(&pool, raw).await?;
+        assert!(matches!(again, repo::TokenCheck::Invalid));
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn token_revoke_and_audit_rows(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool.clone()));
+        let res = request_json(
+            &app,
+            "POST",
+            "/api/enrollment-tokens",
+            &cookie,
+            serde_json::json!({ "name": "t", "max_uses": null }),
+        )
+        .await;
+        let body: serde_json::Value = body_json(res).await?;
+        assert!(body["max_uses"].is_null()); // explicit null = unlimited
+        let id = body["id"].as_str().unwrap().to_string();
+        let raw = body["token"].as_str().unwrap().to_string();
+
+        let del = request(
+            &app,
+            "DELETE",
+            &format!("/api/enrollment-tokens/{id}"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(del.status(), StatusCode::NO_CONTENT);
+        // Revoked -> the consume path refuses it.
+        let check = repo::consume_enrollment_token(&pool, &raw).await?;
+        assert!(matches!(check, repo::TokenCheck::Invalid));
+
+        // This test mints exactly one token (one `enroll_token.create`) and
+        // revokes it (one `enroll_token.revoke`) -- recounted from what this
+        // test actually did, not copied from the plan.
+        let n: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "n!" FROM audit_log
+               WHERE action IN ('enroll_token.create', 'enroll_token.revoke')"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(n, 2);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn token_revoke_unknown_id_is_404(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool));
+        let res = request(
+            &app,
+            "DELETE",
+            &format!("/api/enrollment-tokens/{}", Uuid::new_v4()),
+            &cookie,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn token_mint_rejects_empty_name_and_clamps_bounds(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool));
+
+        // Whitespace-only name normalizes to empty and is rejected.
+        let res = request_json(
+            &app,
+            "POST",
+            "/api/enrollment-tokens",
+            &cookie,
+            serde_json::json!({ "name": "   " }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // max_uses below 1 clamps up to 1; expires_in_hours above the cap
+        // clamps down to 8760 (1 year), rather than being rejected.
+        let res = request_json(
+            &app,
+            "POST",
+            "/api/enrollment-tokens",
+            &cookie,
+            serde_json::json!({ "name": "clamp-test", "max_uses": 0, "expires_in_hours": 999_999 }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body: serde_json::Value = body_json(res).await?;
+        assert_eq!(body["max_uses"], 1);
+        Ok(())
+    }
+
+    /// The dev DB fact this whole slice leans on: `make_interval` propagates
+    /// a NULL `hours` argument straight through to a NULL result, which is
+    /// what lets `mint_enrollment_token` store "never expires" by simply
+    /// passing `None` into `make_interval(hours => $6)` with no `CASE`.
+    /// Verified directly against the container this crate's tests run
+    /// against (`docker exec argus-pg psql ...`), and pinned here so a
+    /// future Postgres version that changed this behavior would fail loudly
+    /// in CI instead of silently expiring "unlimited" tokens.
+    #[sqlx::test]
+    async fn make_interval_of_null_hours_is_null(pool: PgPool) -> anyhow::Result<()> {
+        let expires_at: Option<OffsetDateTime> = sqlx::query_scalar!(
+            r#"SELECT now() + make_interval(hours => $1) as "expires_at""#,
+            None::<i32>,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(expires_at.is_none());
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn ca_pem_503_when_ca_not_initialized(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool));
+        let res = request(&app, "GET", "/api/ca.pem", &cookie).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
     }
 
     #[sqlx::test]

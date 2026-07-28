@@ -1,0 +1,142 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO enrollment_tokens (name, token_hash, display_name, tags, max_uses, expires_at, created_by)\n        VALUES ($1, $2, $3, $4, $5, now() + make_interval(hours => $6), $7)\n        RETURNING id, name, display_name, tags as \"tags!\", max_uses, uses, expires_at, revoked, created_by, created_at\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "enrollment_tokens",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "enrollment_tokens",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "display_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "enrollment_tokens",
+            "name": "display_name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "tags!",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "enrollment_tokens",
+            "name": "tags"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "max_uses",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "enrollment_tokens",
+            "name": "max_uses"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "uses",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "enrollment_tokens",
+            "name": "uses"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "enrollment_tokens",
+            "name": "expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "revoked",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "enrollment_tokens",
+            "name": "revoked"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "created_by",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "enrollment_tokens",
+            "name": "created_by"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "enrollment_tokens",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Bytea",
+        "Text",
+        "TextArray",
+        "Int4",
+        "Int4",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      true,
+      false,
+      true,
+      false,
+      true,
+      false,
+      true,
+      false
+    ]
+  },
+  "hash": "634f7ca1b3286eb1a8b0bcfb1ae69c7b88770b7fcb47dcd676c876155dbbf9f7"
+}

@@ -53,16 +53,12 @@ use x509_parser::prelude::{FromDer, X509Certificate};
 // === Validation constants and functions (Task 2) ===
 
 pub const MAX_TAGS: usize = 16;
-#[allow(dead_code)]
 const MAX_TAG_LEN: usize = 32;
-#[allow(dead_code)]
 const MAX_DISPLAY_NAME_LEN: usize = 64;
-#[allow(dead_code)]
 const MAX_NOTES_LEN: usize = 4000;
 
 /// trim → lowercase → order-preserving dedupe → validate each. Errors carry
 /// the offending value so the 400 is actionable; nothing is silently dropped.
-#[allow(dead_code)]
 pub fn normalize_tags(raw: &[String]) -> Result<Vec<String>, String> {
     let mut out: Vec<String> = Vec::new();
     for r in raw {
@@ -95,7 +91,6 @@ pub fn normalize_tags(raw: &[String]) -> Result<Vec<String>, String> {
 }
 
 /// `Ok(None)` = clear back to "display the hostname".
-#[allow(dead_code)]
 pub fn normalize_display_name(raw: &str) -> Result<Option<String>, String> {
     let t = raw.trim();
     if t.is_empty() {
@@ -109,7 +104,6 @@ pub fn normalize_display_name(raw: &str) -> Result<Option<String>, String> {
     Ok(Some(t.to_string()))
 }
 
-#[allow(dead_code)]
 pub fn validate_notes(raw: &str) -> Result<(), String> {
     if raw.chars().count() > MAX_NOTES_LEN {
         return Err(format!("notes too long (max {MAX_NOTES_LEN} chars)"));

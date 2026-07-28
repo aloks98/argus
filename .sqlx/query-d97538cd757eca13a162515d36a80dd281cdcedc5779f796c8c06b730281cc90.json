@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT cert_pem FROM ca_material WHERE id = 1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cert_pem",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "ca_material",
+            "name": "cert_pem"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d97538cd757eca13a162515d36a80dd281cdcedc5779f796c8c06b730281cc90"
+}
