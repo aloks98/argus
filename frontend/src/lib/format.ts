@@ -49,3 +49,15 @@ export function formatBytes(v: number): string {
   }
   return `${n.toFixed(1)} ${units[i]}`;
 }
+
+/** "up 3d 4h" / "up 2h 14m" / "up 12m" from an RFC3339 boot time. Derived
+ *  client-side on every render, so it stays current without agent traffic. */
+export function formatUptime(bootTimeIso: string): string {
+  const secs = Math.max(0, (Date.now() - Date.parse(bootTimeIso)) / 1000);
+  const d = Math.floor(secs / 86400);
+  const h = Math.floor((secs % 86400) / 3600);
+  const m = Math.floor((secs % 3600) / 60);
+  if (d > 0) return `up ${d}d ${h}h`;
+  if (h > 0) return `up ${h}h ${m}m`;
+  return `up ${m}m`;
+}

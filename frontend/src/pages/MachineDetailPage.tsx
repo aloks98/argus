@@ -51,12 +51,13 @@ import { BOOT_LOGS, CAP_DOCKER, CAP_JOURNAL, CAP_SYSTEMD, SYSTEM_JOURNAL } from 
 import { cn } from "../lib/cn";
 import { displayName } from "../lib/fleet";
 import { useLogFilters } from "../lib/logFilters";
-import { formatBytes, formatBytesPerSec, formatRelative } from "../lib/format";
+import { formatBytes, formatBytesPerSec, formatRelative, formatUptime } from "../lib/format";
 import {
   buildCpuSeries,
   buildLoadSeries,
   buildMemUsedSeries,
   latestMem,
+  latestResources,
   buildNetRateSeries,
 } from "../lib/metrics";
 import { useDocker, useMachine, useMetrics, useSystemd } from "../lib/queries";
@@ -249,6 +250,7 @@ export default function MachineDetailPage() {
   const cpuPoints = buildCpuSeries(metrics);
   const memPoints = buildMemUsedSeries(metrics);
   const memNow = latestMem(metrics);
+  const resources = latestResources(metrics);
   const loadPoints = buildLoadSeries(metrics);
   const netPoints = buildNetRateSeries(metrics);
   const latestNet =
@@ -264,6 +266,35 @@ export default function MachineDetailPage() {
     ...(machine.kernel !== null ? [{ label: "Kernel", value: machine.kernel }] : []),
     ...(machine.arch !== null ? [{ label: "Arch", value: machine.arch }] : []),
     ...(machine.agent_version !== null ? [{ label: "Agent", value: machine.agent_version }] : []),
+    ...(machine.cpu_model !== null
+      ? [{
+          label: "Processor",
+          value: machine.cpu_cores !== null
+            ? `${machine.cpu_model} · ${machine.cpu_cores} cores`
+            : machine.cpu_model,
+        }]
+      : []),
+    ...(machine.boot_time !== null
+      ? [{ label: "Uptime", value: formatUptime(machine.boot_time) }]
+      : []),
+    ...(machine.virt !== null
+      ? [{ label: "Virtualization", value: machine.virt === "none" ? "bare metal" : machine.virt }]
+      : []),
+    ...(resources.disk !== null
+      ? [{
+          label: "Disk",
+          value: `${formatBytes(resources.disk.used)} / ${formatBytes(resources.disk.total)} (${((100 * resources.disk.used) / resources.disk.total).toFixed(0)}%)`,
+        }]
+      : []),
+    ...(memNow !== null
+      ? [{ label: "Memory", value: formatBytes(memNow.total) }]
+      : []),
+    ...(resources.swap !== null && resources.swap.total > 0
+      ? [{
+          label: "Swap",
+          value: `${formatBytes(resources.swap.used)} / ${formatBytes(resources.swap.total)}`,
+        }]
+      : []),
     { label: "Last seen", value: formatRelative(machine.last_seen_at) },
   ];
 

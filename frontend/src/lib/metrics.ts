@@ -33,6 +33,36 @@ export function latestMem(points: MetricPoint[]): { used: number; total: number 
   return null;
 }
 
+/**
+ * The strip's Disk/Swap facts. Independent backward walks — a sample can
+ * carry the disk counter pair without the swap pair or vice versa — so each
+ * is found separately rather than reusing a single "latest complete point".
+ */
+export function latestResources(
+  points: MetricPoint[],
+): {
+  disk: { used: number; total: number } | null;
+  swap: { used: number; total: number } | null;
+} {
+  let disk: { used: number; total: number } | null = null;
+  for (let i = points.length - 1; i >= 0; i--) {
+    const p = points[i];
+    if (p.disk_used !== null && p.disk_total !== null && p.disk_total > 0) {
+      disk = { used: p.disk_used, total: p.disk_total };
+      break;
+    }
+  }
+  let swap: { used: number; total: number } | null = null;
+  for (let i = points.length - 1; i >= 0; i--) {
+    const p = points[i];
+    if (p.swap_used !== null && p.swap_total !== null) {
+      swap = { used: p.swap_used, total: p.swap_total };
+      break;
+    }
+  }
+  return { disk, swap };
+}
+
 // load1 is NOT a percentage — leave it unbounded so the chart auto-scales to
 // the series max instead of clamping to 0-100.
 export function buildLoadSeries(points: MetricPoint[]): ChartPoint[] {
