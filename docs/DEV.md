@@ -1282,3 +1282,44 @@ touched `ca_material` again); the vite dev server on `:5173` was never
 stopped. The dev agent enrolled before this task remains orphaned by the
 `--ignored` gate's CA rotation (see above) and needs re-enrolling before any
 agent-facing check.
+
+## Fleet identity & navigation — live verification (2026-07-28)
+
+Design of record: `docs/superpowers/specs/2026-07-28-fleet-identity-design.md`.
+API-level pass run with curl against the dev control plane (branch build,
+migration 0006 applied on startup) and the real dev agent. All green:
+
+- **Mint** (`POST /api/enrollment-tokens`, local-admin session): body tags
+  `["Dev ", " e2e", "dev"]` came back `["dev", "e2e"]` — trim/lowercase/dedupe
+  happens server-side at mint. Defaults confirmed: `max_uses: 1`,
+  `expires_at` ≈ now+24h, `created_by: "local:admin"`, raw `token` present in
+  the 201 and in no other response.
+- **Enroll-time identity** (the Task 5 seam, live): killed the dev agent,
+  wiped `ARGUS_DATA_DIR`, re-enrolled with the minted token → the SAME
+  machine row (keyed on `machine_id`) picked up `display_name "Fatman (dev)"`
+  and `tags {dev,e2e}`; token then shows `uses 1/1` ("used" in the list API).
+- **PATCH** `/api/machines/{id}`: rename/retag/notes round-trip in one call;
+  `{"tags": ["has space"]}` → 400 with the actionable message naming the tag;
+  partial semantics verified (revert PATCH left unlisted fields alone).
+- **Fleet payload** carries `display_name`, `tags`, `capabilities`.
+  **`GET /api/ca.pem`** serves the CA PEM behind auth.
+- **Revoke** → 204; list-state derivation shows `revoked` / `used` / `active`
+  correctly across the table's real history.
+- **Audit**: `machine.update` rows carry field NAMES only (never values);
+  `enroll_token.create`/`enroll_token.revoke` carry the label (and, after the
+  final-review fix, the token id — names are not unique).
+
+One operational note: the enroll page (and any new `/api` route) 404-falls
+through to the SPA on a control plane built before this slice — the browser
+then shows "Unexpected token '<'" from parsing `index.html` as JSON. That is
+a stale-binary symptom, not a routing bug: rebuild and restart `argus`.
+
+Local admin was reset during this pass (the previous password had been
+rotated during the PR #12 checks): the break-glass credential in use is the
+one issued 2026-07-28 by `argus local-admin reset`.
+
+Browser checklist (operator): identity dialog single-border both themes;
+chip-count contrast inside the selected Badge; server-400 Alert in the
+dialog via an invalid-charset tag; Enter-with-highlight commits the
+suggestion; enroll page mint/copy/revoke flow; grouped view duplicating a
+multi-tag machine; URL round-trip in a fresh tab; Ctrl+K from a cold page.
