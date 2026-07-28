@@ -79,17 +79,24 @@ HASH=$(printf devtoken | sha256sum | cut -d' ' -f1)
 docker exec argus-pg psql -U postgres -d argus -c \
   "INSERT INTO enrollment_tokens (name, token_hash) VALUES ('dev', decode('$HASH','hex'))"
 
-# 3. Run the agent (ARGUS_DATA_DIR lets it write its key/cert as a non-root user):
-ARGUS_AGENT_ENDPOINT=https://localhost:9443 \
-ARGUS_JOIN_TOKEN=devtoken \
-ARGUS_CA_CERT=/tmp/argus-ca.crt \
-ARGUS_DATA_DIR=/tmp/argus-agent \
-cargo run -p argus-agent
+# 3. Run the agent. Run it AS ROOT (sudo -n) to match production: the terminal
+#    slice spawns its shell as the agent's own user with no user switching, so a
+#    non-root agent quietly gives every terminal a non-root shell — it looks
+#    like an SSO-to-OS-user mapping, but no such mapping exists. Build first;
+#    `sudo cargo run` would build as root and litter target/ with root-owned files.
+cargo build -p argus-agent
+sudo -n env \
+  ARGUS_AGENT_ENDPOINT=https://localhost:9443 \
+  ARGUS_JOIN_TOKEN=devtoken \
+  ARGUS_CA_CERT=/tmp/argus-ca.crt \
+  ARGUS_DATA_DIR=/tmp/argus-agent \
+  ./target/debug/argus-agent
 ```
 The agent generates a keypair + CSR locally (private key never leaves the host),
 calls `Enroll` over server-auth TLS, persists the issued client cert to
 `ARGUS_DATA_DIR`, then opens the persistent mTLS `Session` and heartbeats. On a
-later start it *loads* that identity and skips enrollment.
+later start it *loads* that identity and skips enrollment — but `ARGUS_JOIN_TOKEN`
+must still be set (any value): config validation requires it unconditionally.
 
 Open http://127.0.0.1:8080 — the fleet page shows the machine `online`.
 
