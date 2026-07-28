@@ -196,3 +196,25 @@
   font-style: var(--shiki-dark-font-style);
   font-weight: var(--shiki-dark-font-weight);
 }
+
+/* uPlot legend, restyled to the app's idiom (user-reported: the stock
+   legend looked foreign). uPlot renders it as table.u-legend.u-inline when
+   `live: false`; markers carry the series stroke as an inline border color,
+   so only shape/size/typography are overridden here. */
+table.u-legend.u-inline {
+  margin-top: 0.5rem;
+}
+table.u-legend.u-inline th {
+  font-family: "IBM Plex Mono", ui-monospace, monospace;
+  font-size: 11px;
+  font-weight: 400;
+  text-transform: uppercase;
+  letter-spacing: 0.16em;
+  color: var(--muted-foreground);
+}
+table.u-legend.u-inline .u-marker {
+  width: 10px;
+  height: 10px;
+  border-radius: 0;
+  border-width: 2px;
+}

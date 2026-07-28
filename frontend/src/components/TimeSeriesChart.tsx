@@ -145,6 +145,19 @@ export default function TimeSeriesChart({
           grid: { stroke: axis, width: 1 },
           ticks: { stroke: axis },
           font: '11px "IBM Plex Mono", monospace',
+          // The y labels go through the SAME formatter as the tooltip, so a
+          // bytes chart reads "150 KB/s", not a raw "150,000" (user-reported:
+          // raw values both overflowed the default 50px gutter — clipping to
+          // "00,000" — and meant nothing without units).
+          values: (_u: uPlot, vals: number[]) => vals.map(format),
+          // Size the gutter to the longest label actually rendered instead
+          // of uPlot's fixed default: formatted rates ("150.0 KB/s") are far
+          // wider than the percentages the default was tuned for. ~6.6px per
+          // character at 11px IBM Plex Mono, plus tick+padding.
+          size: (_u: uPlot, vals: string[] | null) => {
+            const longest = vals === null ? 4 : vals.reduce((m, v) => Math.max(m, v.length), 0);
+            return Math.ceil(longest * 6.6) + 18;
+          },
         },
       ],
       series: [
