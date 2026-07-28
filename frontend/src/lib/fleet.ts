@@ -4,8 +4,6 @@
 import type { FleetRow } from "../api";
 import { CAP_DOCKER, CAP_JOURNAL, CAP_SYSTEMD } from "../api";
 
-export type FleetView = "flat" | "grouped";
-
 /** The name a machine renders under everywhere: operator-set, else hostname. */
 export function displayName(m: Pick<FleetRow, "display_name" | "hostname">): string {
   return m.display_name ?? m.hostname;

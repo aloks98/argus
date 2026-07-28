@@ -21,16 +21,16 @@ import {
   AlertDialogTitle,
   Badge,
   Button,
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
   Checkbox,
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
   CopyButton,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
   EmptyState,
   Field,
   FieldDescription,
@@ -105,15 +105,123 @@ export default function EnrollPage() {
         meta="Mint a join token so a new agent can enroll into the fleet."
       />
       <div className="flex flex-col gap-4">
-        <MintTokenCard />
+        <MintTokenSection />
         <TokenTable />
       </div>
     </>
   );
 }
 
-function MintTokenCard() {
+/**
+ * Owns both dialogs and the one `useMintToken()` instance shared between
+ * them — the mutation has to live above whichever dialog is currently
+ * mounted so `mintMutation.data` survives the form dialog closing (its
+ * content, `MintTokenForm`, unmounts on close — see the Dialog below) long
+ * enough for the result dialog to read it.
+ */
+function MintTokenSection() {
   const mintMutation = useMintToken();
+  const [mintOpen, setMintOpen] = useState(false);
+  const [resultOpen, setResultOpen] = useState(false);
+
+  function openMint() {
+    // Clears a previous attempt's error/data before the form (re)mounts —
+    // same reason `TokenTable`'s `openRevoke` resets its mutation before
+    // opening.
+    mintMutation.reset();
+    setMintOpen(true);
+  }
+
+  return (
+    <>
+      <div>
+        <Button onClick={openMint}>Mint a token</Button>
+      </div>
+
+      {/* Dialog 1: the mint form. A normal dismissable dialog (Escape,
+          outside-click, and the built-in X all close it) — unlike the result
+          dialog below, nothing here is destructive or shown only once.
+          `MintTokenForm` is DialogContent's direct child; rnui's
+          `DialogContent` wraps `Dialog.Portal` with no `keepMounted`
+          (defaults to `false`), so the portal — and `MintTokenForm` with
+          it — unmounts once the close transition finishes. That gives the
+          form fresh `useForm()` state on every open for free, the same
+          mechanism MachineDetailPage's identity Dialog relies on for
+          `MachineIdentity` (see its comment for the precedent). */}
+      <Dialog open={mintOpen} onOpenChange={setMintOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Mint an enrollment token</DialogTitle>
+            <DialogDescription>
+              A join token an agent uses once to enroll into the fleet.
+            </DialogDescription>
+          </DialogHeader>
+          <MintTokenForm
+            mintMutation={mintMutation}
+            onMinted={() => {
+              setMintOpen(false);
+              setResultOpen(true);
+            }}
+          />
+        </DialogContent>
+      </Dialog>
+
+      {/* Dialog 2: the result. The raw token is shown exactly once (design
+          "Enroll page") — an accidental Esc or outside click must not eat
+          it, so this is an AlertDialog with an `onOpenChange` guard on top,
+          not a plain Dialog:
+            - AlertDialog forces `disablePointerDismissal` internally
+              (base-ui's `useRenderDialogRoot`: `isAlertDialog ||
+              disablePointerDismissalProp`), which already blocks
+              outside-press.
+            - Escape is NOT gated by that same flag, though — base-ui's
+              dismiss wiring (`useDialogRoot`'s `DialogInteractions`) passes
+              `escapeKey: isTopmost` unconditionally to `useDismiss`, so an
+              AlertDialog closes on Escape exactly like a plain Dialog unless
+              something cancels the attempt. Verified by reading both
+              `useDialogRoot.js` and `useDismiss.js` in
+              `@base-ui/react` — this is not the "AlertDialog blocks Escape
+              too" behavior it's easy to assume from the name.
+          The guard below calls `eventDetails.cancel()` for every close
+          attempt, which base-ui checks *before* touching its own open state
+          (`applyPopupOpenChange`: `onOpenChange` runs, then `if
+          (eventDetails.isCanceled) return;`), so a canceled Escape/outside
+          press never starts an exit transition — no flicker back open. The
+          "Done" button below sets `resultOpen` directly, which changes the
+          controlled `open` prop rather than going through this dismiss flow
+          at all, so it's the only path that actually closes the dialog. */}
+      <AlertDialog
+        open={resultOpen}
+        onOpenChange={(open, eventDetails) => {
+          if (!open) eventDetails.cancel();
+        }}
+      >
+        <AlertDialogContent className="sm:max-w-lg">
+          <AlertDialogHeader>
+            <AlertDialogTitle>Token minted</AlertDialogTitle>
+            <AlertDialogDescription>
+              Shown once. The server stores only a hash.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+
+          {mintMutation.data && <ResultPanel data={mintMutation.data} />}
+
+          <AlertDialogFooter>
+            <Button onClick={() => setResultOpen(false)}>Done</Button>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+    </>
+  );
+}
+
+function MintTokenForm({
+  mintMutation,
+  onMinted,
+}: {
+  mintMutation: ReturnType<typeof useMintToken>;
+  onMinted: () => void;
+}) {
   const form = useForm<MintFormValues>({
     // `z.coerce.number()` gives the schema an *input* type of `unknown` for
     // `max_uses`/`expires_in_hours` (any input is accepted pre-coercion), so
@@ -136,274 +244,260 @@ function MintTokenCard() {
   const neverExpires = form.watch("never_expires");
 
   const onSubmit = (values: MintFormValues) => {
-    mintMutation.mutate(toMintBody(values), {
-      onSuccess: () => form.reset(defaultMintValues),
-    });
+    mintMutation.mutate(toMintBody(values), { onSuccess: onMinted });
   };
 
   return (
+    // No Card here — this component is dialog-only (MintTokenSection mounts
+    // it inside DialogContent, which already supplies the frame and the
+    // visible heading via DialogTitle/DialogDescription). Same reasoning as
+    // MachineIdentity.tsx's dialog-only form: a Card wrapper would nest its
+    // own border inside the dialog's, rendering as a visible double border.
     <>
-      <Card>
-        <CardHeader>
-          <CardTitle>Mint an enrollment token</CardTitle>
-          <CardDescription>
-            A join token an agent uses once to enroll into the fleet.
-          </CardDescription>
-        </CardHeader>
-        <CardContent>
-          {mintMutation.error !== null && (
-            <Alert variant="destructive" className="mb-4">
-              <AlertTitle>Mint failed</AlertTitle>
-              <AlertDescription>{mintMutation.error.message}</AlertDescription>
-            </Alert>
-          )}
+      {mintMutation.error !== null && (
+        <Alert variant="destructive" className="mb-4">
+          <AlertTitle>Mint failed</AlertTitle>
+          <AlertDescription>{mintMutation.error.message}</AlertDescription>
+        </Alert>
+      )}
 
-          {/* `noValidate`: see SignIn.tsx's LocalSignInForm for why — without
-              it the browser's own bubble validation wins the race against
-              FieldError. */}
-          <form
-            noValidate
-            onSubmit={form.handleSubmit(onSubmit)}
-            className="flex flex-col gap-4"
-          >
+      {/* `noValidate`: see SignIn.tsx's LocalSignInForm for why — without
+          it the browser's own bubble validation wins the race against
+          FieldError. */}
+      <form
+        noValidate
+        onSubmit={form.handleSubmit(onSubmit)}
+        className="flex flex-col gap-4"
+      >
+        <FieldGroup>
+          <Controller
+            name="name"
+            control={form.control}
+            render={({ field, fieldState }) => (
+              <Field data-invalid={fieldState.invalid}>
+                <FieldLabel htmlFor="mint-name">Label</FieldLabel>
+                <Input
+                  {...field}
+                  id="mint-name"
+                  placeholder="e.g. rack-3-batch"
+                  aria-invalid={fieldState.invalid}
+                />
+                <FieldDescription>
+                  Identifies this token in the table below — not shown to the agent.
+                </FieldDescription>
+                {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+              </Field>
+            )}
+          />
+
+          <Controller
+            name="display_name"
+            control={form.control}
+            render={({ field, fieldState }) => (
+              <Field data-invalid={fieldState.invalid}>
+                <FieldLabel htmlFor="mint-display-name">Display name</FieldLabel>
+                <Input
+                  {...field}
+                  id="mint-display-name"
+                  placeholder="Optional — applied to the enrolled machine"
+                  aria-invalid={fieldState.invalid}
+                />
+                {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+              </Field>
+            )}
+          />
+
+          <Controller
+            name="tags"
+            control={form.control}
+            render={({ field, fieldState }) => (
+              <Field data-invalid={fieldState.invalid}>
+                <FieldLabel htmlFor="mint-tags">Tags</FieldLabel>
+                <Input
+                  {...field}
+                  id="mint-tags"
+                  placeholder="rack-3, prod"
+                  aria-invalid={fieldState.invalid}
+                />
+                <FieldDescription>
+                  Comma-separated. Applied to the enrolled machine.
+                </FieldDescription>
+                {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+              </Field>
+            )}
+          />
+        </FieldGroup>
+
+        <Collapsible>
+          <CollapsibleTrigger className="group flex items-center gap-1.5 self-start font-mono text-[11px] uppercase tracking-widest text-muted-foreground hover:text-foreground">
+            <ChevronRight className="size-3.5 transition-transform group-data-panel-open:rotate-90" />
+            Advanced
+          </CollapsibleTrigger>
+          <CollapsibleContent className="mt-3">
             <FieldGroup>
               <Controller
-                name="name"
+                name="max_uses"
                 control={form.control}
                 render={({ field, fieldState }) => (
                   <Field data-invalid={fieldState.invalid}>
-                    <FieldLabel htmlFor="mint-name">Label</FieldLabel>
-                    <Input
-                      {...field}
-                      id="mint-name"
-                      placeholder="e.g. rack-3-batch"
-                      aria-invalid={fieldState.invalid}
-                    />
-                    <FieldDescription>
-                      Identifies this token in the table below — not shown to the agent.
-                    </FieldDescription>
+                    <FieldLabel htmlFor="mint-max-uses">Max uses</FieldLabel>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <Input
+                        {...field}
+                        id="mint-max-uses"
+                        type="number"
+                        min={1}
+                        disabled={unlimitedUses}
+                        aria-invalid={fieldState.invalid}
+                        className="max-w-[7rem]"
+                      />
+                      <Controller
+                        name="unlimited_uses"
+                        control={form.control}
+                        render={({ field: unlimitedField }) => (
+                          <div className="flex items-center gap-2">
+                            <Checkbox
+                              id="mint-unlimited-uses"
+                              checked={unlimitedField.value}
+                              onCheckedChange={unlimitedField.onChange}
+                            />
+                            <label
+                              htmlFor="mint-unlimited-uses"
+                              className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground"
+                            >
+                              Unlimited
+                            </label>
+                          </div>
+                        )}
+                      />
+                    </div>
+                    <FieldDescription>Default: single use.</FieldDescription>
                     {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
                   </Field>
                 )}
               />
 
               <Controller
-                name="display_name"
+                name="expires_in_hours"
                 control={form.control}
                 render={({ field, fieldState }) => (
                   <Field data-invalid={fieldState.invalid}>
-                    <FieldLabel htmlFor="mint-display-name">Display name</FieldLabel>
-                    <Input
-                      {...field}
-                      id="mint-display-name"
-                      placeholder="Optional — applied to the enrolled machine"
-                      aria-invalid={fieldState.invalid}
-                    />
-                    {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
-                  </Field>
-                )}
-              />
-
-              <Controller
-                name="tags"
-                control={form.control}
-                render={({ field, fieldState }) => (
-                  <Field data-invalid={fieldState.invalid}>
-                    <FieldLabel htmlFor="mint-tags">Tags</FieldLabel>
-                    <Input
-                      {...field}
-                      id="mint-tags"
-                      placeholder="rack-3, prod"
-                      aria-invalid={fieldState.invalid}
-                    />
-                    <FieldDescription>
-                      Comma-separated. Applied to the enrolled machine.
-                    </FieldDescription>
+                    <FieldLabel htmlFor="mint-expires-in-hours">
+                      Expires in (hours)
+                    </FieldLabel>
+                    <div className="flex flex-wrap items-center gap-3">
+                      <Input
+                        {...field}
+                        id="mint-expires-in-hours"
+                        type="number"
+                        min={1}
+                        max={8760}
+                        disabled={neverExpires}
+                        aria-invalid={fieldState.invalid}
+                        className="max-w-[7rem]"
+                      />
+                      <Controller
+                        name="never_expires"
+                        control={form.control}
+                        render={({ field: neverField }) => (
+                          <div className="flex items-center gap-2">
+                            <Checkbox
+                              id="mint-never-expires"
+                              checked={neverField.value}
+                              onCheckedChange={neverField.onChange}
+                            />
+                            <label
+                              htmlFor="mint-never-expires"
+                              className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground"
+                            >
+                              Never expires
+                            </label>
+                          </div>
+                        )}
+                      />
+                    </div>
+                    <FieldDescription>Default: 24 hours.</FieldDescription>
                     {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
                   </Field>
                 )}
               />
             </FieldGroup>
+          </CollapsibleContent>
+        </Collapsible>
 
-            <Collapsible>
-              <CollapsibleTrigger className="group flex items-center gap-1.5 self-start font-mono text-[11px] uppercase tracking-widest text-muted-foreground hover:text-foreground">
-                <ChevronRight className="size-3.5 transition-transform group-data-panel-open:rotate-90" />
-                Advanced
-              </CollapsibleTrigger>
-              <CollapsibleContent className="mt-3">
-                <FieldGroup>
-                  <Controller
-                    name="max_uses"
-                    control={form.control}
-                    render={({ field, fieldState }) => (
-                      <Field data-invalid={fieldState.invalid}>
-                        <FieldLabel htmlFor="mint-max-uses">Max uses</FieldLabel>
-                        <div className="flex flex-wrap items-center gap-3">
-                          <Input
-                            {...field}
-                            id="mint-max-uses"
-                            type="number"
-                            min={1}
-                            disabled={unlimitedUses}
-                            aria-invalid={fieldState.invalid}
-                            className="max-w-[7rem]"
-                          />
-                          <Controller
-                            name="unlimited_uses"
-                            control={form.control}
-                            render={({ field: unlimitedField }) => (
-                              <div className="flex items-center gap-2">
-                                <Checkbox
-                                  id="mint-unlimited-uses"
-                                  checked={unlimitedField.value}
-                                  onCheckedChange={unlimitedField.onChange}
-                                />
-                                <label
-                                  htmlFor="mint-unlimited-uses"
-                                  className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground"
-                                >
-                                  Unlimited
-                                </label>
-                              </div>
-                            )}
-                          />
-                        </div>
-                        <FieldDescription>Default: single use.</FieldDescription>
-                        {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
-                      </Field>
-                    )}
-                  />
-
-                  <Controller
-                    name="expires_in_hours"
-                    control={form.control}
-                    render={({ field, fieldState }) => (
-                      <Field data-invalid={fieldState.invalid}>
-                        <FieldLabel htmlFor="mint-expires-in-hours">
-                          Expires in (hours)
-                        </FieldLabel>
-                        <div className="flex flex-wrap items-center gap-3">
-                          <Input
-                            {...field}
-                            id="mint-expires-in-hours"
-                            type="number"
-                            min={1}
-                            max={8760}
-                            disabled={neverExpires}
-                            aria-invalid={fieldState.invalid}
-                            className="max-w-[7rem]"
-                          />
-                          <Controller
-                            name="never_expires"
-                            control={form.control}
-                            render={({ field: neverField }) => (
-                              <div className="flex items-center gap-2">
-                                <Checkbox
-                                  id="mint-never-expires"
-                                  checked={neverField.value}
-                                  onCheckedChange={neverField.onChange}
-                                />
-                                <label
-                                  htmlFor="mint-never-expires"
-                                  className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground"
-                                >
-                                  Never expires
-                                </label>
-                              </div>
-                            )}
-                          />
-                        </div>
-                        <FieldDescription>Default: 24 hours.</FieldDescription>
-                        {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
-                      </Field>
-                    )}
-                  />
-                </FieldGroup>
-              </CollapsibleContent>
-            </Collapsible>
-
-            <div className="flex justify-end">
-              <Button type="submit" disabled={mintMutation.isPending}>
-                {mintMutation.isPending ? (
-                  <>
-                    <Spinner className="size-3.5" />
-                    Minting…
-                  </>
-                ) : (
-                  "Mint token"
-                )}
-              </Button>
-            </div>
-          </form>
-        </CardContent>
-      </Card>
-
-      {/* Component state only (`mintMutation.data`, held by this hook
-          instance) — never written to the query cache or anywhere else, so
-          navigating away loses the raw token for good. That's the point: the
-          server only ever stores its hash (design "Enroll page"). A fresh
-          `mutate()` call clears `data` back to `undefined` before the new
-          result arrives (see query-core's "pending" reducer case), so
-          starting a second mint doesn't leave a stale token on screen. */}
-      {mintMutation.isSuccess && mintMutation.data && (
-        <ResultPanel data={mintMutation.data} />
-      )}
+        <div className="flex justify-end">
+          <Button type="submit" disabled={mintMutation.isPending}>
+            {mintMutation.isPending ? (
+              <>
+                <Spinner className="size-3.5" />
+                Minting…
+              </>
+            ) : (
+              "Mint token"
+            )}
+          </Button>
+        </div>
+      </form>
     </>
   );
 }
 
 function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
+  // `--config` reads the same four keys from an env-file (`KEY=VALUE` per
+  // line — a subset of systemd's `EnvironmentFile=` syntax) instead of the
+  // process environment (docs/DEV.md, "Enroll an agent" § Alternative). That
+  // file survives a reboot, unlike the old `sudo -n env VAR=... ./argus-agent`
+  // one-shot, and doubles as a systemd unit's `EnvironmentFile=` unchanged
+  // later — the reason this block writes the file first rather than passing
+  // the same four values as env vars directly.
   const runBlock = [
-    "sudo -n env \\",
-    "  ARGUS_AGENT_ENDPOINT=https://<agent-endpoint>:9443 \\",
-    `  ARGUS_JOIN_TOKEN=${data.token} \\`,
-    "  ARGUS_CA_CERT=/etc/argus/argus-ca.crt \\",
-    "  ARGUS_DATA_DIR=/var/lib/argus-agent \\",
-    "  ./argus-agent",
+    "sudo tee /etc/argus/agent.env <<'EOF'",
+    "ARGUS_AGENT_ENDPOINT=https://<agent-endpoint>:9443",
+    `ARGUS_JOIN_TOKEN=${data.token}`,
+    "ARGUS_CA_CERT=/etc/argus/argus-ca.crt",
+    "ARGUS_DATA_DIR=/var/lib/argus-agent",
+    "EOF",
+    "",
+    "sudo -n ./argus-agent --config /etc/argus/agent.env",
   ].join("\n");
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Token minted</CardTitle>
-        <CardDescription>
-          Shown once. The server stores only a hash.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-4">
-        <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2">
-          <code className="min-w-0 flex-1 select-all break-all font-mono text-sm">
-            {data.token}
-          </code>
-          <CopyButton value={data.token} />
-        </div>
+    // No Card here, same reasoning as MintTokenForm — this panel only ever
+    // renders inside the result AlertDialog, which already supplies the
+    // frame and the "Token minted" heading via AlertDialogHeader.
+    <div className="flex flex-col gap-4">
+      <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2">
+        <code className="min-w-0 flex-1 select-all break-all font-mono text-sm">
+          {data.token}
+        </code>
+        <CopyButton value={data.token} />
+      </div>
 
-        <Button
-          variant="outline"
-          size="sm"
-          className="w-fit"
-          render={<a href="/api/ca.pem" download="argus-ca.crt" />}
-        >
-          Download CA certificate
-        </Button>
+      <Button
+        variant="outline"
+        size="sm"
+        className="w-fit"
+        render={<a href="/api/ca.pem" download="argus-ca.crt" />}
+      >
+        Download CA certificate
+      </Button>
 
-        <div>
-          <div className="flex items-center justify-between gap-2 rounded-t-lg border border-b-0 border-border bg-muted/40 px-3 py-1.5">
-            <span className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">
-              Run on the host
-            </span>
-            <CopyButton value={runBlock} />
-          </div>
-          <pre className="overflow-x-auto rounded-b-lg border border-border bg-muted/20 px-3 py-2 font-mono text-xs">
-            {runBlock}
-          </pre>
-          <FieldDescription className="mt-1">
-            Replace <code>&lt;agent-endpoint&gt;</code> with the address agents reach the
-            control plane on — Argus cannot know its externally routable address.
-          </FieldDescription>
+      <div>
+        <div className="flex items-center justify-between gap-2 rounded-t-lg border border-b-0 border-border bg-muted/40 px-3 py-1.5">
+          <span className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">
+            Run on the host
+          </span>
+          <CopyButton value={runBlock} />
         </div>
-      </CardContent>
-    </Card>
+        <pre className="overflow-x-auto rounded-b-lg border border-border bg-muted/20 px-3 py-2 font-mono text-xs">
+          {runBlock}
+        </pre>
+        <FieldDescription className="mt-1">
+          Replace <code>&lt;agent-endpoint&gt;</code> with the address agents reach the
+          control plane on — Argus cannot know its externally routable address.
+        </FieldDescription>
+      </div>
+    </div>
   );
 }
 

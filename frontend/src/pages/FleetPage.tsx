@@ -3,10 +3,10 @@
 // column per row, plus an amber "reconnecting…" hint for rows that were
 // online/pending but have gone quiet.
 //
-// Search, tag filter and flat/grouped view are all URL state (`q`, `tags`,
-// `view`) so a filtered view is linkable and survives a reload — same
-// contract as the Logs tab's `useLogFilters`, hand-rolled here because this
-// page's params (a multi-value tag set, a two-state view) don't fit that
+// Search, tag filter and group-by are all URL state (`q`, `tags`, `group`)
+// so a filtered view is linkable and survives a reload — same contract as
+// the Logs tab's `useLogFilters`, hand-rolled here because this page's
+// params (a multi-value tag set, a single active group tag) don't fit that
 // hook's shape.
 import { Link, useSearchParams } from "react-router-dom";
 import {
@@ -14,6 +14,14 @@ import {
   AlertDescription,
   AlertTitle,
   Badge,
+  Button,
+  DropdownMenu,
+  DropdownMenuContent,
+  DropdownMenuItem,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
+  DropdownMenuTrigger,
   EmptyState,
   Input,
   Table,
@@ -22,8 +30,6 @@ import {
   TableHead,
   TableHeader,
   TableRow,
-  ToggleGroup,
-  ToggleGroupItem,
 } from "@e412/rnui-react";
 import type { FleetRow } from "../api";
 import AssetTag from "../components/AssetTag";
@@ -31,7 +37,6 @@ import PageHeader from "../components/PageHeader";
 import Sparkline from "../components/Sparkline";
 import StatusBadge from "../components/StatusBadge";
 import { displayName, fleetTags, groupFleet, visibleFleet } from "../lib/fleet";
-import type { FleetView } from "../lib/fleet";
 import { formatPct, formatRelative } from "../lib/format";
 import { useFleet } from "../lib/queries";
 import { machineTone } from "../lib/status";
@@ -147,7 +152,12 @@ export default function FleetPage() {
     .split(",")
     .map((t) => t.trim().toLowerCase())
     .filter(Boolean);
-  const view: FleetView = params.get("view") === "grouped" ? "grouped" : "flat";
+  // Absent/empty = flat (no grouping); otherwise the tag whose section is
+  // shown in place of the flat table. Lowercased for the same reason
+  // `selectedTags` is — a hand-edited URL with stray case would otherwise
+  // silently match no section.
+  const rawGroup = params.get("group");
+  const group = rawGroup !== null && rawGroup.trim() !== "" ? rawGroup.trim().toLowerCase() : null;
 
   // One updater so every control writes URL state the same way; deleting
   // empty params keeps URLs canonical (absent = default, per the design).
@@ -172,6 +182,15 @@ export default function FleetPage() {
 
   const tags = fleetTags(rows);
   const filtered = visibleFleet(rows, q, selectedTags);
+  // The group tag composes with q/tags: `groupFleet` is run on the
+  // already-filtered rows, then the one section for the active group tag is
+  // picked out of it — `groupFleet` still owns "a machine under every tag it
+  // carries" so that semantics isn't duplicated here. A group tag that
+  // matches nothing in the current filter (rather than one absent from the
+  // fleet entirely — the dropdown only ever offers real tags) falls back to
+  // an empty section rather than disappearing.
+  const groupSection =
+    group !== null ? (groupFleet(filtered).find((s) => s.tag === group) ?? { tag: group, rows: [] }) : null;
 
   return (
     <>
@@ -215,7 +234,7 @@ export default function FleetPage() {
         />
         {tags.length > 0 && (
           <div className="flex flex-wrap gap-1">
-            {tags.map(({ tag, count }) => {
+            {tags.map(({ tag }) => {
               const selected = selectedTags.includes(tag);
               return (
                 // A plain `<button>` wrapping the Badge rather than Badge's own
@@ -223,29 +242,49 @@ export default function FleetPage() {
                 // button chrome (border-width, padding, background), so the
                 // wrapper adds nothing visually but keeps the toggle semantics
                 // (aria-pressed, click) independent of Badge's own prop surface.
+                //
+                // No count here (browser-review decision) — counts now live
+                // only in the "Group by" dropdown below, so a chip is just
+                // the tag itself.
                 <button
                   key={tag}
                   type="button"
                   aria-pressed={selected}
                   onClick={() => toggleTag(tag)}
                 >
-                  <Badge variant={selected ? "default" : "outline"}>
-                    {tag} <span className="text-muted-foreground">{count}</span>
-                  </Badge>
+                  <Badge variant={selected ? "default" : "outline"}>{tag}</Badge>
                 </button>
               );
             })}
           </div>
         )}
-        <ToggleGroup
-          value={[view]}
-          onValueChange={(next) => setParam("view", next.includes("grouped") ? "grouped" : "")}
-          aria-label="Fleet view"
-          className="ml-auto"
-        >
-          <ToggleGroupItem value="flat">Flat</ToggleGroupItem>
-          <ToggleGroupItem value="grouped">Grouped</ToggleGroupItem>
-        </ToggleGroup>
+
+        {/* Replaces the old Flat/Grouped ToggleGroup (browser-review
+            decision) — a single dropdown whose trigger names the active
+            group, with per-tag counts moved here (off the filter chips
+            above). `DropdownMenuContent`/`DropdownMenuSubContent` already
+            wrap their own Portal+Positioner (rnui's dropdown-menu.tsx), so
+            no manual Portal here. */}
+        <DropdownMenu>
+          <DropdownMenuTrigger render={<Button variant="outline" size="sm" className="ml-auto" />}>
+            {`Group by: ${group ?? "none"}`}
+          </DropdownMenuTrigger>
+          <DropdownMenuContent align="end">
+            <DropdownMenuItem onClick={() => setParam("group", "")}>None</DropdownMenuItem>
+            {tags.length > 0 && (
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger>Tags</DropdownMenuSubTrigger>
+                <DropdownMenuSubContent>
+                  {tags.map(({ tag, count }) => (
+                    <DropdownMenuItem key={tag} onClick={() => setParam("group", tag)}>
+                      {tag} ({count})
+                    </DropdownMenuItem>
+                  ))}
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
+            )}
+          </DropdownMenuContent>
+        </DropdownMenu>
       </form>
 
       {!isPending && rows.length === 0 ? (
@@ -262,27 +301,26 @@ export default function FleetPage() {
             description="No machine matches the current filter."
           />
         </div>
-      ) : view === "flat" ? (
+      ) : groupSection === null ? (
         <FleetTable rows={filtered} />
       ) : (
-        <div className="space-y-6">
-          {groupFleet(filtered).map((section) => (
-            // `""` (not "untagged") — a real tag literally named "untagged"
-            // is a distinct section from the untagged one, so both need
-            // distinct keys; the tag charset regex requires a first
-            // character, so "" can never collide with an actual tag.
-            <div key={section.tag ?? ""}>
-              <div className="flex flex-wrap items-baseline gap-2 pb-2">
-                <h2 className="font-display text-sm uppercase tracking-widest">
-                  {section.tag ?? "Untagged"}
-                </h2>
-                <span className="font-mono text-[11px] normal-case tracking-normal text-muted-foreground">
-                  {section.rows.length} machine{section.rows.length === 1 ? "" : "s"}
-                </span>
-              </div>
-              <FleetTable rows={section.rows} />
+        <div>
+          <div className="flex flex-wrap items-baseline gap-2 pb-2">
+            <h2 className="font-display text-sm uppercase tracking-widest">{groupSection.tag}</h2>
+            <span className="font-mono text-[11px] normal-case tracking-normal text-muted-foreground">
+              {groupSection.rows.length} machine{groupSection.rows.length === 1 ? "" : "s"}
+            </span>
+          </div>
+          {groupSection.rows.length === 0 ? (
+            <div className="border border-border">
+              <EmptyState
+                title="No matching machines"
+                description={`No machine in the current filter carries the "${groupSection.tag}" tag.`}
+              />
             </div>
-          ))}
+          ) : (
+            <FleetTable rows={groupSection.rows} />
+          )}
         </div>
       )}
     </>

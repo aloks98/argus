@@ -9,6 +9,7 @@ import {
   Alert,
   AlertDescription,
   AlertTitle,
+  Badge,
   Breadcrumb,
   BreadcrumbItem,
   BreadcrumbLink,
@@ -251,7 +252,6 @@ export default function MachineDetailPage() {
     ...(machine.arch !== null ? [{ label: "Arch", value: machine.arch }] : []),
     ...(machine.agent_version !== null ? [{ label: "Agent", value: machine.agent_version }] : []),
     { label: "Last seen", value: formatRelative(machine.last_seen_at) },
-    ...(machine.tags.length > 0 ? [{ label: "Tags", value: machine.tags.join(", ") }] : []),
   ];
 
   return (
@@ -289,26 +289,39 @@ export default function MachineDetailPage() {
             common case) show just the hostname, unchanged from before. The
             Edit control sits in this same row rather than in SpecStrip —
             editing identity isn't "a fact about the machine" the way OS/IP/
-            kernel are. */}
-        <div
-          className={cn(
-            "mt-2 flex flex-wrap items-center gap-3",
-            machine.display_name === null && "mb-3",
+            kernel are.
+
+            Tags live here too, as chips, rather than comma-joined in
+            SpecStrip (browser-review decision) — same `Badge
+            variant="outline"` FleetPage's Tags column uses, so a machine's
+            tags read identically whether you're scanning the fleet table or
+            its own detail page. Omitted entirely when the machine has none,
+            same as every other conditional line in this block. */}
+        <div className="mt-2 mb-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <h1 className="font-display text-2xl uppercase tracking-tight">
+              {displayName(machine)}
+            </h1>
+            <Button variant="outline" size="sm" onClick={() => setEditOpen(true)}>
+              <Pencil className="size-3.5" />
+              Edit
+            </Button>
+          </div>
+          {machine.display_name !== null && (
+            <p className="mt-1 font-mono text-[11px] text-muted-foreground">
+              {machine.hostname}
+            </p>
           )}
-        >
-          <h1 className="font-display text-2xl uppercase tracking-tight">
-            {displayName(machine)}
-          </h1>
-          <Button variant="outline" size="sm" onClick={() => setEditOpen(true)}>
-            <Pencil className="size-3.5" />
-            Edit
-          </Button>
+          {machine.tags.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1">
+              {machine.tags.map((tag) => (
+                <Badge key={tag} variant="outline">
+                  {tag}
+                </Badge>
+              ))}
+            </div>
+          )}
         </div>
-        {machine.display_name !== null && (
-          <p className="mb-3 font-mono text-[11px] text-muted-foreground">
-            {machine.hostname}
-          </p>
-        )}
 
         <SpecStrip items={specItems} />
       </div>

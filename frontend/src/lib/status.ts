@@ -55,10 +55,18 @@ export function unitTone(activeState: string): Tone {
 /**
  * Enrollment-token lifecycle, derived client-side from its four contributing
  * fields (there is no `state` column on the wire). Order matters: a revoked
- * token reads "revoked" even if it's also past its expiry or used up, and a
- * used-up token reads that way even if it also happens to be expired.
+ * token reads "revoked" even if it's also past its expiry or used up.
+ *
+ * "used up" deliberately folds into "expired" (browser-review decision): a
+ * token that has spent all its uses is, for every purpose an operator cares
+ * about, no longer usable — same as one past its time expiry — and the two
+ * read the same way (`warn` tone) rather than as separate states. The uses
+ * column (`t.uses`/`t.max_uses`) still shows `1/1` on the row, so which kind
+ * of "expired" it is isn't lost, just not surfaced as its own label. Revoke
+ * button visibility (active-only) is unaffected — it was never state-gated
+ * on "used up" specifically.
  */
-export type TokenState = "revoked" | "used up" | "expired" | "active";
+export type TokenState = "revoked" | "expired" | "active";
 
 export function tokenState(t: {
   revoked: boolean;
@@ -67,17 +75,16 @@ export function tokenState(t: {
   expires_at: string | null;
 }): TokenState {
   if (t.revoked) return "revoked";
-  if (t.max_uses !== null && t.uses >= t.max_uses) return "used up";
+  if (t.max_uses !== null && t.uses >= t.max_uses) return "expired";
   if (t.expires_at !== null && Date.parse(t.expires_at) < Date.now()) return "expired";
   return "active";
 }
 
-/** fail/warn/warn/ok, per the design. */
+/** fail/warn/ok, per the design. */
 export function tokenTone(state: TokenState): Tone {
   switch (state) {
     case "revoked":
       return "fail";
-    case "used up":
     case "expired":
       return "warn";
     case "active":
