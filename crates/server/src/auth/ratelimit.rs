@@ -18,6 +18,11 @@
 //!    cannot force the restart that would reset the counter. A table would
 //!    buy durability against a crash nobody can induce, at the cost of a
 //!    write on every failed attempt.
+//! 4. **Hand-rolled, not `governor`.** Considered and rejected: GCRA answers
+//!    "too many requests per period?", but this state machine is keyed to
+//!    *outcomes* -- escalating delay per consecutive failure, reservation
+//!    unwound on success -- which a `Quota` cannot express. Governor's real
+//!    value-add is keyed (per-IP) limiting, which decision 1 rules out here.
 //!
 //! This is a backstop, not the primary defence: the password is 24 random
 //! characters (arithmetically unguessable online -- design §7) and argon2id's
