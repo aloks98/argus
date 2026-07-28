@@ -37,3 +37,15 @@ export function formatBytesPerSec(v: number): string {
   }
   return `${n.toFixed(1)} ${units[i]}`;
 }
+
+/** Same 1024-based ladder as `formatBytesPerSec`, for absolute sizes. */
+export function formatBytes(v: number): string {
+  const units = ["B", "KB", "MB", "GB", "TB"];
+  let n = v;
+  let i = 0;
+  while (n >= 1024 && i < units.length - 1) {
+    n /= 1024;
+    i++;
+  }
+  return `${n.toFixed(1)} ${units[i]}`;
+}

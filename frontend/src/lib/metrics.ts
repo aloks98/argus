@@ -12,14 +12,25 @@ export function buildCpuSeries(points: MetricPoint[]): ChartPoint[] {
     .map((p) => ({ ts: p.ts, value: p.cpu_pct! }));
 }
 
-// mem% is derived from the used/total counters; points missing either side
-// (or with a zero total) are skipped rather than plotted as 0.
-export function buildMemSeries(points: MetricPoint[]): ChartPoint[] {
+// Absolute bytes used, not a derived percentage (user decision: "%" hid the
+// real numbers). Total is effectively constant per machine, so the chart
+// shape is identical to the old percent series — only the axis becomes
+// meaningful. Points missing the counter are skipped rather than plotted as 0.
+export function buildMemUsedSeries(points: MetricPoint[]): ChartPoint[] {
   return points
-    .filter(
-      (p) => p.mem_used !== null && p.mem_total !== null && p.mem_total > 0,
-    )
-    .map((p) => ({ ts: p.ts, value: (100 * p.mem_used!) / p.mem_total! }));
+    .filter((p) => p.mem_used !== null)
+    .map((p) => ({ ts: p.ts, value: p.mem_used! }));
+}
+
+/** The latest point carrying both counters — the card header's used/total. */
+export function latestMem(points: MetricPoint[]): { used: number; total: number } | null {
+  for (let i = points.length - 1; i >= 0; i--) {
+    const p = points[i];
+    if (p.mem_used !== null && p.mem_total !== null && p.mem_total > 0) {
+      return { used: p.mem_used, total: p.mem_total };
+    }
+  }
+  return null;
 }
 
 // load1 is NOT a percentage — leave it unbounded so the chart auto-scales to
