@@ -180,9 +180,13 @@ export default function UnitsCard({
             <TableHeader className="sticky top-0 z-10 [&_th]:bg-background">
               <TableRow>
                 <TableHead>Name</TableHead>
-                <TableHead>Active</TableHead>
-                <TableHead>Sub</TableHead>
-                <TableHead>Description</TableHead>
+                {/* Hidden on phones with the same reasoning as Sub/Description: the
+                    AssetTag's tone already encodes active-vs-failed, and the
+                    ~110px this column costs is exactly what pushed Restart off
+                    a 390px screen (measured). */}
+                <TableHead className="hidden md:table-cell">Active</TableHead>
+                <TableHead className="hidden md:table-cell">Sub</TableHead>
+                <TableHead className="hidden md:table-cell">Description</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
@@ -202,22 +206,22 @@ export default function UnitsCard({
                     <TableCell className="font-medium" title={u.name}>
                       <AssetTag
                         tone={unitTone(u.active_state)}
-                        className="max-w-[30ch]"
+                        className="max-w-[16ch] md:max-w-[30ch]"
                       >
                         <span className="min-w-0 truncate">{u.name}</span>
                       </AssetTag>
                     </TableCell>
-                    <TableCell>
+                    <TableCell className="hidden md:table-cell">
                       <StatusBadge
                         tone={unitTone(u.active_state)}
                         label={u.active_state}
                       />
                     </TableCell>
-                    <TableCell className="font-mono text-muted-foreground">
+                    <TableCell className="hidden md:table-cell font-mono text-muted-foreground">
                       {u.sub_state}
                     </TableCell>
                     <TableCell
-                      className="max-w-[36ch] truncate text-muted-foreground"
+                      className="hidden md:table-cell max-w-[36ch] truncate text-muted-foreground"
                       title={u.description}
                     >
                       {u.description}

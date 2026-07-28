@@ -6,6 +6,7 @@
 import { useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import {
+  Command,
   CommandDialog,
   CommandEmpty,
   CommandGroup,
@@ -45,26 +46,37 @@ export default function CommandPalette({
   const entries = paletteEntries(rows);
   return (
     <CommandDialog open={open} onOpenChange={onOpenChange}>
-      <CommandInput placeholder="Jump to a machine…" />
-      <CommandList>
-        <CommandEmpty>No matches.</CommandEmpty>
-        <CommandGroup heading="Machines">
-          {entries.map((e) => (
-            <CommandItem key={e.key} value={`${e.label} ${e.keywords}`} onSelect={() => go(e.to)}>
-              <span>{e.label}</span>
-              <span className="ml-auto font-mono text-[11px] text-muted-foreground">{e.hint}</span>
+      {/* The explicit <Command> root is LOAD-BEARING, not decoration: unlike
+          shadcn's CommandDialog, rnui's passes children straight into
+          DialogContent without providing cmdk's Command context. Every
+          CommandInput/List/Empty/Item below reads that context via
+          useSyncExternalStore(store.subscribe, ...) — with no root, store is
+          undefined and the first open throws "Cannot read properties of
+          undefined (reading 'subscribe')", unmounting the entire app to a
+          black page. Verified against rnui's compiled $i/CommandDialog and
+          cmdk's source; there is no type error either way, only the crash. */}
+      <Command>
+        <CommandInput placeholder="Jump to a machine…" />
+        <CommandList>
+          <CommandEmpty>No matches.</CommandEmpty>
+          <CommandGroup heading="Machines">
+            {entries.map((e) => (
+              <CommandItem key={e.key} value={`${e.label} ${e.keywords}`} onSelect={() => go(e.to)}>
+                <span>{e.label}</span>
+                <span className="ml-auto font-mono text-[11px] text-muted-foreground">{e.hint}</span>
+              </CommandItem>
+            ))}
+          </CommandGroup>
+          <CommandGroup heading="Pages">
+            <CommandItem value="fleet machines" onSelect={() => go("/machines")}>
+              Fleet
             </CommandItem>
-          ))}
-        </CommandGroup>
-        <CommandGroup heading="Pages">
-          <CommandItem value="fleet machines" onSelect={() => go("/machines")}>
-            Fleet
-          </CommandItem>
-          <CommandItem value="enroll token" onSelect={() => go("/enroll")}>
-            Enroll a machine
-          </CommandItem>
-        </CommandGroup>
-      </CommandList>
+            <CommandItem value="enroll token" onSelect={() => go("/enroll")}>
+              Enroll a machine
+            </CommandItem>
+          </CommandGroup>
+        </CommandList>
+      </Command>
     </CommandDialog>
   );
 }

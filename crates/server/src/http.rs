@@ -1484,6 +1484,7 @@ fn content_type(path: &str) -> &'static str {
         Some("png") => "image/png",
         Some("webp") => "image/webp",
         Some("woff2") => "font/woff2",
+        Some("webmanifest") => "application/manifest+json",
         _ => "application/octet-stream",
     }
 }
@@ -3201,6 +3202,17 @@ mod tests {
     #[test]
     fn an_invalid_window_is_still_rejected_even_with_since_ms() {
         assert!(resolve_log_filters_with_since(None, Some("bogus"), Some(1)).is_none());
+    }
+
+    // --- content_type: the PWA manifest must be served with the MIME type
+    // browsers require to treat it as installable (mobile-pass Task 1).
+
+    #[test]
+    fn content_type_serves_the_webmanifest_mime() {
+        assert_eq!(
+            content_type("manifest.webmanifest"),
+            "application/manifest+json"
+        );
     }
 
     fn test_state(pool: PgPool) -> AppState {

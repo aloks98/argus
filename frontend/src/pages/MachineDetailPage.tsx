@@ -51,11 +51,12 @@ import { BOOT_LOGS, CAP_DOCKER, CAP_JOURNAL, CAP_SYSTEMD, SYSTEM_JOURNAL } from 
 import { cn } from "../lib/cn";
 import { displayName } from "../lib/fleet";
 import { useLogFilters } from "../lib/logFilters";
-import { formatBytesPerSec, formatRelative } from "../lib/format";
+import { formatBytes, formatBytesPerSec, formatRelative } from "../lib/format";
 import {
   buildCpuSeries,
   buildLoadSeries,
-  buildMemSeries,
+  buildMemUsedSeries,
+  latestMem,
   buildNetRateSeries,
 } from "../lib/metrics";
 import { useDocker, useMachine, useMetrics, useSystemd } from "../lib/queries";
@@ -80,6 +81,8 @@ function MetricChartCard({
   series,
   height = 220,
   format,
+  tooltipFormat,
+  rightAxisFormat,
 }: {
   title: string;
   description: string;
@@ -87,6 +90,8 @@ function MetricChartCard({
   series: ChartSeries[];
   height?: number;
   format?: (v: number) => string;
+  tooltipFormat?: (v: number) => string;
+  rightAxisFormat?: (v: number) => string;
 }) {
   return (
     <Card>
@@ -101,7 +106,14 @@ function MetricChartCard({
             description="Waiting for metrics to accumulate."
           />
         ) : (
-          <TimeSeriesChart timestamps={timestamps} series={series} height={height} format={format} />
+          <TimeSeriesChart
+            timestamps={timestamps}
+            series={series}
+            height={height}
+            format={format}
+            tooltipFormat={tooltipFormat}
+            rightAxisFormat={rightAxisFormat}
+          />
         )}
       </CardContent>
     </Card>
@@ -235,7 +247,8 @@ export default function MachineDetailPage() {
   }
 
   const cpuPoints = buildCpuSeries(metrics);
-  const memPoints = buildMemSeries(metrics);
+  const memPoints = buildMemUsedSeries(metrics);
+  const memNow = latestMem(metrics);
   const loadPoints = buildLoadSeries(metrics);
   const netPoints = buildNetRateSeries(metrics);
   const latestNet =
@@ -431,16 +444,30 @@ export default function MachineDetailPage() {
             />
             <MetricChartCard
               title="Memory"
-              description="Memory utilization (%)"
+              description={
+                memNow !== null
+                  ? `used — latest ${formatBytes(memNow.used)} of ${formatBytes(memNow.total)} (${((100 * memNow.used) / memNow.total).toFixed(0)}%)`
+                  : "memory used"
+              }
               timestamps={toSecs(memPoints)}
               series={[
                 {
-                  name: "mem %",
+                  name: "used",
                   data: memPoints.map((p) => p.value),
                   colorVar: "--chart-2",
                 },
               ]}
-              format={formatPercent}
+              format={formatBytes}
+              tooltipFormat={
+                memNow !== null
+                  ? (v: number) => `${formatBytes(v)} (${((100 * v) / memNow.total).toFixed(0)}%)`
+                  : undefined
+              }
+              rightAxisFormat={
+                memNow !== null
+                  ? (v: number) => `${((100 * v) / memNow.total).toFixed(0)}%`
+                  : undefined
+              }
             />
             <MetricChartCard
               title="Load average"

@@ -74,7 +74,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </Alert>
       )}
       <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} />
-      <FleetSidebar onAccountError={setAccountError} onOpenPalette={() => setPaletteOpen(true)} />
+      <FleetSidebar onAccountError={setAccountError} />
       {/* min-w-0 + overflow-x-hidden are load-bearing for wide content (the
           units table runs ~130 rows with 90-char unit names): SidebarInset is a
           flex child, and a flex item defaults to `min-width: auto`, so without
@@ -82,7 +82,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           document grows wider than the viewport, and the PAGE takes the
           horizontal scroll instead of the table's own scroll container. */}
       <SidebarInset className="min-w-0 overflow-x-hidden">
-        <TopBar />
+        <TopBar onOpenPalette={() => setPaletteOpen(true)} />
         <div className="mx-auto w-full min-w-0 max-w-6xl p-4">{children}</div>
       </SidebarInset>
     </SidebarProvider>
@@ -90,12 +90,13 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 }
 
 /**
- * The collapse control lives out here rather than on the sidebar: at rail width
- * there is no good home for it, and on mobile the sidebar is a sheet that is
- * fully off-canvas when closed — a control inside it would be unreachable. One
- * button in a fixed place beats two that appear conditionally.
+ * The header row: collapse control on the left; fleet summary, the palette
+ * search trigger and the theme toggle on the right. The collapse control
+ * lives out here rather than on the sidebar because at rail width there is
+ * no good home for it, and on mobile the sidebar is an off-canvas sheet — a
+ * control inside it would be unreachable.
  */
-function TopBar() {
+function TopBar({ onOpenPalette }: { onOpenPalette: () => void }) {
   const { data: rows } = useFleet();
   const summary =
     rows === undefined
@@ -110,45 +111,52 @@ function TopBar() {
           {summary}
         </span>
       )}
+      {/* Search + theme controls live in the header (user decision — moved
+          out of the sidebar footer, which is a sheet on mobile and a ~3rem
+          rail when collapsed: the header is the one place these are always
+          one tap away). `ml-auto` sits on the summary when it
+          renders, else on this cluster, so the group is right-aligned in
+          both states. */}
+      <div className={summary === null ? "ml-auto flex items-center gap-2" : "flex items-center gap-2"}>
+        <CommandPaletteTrigger onOpen={onOpenPalette} />
+        <ThemeToggle showLabel={false} />
+      </div>
     </header>
   );
 }
 
 /**
- * The Ctrl/Cmd+K trigger, first control in the footer above the account
- * controls. Matches `ThemeToggle`'s own rail/full split: an icon-only
- * `size-8` square in the rail, icon + label + shortcut hint at full width —
- * there's no room for the label or the `Kbd` hint at rail width either.
+ * The Ctrl/Cmd+K trigger, in the top bar — styled as a search FIELD rather
+ * than a button (user decision: "make it a search bar type"). It is still a
+ * real <button> (it opens the palette, it doesn't accept typing), dressed in
+ * the same idiom as the app's filter inputs: bordered, mono, muted
+ * placeholder text. The Kbd hint and the wide field are md+ only; on phones
+ * it shrinks to an icon-sized tap target since there's no hardware keyboard
+ * to honor the hint anyway.
  */
-function CommandPaletteTrigger({ rail, onOpen }: { rail: boolean; onOpen: () => void }) {
+function CommandPaletteTrigger({ onOpen }: { onOpen: () => void }) {
   return (
-    <Button
-      variant="outline"
-      size="sm"
+    <button
+      type="button"
       aria-label="Search"
       title="Search"
-      className={rail ? "size-8 justify-center p-0" : "w-full justify-start gap-2"}
       onClick={onOpen}
+      className="flex h-8 items-center gap-2 border border-input bg-transparent px-2.5 font-mono text-xs text-muted-foreground transition-colors hover:border-ring hover:text-foreground md:w-64"
     >
       <Search className="size-4 shrink-0" />
-      {!rail && (
-        <>
-          <span className="flex-1 text-left">Search</span>
-          <Kbd>{isMacPlatform() ? "⌘K" : "Ctrl K"}</Kbd>
-        </>
-      )}
-    </Button>
+      <span className="hidden flex-1 text-left md:inline">Search…</span>
+      <Kbd className="hidden md:inline-flex">{isMacPlatform() ? "⌘K" : "Ctrl K"}</Kbd>
+    </button>
   );
 }
 
 /**
- * Identity + sign-out, beside `ThemeToggle` in the sidebar footer.
+ * Identity + the two account actions (rotate, sign-out), one row in the
+ * sidebar footer. ThemeToggle and the palette trigger moved to the TopBar.
  *
- * At rail width there is no room for both an identity string and two
- * controls, so — matching the nav labels above — the identity disappears
- * entirely rather than being clipped with CSS (which would still size its
- * parent), and the two controls stack vertically instead of sitting side by
- * side: two `size-8` squares plus a gap don't fit the ~3rem rail.
+ * At rail width the identity disappears entirely rather than being clipped
+ * with CSS (which would still size its parent), and the actions stack
+ * vertically: two squares plus a gap don't fit the ~3rem rail.
  */
 function AccountFooter({
   rail,
@@ -202,21 +210,22 @@ function AccountFooter({
 
   return (
     <>
-      {!rail && identity !== null && (
-        <div
-          title={identity}
-          className="w-full truncate font-mono text-[10px] uppercase tracking-widest text-muted-foreground"
-        >
-          {identity}
-        </div>
-      )}
-      <div className={rail ? "flex flex-col items-center gap-1" : "flex w-full items-center justify-between gap-2"}>
-        <ThemeToggle showLabel={!rail} />
-        {/* The two icon-only account actions grouped together so
-            `justify-between` above still reads as "toggle on the left,
-            actions on the right" with a third control added; in the rail
-            this nested flex just continues the same vertical stack. */}
-        <div className={rail ? "flex flex-col items-center gap-1" : "flex items-center gap-1"}>
+      {/* One row (user decision): identity truncating on the left, the two
+          account actions on the right — not stacked. `min-w-0 flex-1` is what
+          lets the identity string yield space instead of pushing the buttons
+          to a second line. ThemeToggle lives in the TopBar now. */}
+      <div className={rail ? "flex flex-col items-center gap-1" : "flex w-full items-center gap-2"}>
+        {!rail && identity !== null && (
+          <div
+            title={identity}
+            className="min-w-0 flex-1 truncate font-mono text-[10px] uppercase tracking-widest text-muted-foreground"
+          >
+            {identity}
+          </div>
+        )}
+        {/* ml-auto (not justify-between on the parent) so the actions stay
+            right-aligned even when the identity is absent. */}
+        <div className={rail ? "flex flex-col items-center gap-1" : "ml-auto flex items-center gap-1"}>
           <RotateLocalAdmin
             onError={(message) =>
               onAccountError(message === null ? null : { title: "Rotation failed", message })
@@ -249,10 +258,8 @@ function AccountFooter({
  */
 function FleetSidebar({
   onAccountError,
-  onOpenPalette,
 }: {
   onAccountError: (error: AccountError | null) => void;
-  onOpenPalette: () => void;
 }) {
   const location = useLocation();
   const { state, isMobile } = useSidebar();
@@ -271,11 +278,15 @@ function FleetSidebar({
     // even now that the width matches rnui's default — dropping it would
     // quietly reintroduce that trap the next time this width changes.
     <Sidebar collapsible="icon" className="group-data-[side=left]:border-r border-border">
-      <SidebarHeader className="gap-0 p-0">
+      {/* border-b + fixed h-12 on the wordmark: the TopBar across the inset is
+          exactly h-12 with its own border-b, and the two lines must meet at
+          the sidebar edge — the previous py-3 sizing left the yellow block a
+          few pixels short of the header line (user-reported). */}
+      <SidebarHeader className="gap-0 border-b border-border p-0">
         <Link
           to="/machines"
           title="Argus"
-          className="block bg-primary py-3 text-center font-display text-sm tracking-widest text-primary-foreground"
+          className="flex h-12 items-center justify-center bg-primary font-display text-sm tracking-widest text-primary-foreground"
         >
           {/* The wordmark has no rail form, so it becomes a single-letter mark
               rather than being truncated to something unreadable. */}
@@ -339,7 +350,6 @@ function FleetSidebar({
             : "gap-1 border-t border-border px-3 py-2"
         }
       >
-        <CommandPaletteTrigger rail={rail} onOpen={onOpenPalette} />
         <AccountFooter rail={rail} onAccountError={onAccountError} />
       </SidebarFooter>
 

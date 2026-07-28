@@ -140,22 +140,75 @@ function FleetTable({ rows }: { rows: FleetRow[] }) {
   );
 }
 
+/**
+ * Phone rendering of one fleet row: the whole card is a single tap target
+ * (design "Fleet: card list below md"). Same data, same helpers as the
+ * table — this is a second renderer, not a second data path.
+ *
+ * Kept in its own bordered wrapper, same as `FleetTable`'s, so either
+ * renderer presents the same surface at the call site — the swap below
+ * only ever toggles which one is visible, not the border around it.
+ */
+function FleetCards({ rows }: { rows: FleetRow[] }) {
+  return (
+    <div className="border border-border">
+      <ul className="flex flex-col divide-y divide-border">
+        {rows.map((row) => (
+          <li key={row.id}>
+            <Link to={`/machines/${row.id}`} className="flex flex-col gap-2 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <AssetTag tone={machineTone(row.status)}>{displayName(row)}</AssetTag>
+                <StatusCell row={row} />
+              </div>
+              {row.display_name !== null && (
+                <span className="font-mono text-[11px] text-muted-foreground">{row.hostname}</span>
+              )}
+              <div className="flex items-center gap-4">
+                <span className="flex items-center gap-2 font-mono text-xs">
+                  CPU {formatPct(row.cpu_pct)} <Sparkline values={row.spark_cpu} />
+                </span>
+                <span className="flex items-center gap-2 font-mono text-xs">
+                  Mem {formatPct(row.mem_pct)} <Sparkline values={row.spark_mem} />
+                </span>
+              </div>
+              <span className="font-mono text-[11px] text-muted-foreground">
+                seen {formatRelative(row.last_seen_at)}
+              </span>
+            </Link>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/**
+ * `FleetCards` below `md`, `FleetTable` at/above it — `md` is THE
+ * breakpoint for this slice (no per-callsite improvisation). Both branches
+ * render so the swap is pure CSS visibility, not a remount on resize.
+ */
+function FleetRows({ rows }: { rows: FleetRow[] }) {
+  return (
+    <>
+      <div className="hidden md:block">
+        <FleetTable rows={rows} />
+      </div>
+      <div className="md:hidden">
+        <FleetCards rows={rows} />
+      </div>
+    </>
+  );
+}
+
 export default function FleetPage() {
   const { data: rows = [], error, isPending } = useFleet();
   const [params, setParams] = useSearchParams();
 
   const q = params.get("q") ?? "";
-  // Tags are stored lowercase server-side and `visibleFleet` matches with an
-  // exact `includes` — a hand-edited URL with stray case would otherwise
-  // silently match nothing.
-  const selectedTags = (params.get("tags") ?? "")
-    .split(",")
-    .map((t) => t.trim().toLowerCase())
-    .filter(Boolean);
   // Absent/empty = flat (no grouping); otherwise the tag whose section is
-  // shown in place of the flat table. Lowercased for the same reason
-  // `selectedTags` is — a hand-edited URL with stray case would otherwise
-  // silently match no section.
+  // shown in place of the flat table. Lowercased because tags are stored
+  // lowercase server-side — a hand-edited URL with stray case would
+  // otherwise silently match no section.
   const rawGroup = params.get("group");
   const group = rawGroup !== null && rawGroup.trim() !== "" ? rawGroup.trim().toLowerCase() : null;
 
@@ -173,16 +226,9 @@ export default function FleetPage() {
     );
   }
 
-  function toggleTag(tag: string) {
-    const next = selectedTags.includes(tag)
-      ? selectedTags.filter((t) => t !== tag)
-      : [...selectedTags, tag];
-    setParam("tags", next.join(","));
-  }
-
   const tags = fleetTags(rows);
-  const filtered = visibleFleet(rows, q, selectedTags);
-  // The group tag composes with q/tags: `groupFleet` is run on the
+  const filtered = visibleFleet(rows, q);
+  // The group tag composes with q: `groupFleet` is run on the
   // already-filtered rows, then the one section for the active group tag is
   // picked out of it — `groupFleet` still owns "a machine under every tag it
   // carries" so that semantics isn't duplicated here. A group tag that
@@ -232,33 +278,6 @@ export default function FleetPage() {
           aria-label="Filter machines"
           className="max-w-xs font-mono text-xs"
         />
-        {tags.length > 0 && (
-          <div className="flex flex-wrap gap-1">
-            {tags.map(({ tag }) => {
-              const selected = selectedTags.includes(tag);
-              return (
-                // A plain `<button>` wrapping the Badge rather than Badge's own
-                // `render` prop: Tailwind's preflight already strips native
-                // button chrome (border-width, padding, background), so the
-                // wrapper adds nothing visually but keeps the toggle semantics
-                // (aria-pressed, click) independent of Badge's own prop surface.
-                //
-                // No count here (browser-review decision) — counts now live
-                // only in the "Group by" dropdown below, so a chip is just
-                // the tag itself.
-                <button
-                  key={tag}
-                  type="button"
-                  aria-pressed={selected}
-                  onClick={() => toggleTag(tag)}
-                >
-                  <Badge variant={selected ? "default" : "outline"}>{tag}</Badge>
-                </button>
-              );
-            })}
-          </div>
-        )}
-
         {/* Replaces the old Flat/Grouped ToggleGroup (browser-review
             decision) — a single dropdown whose trigger names the active
             group, with per-tag counts moved here (off the filter chips
@@ -302,7 +321,7 @@ export default function FleetPage() {
           />
         </div>
       ) : groupSection === null ? (
-        <FleetTable rows={filtered} />
+        <FleetRows rows={filtered} />
       ) : (
         <div>
           <div className="flex flex-wrap items-baseline gap-2 pb-2">
@@ -319,7 +338,7 @@ export default function FleetPage() {
               />
             </div>
           ) : (
-            <FleetTable rows={groupSection.rows} />
+            <FleetRows rows={groupSection.rows} />
           )}
         </div>
       )}

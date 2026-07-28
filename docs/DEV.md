@@ -1355,3 +1355,25 @@ chip-count contrast inside the selected Badge; server-400 Alert in the
 dialog via an invalid-charset tag; Enter-with-highlight commits the
 suggestion; enroll page mint/copy/revoke flow; grouped view duplicating a
 multi-tag machine; URL round-trip in a fresh tab; Ctrl+K from a cold page.
+
+## Mobile / responsive pass — verification (2026-07-29)
+
+Design: `docs/superpowers/specs/2026-07-29-mobile-pass-design.md` (see its
+amendment). Verified headless at 390×844, BOTH themes, zero page-level
+overflow and zero page errors on: sign-in (both stages), fleet flat +
+grouped (cards below `md`), units/containers (all four verbs on-screen —
+measured Restart right edge x=365 after hiding Active/State below `md`;
+it was x=440 before), logs viewer, identity dialog, mint dialog, token
+result dialog. Embedded build serves `/manifest.webmanifest` as
+`application/manifest+json` and all four icons (glyph `#FFE600` — the CSS
+token, not the plan's guessed hex).
+
+Also fixed on this branch (found by the same headless pass): the command
+palette crashed the whole app on first open — rnui's `CommandDialog` does
+NOT provide cmdk's `Command` root the way shadcn's does, and every palette
+child reads that context via `useSyncExternalStore(store.subscribe, ...)`.
+The explicit `<Command>` wrapper in CommandPalette.tsx is load-bearing.
+
+Remaining for the operator: add to a real phone's home screen over the LAN
+origin (iOS-style add; Chrome's install prompt needs the production HTTPS
+entrypoint) and tap fleet → machine → restart a unit.
