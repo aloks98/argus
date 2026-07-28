@@ -101,7 +101,7 @@ fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/me", get(me))
         .route("/api/fleet", get(fleet))
-        .route("/api/machines/{id}", get(machine))
+        .route("/api/machines/{id}", get(machine).patch(patch_machine))
         .route("/api/machines/{id}/metrics", get(machine_metrics))
         .route("/api/machines/{id}/docker", get(machine_docker))
         .route(
@@ -331,6 +331,116 @@ async fn machine(
     match detail {
         Some(d) => Ok(Json(d.into())),
         None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// Body of `PATCH /api/machines/{id}`. The double `Option` distinguishes an
+/// absent key (leave the field alone) from an explicit `null` (clear it) --
+/// plain `Option<String>` cannot represent that difference after serde.
+#[derive(serde::Deserialize)]
+struct MachinePatch {
+    #[serde(default, deserialize_with = "double_option")]
+    display_name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    notes: Option<Option<String>>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+}
+
+fn double_option<'de, D>(d: D) -> Result<Option<Option<String>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    use serde::Deserialize;
+    Ok(Some(Option::<String>::deserialize(d)?))
+}
+
+/// `PATCH /api/machines/{id}` -- display name / notes / tags. Only the fields
+/// present in the body change. Every outcome that MUTATED is audited; a 400
+/// mutates nothing and is not.
+async fn patch_machine(
+    State(state): State<AppState>,
+    crate::auth::AuthUser(identity): crate::auth::AuthUser,
+    Path(id): Path<Uuid>,
+    Json(patch): Json<MachinePatch>,
+) -> Response {
+    // Validate everything BEFORE touching the database.
+    let display_name = match &patch.display_name {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(raw)) => match crate::identity::normalize_display_name(raw) {
+            Ok(v) => Some(v),
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        },
+    };
+    let notes = match &patch.notes {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(raw)) => match crate::identity::validate_notes(raw) {
+            Ok(()) => Some(Some(raw.clone())),
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        },
+    };
+    let tags = match &patch.tags {
+        None => None,
+        Some(raw) => match crate::identity::normalize_tags(raw) {
+            Ok(v) => Some(v),
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        },
+    };
+    let mut fields: Vec<&str> = Vec::new();
+    if display_name.is_some() {
+        fields.push("display_name");
+    }
+    if notes.is_some() {
+        fields.push("notes");
+    }
+    if tags.is_some() {
+        fields.push("tags");
+    }
+    if fields.is_empty() {
+        return (StatusCode::BAD_REQUEST, "no fields to update").into_response();
+    }
+
+    let dn_arg: Option<Option<&str>> = display_name.as_ref().map(|o| o.as_deref());
+    let notes_arg: Option<Option<&str>> = notes.as_ref().map(|o| o.as_deref());
+    let updated =
+        match repo::update_machine_identity(&state.pool, id, dn_arg, notes_arg, tags.as_deref())
+            .await
+        {
+            Ok(u) => u,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to update machine identity");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+    if !updated {
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // detail = which fields changed, never the values: notes may hold anything.
+    if let Err(err) = repo::audit_with_detail(
+        &state.pool,
+        repo::Actor::User(&identity),
+        "machine.update",
+        Some(id),
+        "ok",
+        serde_json::json!({ "fields": fields }),
+    )
+    .await
+    {
+        tracing::error!(error = %err, "failed to audit machine.update");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    // Return the refreshed detail so the client can cache-swap in one round trip.
+    match repo::machine_detail(&state.pool, id).await {
+        Ok(Some(d)) => Json(MachineDetailDto::from(d)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to reload machine detail");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -1371,6 +1481,33 @@ mod tests {
         )
         .await?;
         Ok(format!("{}={}", argus_common::SESSION_COOKIE, token))
+    }
+
+    /// Drives an authenticated JSON request straight through the router --
+    /// method, uri, the session cookie, and a serialized JSON body -- for the
+    /// handlers that take a body (only `PATCH /api/machines/{id}` so far).
+    /// Mirrors the file's existing `Request::builder()...oneshot()` style
+    /// used throughout this module, just consolidated so PATCH tests don't
+    /// repeat the same five lines per call.
+    async fn request_json(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        cookie: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("cookie", cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
     }
 
     #[sqlx::test]
@@ -3116,6 +3253,123 @@ mod tests {
                 .await?;
         assert_eq!(audited.result.as_deref(), Some("ok"));
 
+        Ok(())
+    }
+
+    /// Three PATCH calls, each mutating exactly one thing, each producing its
+    /// own `machine.update` audit row: tags-only leaves `display_name`
+    /// untouched; setting `display_name` then clearing it with an explicit
+    /// `null` proves the double-`Option` distinguishes "absent" from "clear".
+    #[sqlx::test]
+    async fn patch_machine_partial_update_and_audit(pool: PgPool) -> anyhow::Result<()> {
+        // Seed a machine directly (raw SQL precondition, per the standing lesson).
+        let id: Uuid = sqlx::query_scalar!(
+            r#"INSERT INTO machines (machine_id, hostname, tags) VALUES ('m-1', 'host-1', '{old}')
+               RETURNING id"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool.clone()));
+
+        // tags only: display_name must be untouched (null), old tags replaced.
+        let res = request_json(
+            &app,
+            "PATCH",
+            &format!("/api/machines/{id}"),
+            &cookie,
+            serde_json::json!({ "tags": [" Infra ", "media", "infra"] }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let row = sqlx::query!("SELECT display_name, tags FROM machines WHERE id = $1", id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(row.display_name, None);
+        assert_eq!(row.tags, vec!["infra", "media"]);
+
+        // display_name set, then cleared with null.
+        request_json(
+            &app,
+            "PATCH",
+            &format!("/api/machines/{id}"),
+            &cookie,
+            serde_json::json!({ "display_name": "Media box" }),
+        )
+        .await;
+        request_json(
+            &app,
+            "PATCH",
+            &format!("/api/machines/{id}"),
+            &cookie,
+            serde_json::json!({ "display_name": null }),
+        )
+        .await;
+        let dn = sqlx::query_scalar!("SELECT display_name FROM machines WHERE id = $1", id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(dn, None);
+
+        // Audit rows written, naming the changed fields: one per PATCH call
+        // above (tags, then display_name, then display_name again to clear
+        // it) -- three calls, three mutations, three rows.
+        let audits = sqlx::query!(
+            r#"SELECT detail FROM audit_log WHERE action = 'machine.update' ORDER BY ts"#
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(audits.len(), 3);
+        assert_eq!(audits[0].detail["fields"][0], "tags");
+        Ok(())
+    }
+
+    /// Every rejection class (bad tag, over-length display name, empty body)
+    /// returns 400 and writes nothing -- neither to `machines` nor
+    /// `audit_log`. An unknown machine id is a well-formed request that
+    /// simply doesn't match anything, so it 404s instead of 400 and likewise
+    /// audits nothing.
+    #[sqlx::test]
+    async fn patch_machine_rejects_bad_input(pool: PgPool) -> anyhow::Result<()> {
+        let id: Uuid = sqlx::query_scalar!(
+            r#"INSERT INTO machines (machine_id, hostname) VALUES ('m-2', 'host-2') RETURNING id"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool.clone()));
+
+        for bad in [
+            serde_json::json!({ "tags": ["has space"] }),
+            serde_json::json!({ "display_name": "x".repeat(65) }),
+            serde_json::json!({}),
+        ] {
+            let res =
+                request_json(&app, "PATCH", &format!("/api/machines/{id}"), &cookie, bad).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        }
+        // None of the three 400s above mutated anything, so no audit row.
+        let n: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "n!" FROM audit_log WHERE action = 'machine.update'"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(n, 0);
+        // Unknown machine: 404, and still no audit row.
+        let res = request_json(
+            &app,
+            "PATCH",
+            &format!("/api/machines/{}", Uuid::new_v4()),
+            &cookie,
+            serde_json::json!({ "tags": [] }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let n: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "n!" FROM audit_log WHERE action = 'machine.update'"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(n, 0);
         Ok(())
     }
 }

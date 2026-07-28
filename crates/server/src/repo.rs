@@ -559,6 +559,38 @@ pub async fn machine_detail(
     Ok(row)
 }
 
+/// Partial identity update. Each field is guarded by its own `apply` flag so
+/// one static, compile-time-checked query covers every PATCH combination --
+/// no dynamic SQL. Returns false when the machine id does not exist.
+pub async fn update_machine_identity(
+    executor: impl sqlx::PgExecutor<'_>,
+    machine_id: Uuid,
+    display_name: Option<Option<&str>>,
+    notes: Option<Option<&str>>,
+    tags: Option<&[String]>,
+) -> Result<bool> {
+    let res = sqlx::query!(
+        r#"
+        UPDATE machines SET
+            display_name = CASE WHEN $2 THEN $3::text ELSE display_name END,
+            notes        = CASE WHEN $4 THEN $5::text ELSE notes END,
+            tags         = CASE WHEN $6 THEN $7::text[] ELSE tags END,
+            updated_at   = now()
+        WHERE id = $1
+        "#,
+        machine_id,
+        display_name.is_some(),
+        display_name.flatten(),
+        notes.is_some(),
+        notes.flatten(),
+        tags.is_some(),
+        tags.unwrap_or(&[]),
+    )
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected() == 1)
+}
+
 /// An authenticated human. Minted only by the auth middleware, which is what
 /// makes `Actor::User` un-forgeable by a handler.
 #[derive(Clone, Debug)]
