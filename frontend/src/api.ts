@@ -362,7 +362,10 @@ export async function patchMachine(id: string, patch: MachinePatchBody): Promise
       body: JSON.stringify(patch),
     }),
   );
-  if (!r.ok) throw new Error(await r.text().catch(() => `update failed: ${r.status}`));
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    throw new Error(text.trim() !== "" ? text : `update failed: ${r.status}`);
+  }
   return r.json();
 }
 
@@ -402,7 +405,10 @@ export async function mintToken(body: MintTokenBody): Promise<EnrollmentToken & 
       body: JSON.stringify(body),
     }),
   );
-  if (!r.ok) throw new Error(await r.text().catch(() => `mint failed: ${r.status}`));
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    throw new Error(text.trim() !== "" ? text : `mint failed: ${r.status}`);
+  }
   return r.json();
 }
 
