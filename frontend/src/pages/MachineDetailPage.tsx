@@ -22,12 +22,18 @@ import {
   CardDescription,
   CardHeader,
   CardTitle,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
   EmptyState,
   Tabs,
   TabsContent,
   TabsList,
   TabsTrigger,
 } from "@e412/rnui-react";
+import { Pencil } from "lucide-react";
 import ContainersCard from "../components/ContainersCard";
 import LogDialog from "../components/LogDialog";
 import LogFilterBar from "../components/LogFilterBar";
@@ -104,6 +110,10 @@ function MetricChartCard({
 export default function MachineDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [range, setRange] = useState<Range>("1h");
+
+  // The identity editor lives in a Dialog, not inline in the Overview tab
+  // (Task 8 fix round 1 — the user rejected the inline-card placement).
+  const [editOpen, setEditOpen] = useState(false);
 
   // The active tab lives in the URL (`?tab=units`) rather than component state,
   // so a reload keeps the tab and a link to "the units on this box" is
@@ -276,23 +286,53 @@ export default function MachineDetailPage() {
             FleetPage's Name column uses (AssetTag + hostname), so a renamed
             machine reads the same way whether you're scanning the fleet
             table or looking at its detail page. Un-renamed machines (the
-            common case) show just the hostname, unchanged from before. */}
-        <h1
+            common case) show just the hostname, unchanged from before. The
+            Edit control sits in this same row rather than in SpecStrip —
+            editing identity isn't "a fact about the machine" the way OS/IP/
+            kernel are. */}
+        <div
           className={cn(
-            "mt-2 font-display text-2xl uppercase tracking-tight",
+            "mt-2 flex flex-wrap items-center gap-3",
             machine.display_name === null && "mb-3",
           )}
         >
-          {displayName(machine)}
-        </h1>
+          <h1 className="font-display text-2xl uppercase tracking-tight">
+            {displayName(machine)}
+          </h1>
+          <Button variant="outline" size="sm" onClick={() => setEditOpen(true)}>
+            <Pencil className="size-3.5" />
+            Edit
+          </Button>
+        </div>
         {machine.display_name !== null && (
-          <p className="mt-0.5 mb-3 font-mono text-[11px] text-muted-foreground">
+          <p className="mb-3 font-mono text-[11px] text-muted-foreground">
             {machine.hostname}
           </p>
         )}
 
         <SpecStrip items={specItems} />
       </div>
+
+      {/* Identity editing lives in a Dialog rather than inline on the page
+          (Task 8 fix round 1) — LogDialog is the in-repo precedent for a
+          Dialog whose content depends on this page's own state/params.
+          `MachineIdentity` itself is unchanged by this; only its host is —
+          `onSaved` is the one seam added so the dialog can close itself on a
+          successful PATCH, while staying open on a validation/server error
+          so the Alert inside it is visible. */}
+      <Dialog open={editOpen} onOpenChange={setEditOpen}>
+        <DialogContent className="sm:max-w-lg">
+          {/* sr-only: MachineIdentity's own CardTitle/CardDescription
+              ("Identity" / "Rename, tag, and annotate this machine.") are
+              the visible header — this pair exists only so the Dialog has
+              an accessible name, without printing that same text twice. */}
+          <DialogHeader className="sr-only">
+            <DialogTitle>Edit identity</DialogTitle>
+            <DialogDescription>Rename, tag, and annotate this machine.</DialogDescription>
+          </DialogHeader>
+          <MachineIdentity machine={machine} onSaved={() => setEditOpen(false)} />
+        </DialogContent>
+      </Dialog>
 
       <Tabs value={tab} onValueChange={(value) => setTab(String(value))}>
         <TabsList>
@@ -344,9 +384,7 @@ export default function MachineDetailPage() {
         )}
 
         <TabsContent value="overview" className="mt-4">
-          <MachineIdentity machine={machine} />
-
-          <div className="mt-6 flex flex-wrap items-center justify-between gap-2">
+          <div className="flex flex-wrap items-center justify-between gap-2">
             <h2 className="font-display text-sm uppercase tracking-widest">Metrics</h2>
             <ButtonGroup>
               {RANGES.map((r) => (

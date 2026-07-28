@@ -5,7 +5,7 @@
 // fleet-wide vocabulary as suggestions; free entry stays allowed (this is a
 // free-form tag field, not a curated list) — see the note on `TagsField`
 // below for why this isn't rnui's Combobox chips surface.
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm } from "react-hook-form";
 import * as z from "zod";
@@ -59,7 +59,15 @@ function emptyToNull(s: string | undefined): string | null {
   return s === undefined || s === "" ? null : s;
 }
 
-export default function MachineIdentity({ machine }: { machine: MachineDetail }) {
+export default function MachineIdentity({
+  machine,
+  onSaved,
+}: {
+  machine: MachineDetail;
+  /** Called after a successful save (form already reset by then). The
+   * Dialog host uses this to close itself — see MachineDetailPage.tsx. */
+  onSaved?: () => void;
+}) {
   const fleetQuery = useFleet();
   const fleetRows = fleetQuery.data ?? [];
   const suggestions = fleetTags(fleetRows).map((t) => t.tag);
@@ -92,6 +100,7 @@ export default function MachineIdentity({ machine }: { machine: MachineDetail })
           // query cache; resetting here just brings the FORM's local state
           // back in sync with the server's (possibly normalized) values.
           form.reset(defaultsFrom(data));
+          onSaved?.();
         },
       },
     );
@@ -217,10 +226,21 @@ export default function MachineIdentity({ machine }: { machine: MachineDetail })
  * Base UI's `AutocompleteRoot` defaults `fillInputOnItemPress: true`
  * (verified in the compiled `AutocompleteRoot.mjs`, not just the `.d.ts`),
  * so picking a suggestion fires `onValueChange` with `reason: "item-press"` —
- * that's the signal this component uses to commit immediately. Typed text
- * commits on Enter via a plain `onKeyDown`, independent of whatever base-ui
- * highlighted via arrow keys, so the commit path is one function
- * (`commit`) regardless of how the text got into the box.
+ * that's the signal this component uses to commit immediately.
+ *
+ * Enter must never commit something other than what's visibly
+ * highlighted/typed, so this does NOT unconditionally intercept Enter.
+ * `ComboboxInput.js` (which `Autocomplete.Input` is built on) already does
+ * exactly the right thing on its own: when an item is highlighted it calls
+ * `stopEvent` and clicks that item (firing the `item-press` path above); when
+ * nothing is highlighted its own comment says "Allow form submission when no
+ * item is highlighted" and it deliberately does NOT preventDefault. So this
+ * component only needs to cover that second case — commit the raw typed text
+ * and preventDefault so Enter doesn't submit the surrounding form — and
+ * tracks "is anything highlighted right now" itself via `onItemHighlighted`
+ * (a ref, not state: it has to be current at the moment the Enter keydown is
+ * read, not delayed a render). When a highlight exists, this component's
+ * `onKeyDown` does nothing at all and lets Base UI's own path run.
  */
 function TagsField({
   id,
@@ -236,24 +256,36 @@ function TagsField({
   invalid?: boolean;
 }) {
   const [query, setQuery] = useState("");
+  // The currently keyboard-highlighted suggestion, if any. A ref (not
+  // state): `onKeyDown`'s Enter handler needs the value AS OF that keydown,
+  // and arrow-key highlight changes must be visible to it synchronously,
+  // not a render later.
+  const highlightedRef = useRef<string | undefined>(undefined);
 
   const commit = (raw: string) => {
-    const tag = raw.trim();
+    // Lowercase up front so the chip shown here always matches what the
+    // server will actually store (tags are lowercased server-side per
+    // constraints.md) — otherwise a typed "Infra" would render as "Infra"
+    // until save silently swapped it to "infra".
+    const tag = raw.trim().toLowerCase();
     if (tag === "") return;
-    if (value.some((t) => t.toLowerCase() === tag.toLowerCase())) {
+    if (value.includes(tag)) {
       setQuery("");
       return;
     }
     onChange([...value, tag]);
     setQuery("");
+    highlightedRef.current = undefined;
   };
 
   const remove = (tag: string) => onChange(value.filter((t) => t !== tag));
 
   // Suggestions already carried by this machine are noise in its own list.
-  const options = suggestions.filter(
-    (t) => !value.some((v) => v.toLowerCase() === t.toLowerCase()),
-  );
+  // Both sides are server-canonical lowercase (`machine.tags` and
+  // `fleetTags()` come straight from the API) plus whatever this component
+  // itself has committed, which `commit` already lowercases — so a plain
+  // `includes` is enough, no case-folding needed here.
+  const options = suggestions.filter((t) => !value.includes(t));
 
   return (
     <div className="flex flex-col gap-2">
@@ -287,13 +319,22 @@ function TagsField({
           // since the type alias name doesn't hint at the literal value.
           if (details.reason === "item-press") commit(next);
         }}
+        onItemHighlighted={(highlighted) => {
+          highlightedRef.current = highlighted;
+        }}
       >
         <AutocompleteInput
           id={id}
           placeholder="Add a tag…"
           aria-invalid={invalid}
           onKeyDown={(e) => {
-            if (e.key === "Enter") {
+            // Only handle Enter ourselves when NOTHING is highlighted.
+            // When something IS highlighted, do nothing here — Base UI's own
+            // Enter handling (in ComboboxInput.js) selects it, which fires
+            // `onValueChange` with reason "item-press" above. Committing the
+            // raw `query` in that case would add whatever's literally typed
+            // instead of the visibly-selected suggestion.
+            if (e.key === "Enter" && highlightedRef.current === undefined) {
               e.preventDefault();
               commit(query);
             }
