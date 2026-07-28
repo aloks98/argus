@@ -109,7 +109,10 @@ export default function ContainersCard({
               <TableRow>
                 <TableHead>Name</TableHead>
                 <TableHead className="hidden md:table-cell">Image</TableHead>
-                <TableHead>State</TableHead>
+                {/* Same phone-width trade as UnitsCard's Active column: the name
+                    tag's tone carries the state, and the column's width is what
+                    keeps Restart reachable at 390px. */}
+                <TableHead className="hidden md:table-cell">State</TableHead>
                 <TableHead className="hidden md:table-cell">Status</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
               </TableRow>
@@ -129,7 +132,7 @@ export default function ContainersCard({
                     <TableCell className="hidden md:table-cell font-mono text-muted-foreground">
                       {c.image}
                     </TableCell>
-                    <TableCell>
+                    <TableCell className="hidden md:table-cell">
                       <StatusBadge tone={containerTone(c.state)} label={c.state} />
                       {c.health !== "" && (
                         <Badge variant="outline" className="ml-1 font-mono">
