@@ -11,6 +11,18 @@ import type { latestMem, latestResources } from "../lib/metrics";
 
 type Row = { label: string; value: string };
 
+/**
+ * The card's ONE omission rule, as a function: a nullish or empty value
+ * means no row — never a blank or an "undefined" pretending to be a fact.
+ * `== null` (loose) is deliberate: these are additive proto fields, so a
+ * frontend newer than its server sees `undefined`, not `null`, and strict
+ * equality would let it through (this rendered "undefined · undefined
+ * cores" live during this slice's own rollout).
+ */
+function row(label: string, value: string | null | undefined): Row | null {
+  return value == null || value === "" ? null : { label, value };
+}
+
 export default function SystemCard({
   machine,
   resources,
@@ -20,48 +32,35 @@ export default function SystemCard({
   resources: ReturnType<typeof latestResources>;
   memNow: ReturnType<typeof latestMem>;
 }) {
-  // `!= null` (not `!==`) throughout this component is deliberate: these
-  // fields are additive proto columns, so a frontend newer than the server it
-  // talks to sees `undefined` for them, not `null` — strict equality would
-  // let `undefined` fall through and render "undefined" in the row.
-  const bootTime = machine.boot_time != null ? formatDateTime(machine.boot_time) : "";
-  const uptime = machine.boot_time != null ? formatUptime(machine.boot_time) : "";
-
+  // `formatUptime`/`formatDateTime` return "" for garbage input, and `row`
+  // drops "" — so a skewed or absent boot_time simply omits both rows.
+  const { disk, swap } = resources;
   const rows: Row[] = [
-    ...(machine.cpu_model != null ? [{ label: "Processor", value: machine.cpu_model }] : []),
-    ...(machine.cpu_cores != null
-      ? [{ label: "Cores", value: String(machine.cpu_cores) }]
-      : []),
-    ...(machine.kernel != null ? [{ label: "Kernel", value: machine.kernel }] : []),
-    ...(machine.arch != null ? [{ label: "Arch", value: machine.arch }] : []),
-    ...(machine.virt != null
-      ? [{
-          label: "Virtualization",
-          value: machine.virt === "none" ? "bare metal" : machine.virt,
-        }]
-      : []),
-    ...(machine.agent_version != null
-      ? [{ label: "Agent version", value: machine.agent_version }]
-      : []),
-    ...(bootTime !== "" ? [{ label: "Boot time", value: bootTime }] : []),
-    ...(uptime !== "" ? [{ label: "Uptime", value: uptime }] : []),
-    ...(resources.disk != null
-      ? [{
-          label: "Disk",
-          value: `${formatBytes(resources.disk.used)} / ${formatBytes(resources.disk.total)} (${((100 * resources.disk.used) / resources.disk.total).toFixed(0)}%)`,
-        }]
-      : []),
-    ...(memNow != null ? [{ label: "Memory", value: formatBytes(memNow.total) }] : []),
-    ...(resources.swap != null && resources.swap.total > 0
-      ? [{
-          label: "Swap",
-          value: `${formatBytes(resources.swap.used)} / ${formatBytes(resources.swap.total)}`,
-        }]
-      : []),
-    // Identity facts, always present (predate this slice) — no conditional.
-    { label: "Machine ID", value: machine.machine_id },
-    { label: "Enrolled", value: formatDateTime(machine.enrolled_at) },
-  ];
+    row("Processor", machine.cpu_model),
+    row("Cores", machine.cpu_cores?.toString()),
+    row("Kernel", machine.kernel),
+    row("Arch", machine.arch),
+    row("Virtualization", machine.virt === "none" ? "bare metal" : machine.virt),
+    row("Agent version", machine.agent_version),
+    row("Boot time", machine.boot_time != null ? formatDateTime(machine.boot_time) : null),
+    row("Uptime", machine.boot_time != null ? formatUptime(machine.boot_time) : null),
+    row(
+      "Disk",
+      disk != null
+        ? `${formatBytes(disk.used)} / ${formatBytes(disk.total)} (${((100 * disk.used) / disk.total).toFixed(0)}%)`
+        : null,
+    ),
+    row("Memory", memNow != null ? formatBytes(memNow.total) : null),
+    row(
+      "Swap",
+      swap != null && swap.total > 0
+        ? `${formatBytes(swap.used)} / ${formatBytes(swap.total)}`
+        : null,
+    ),
+    // Identity facts, always present (predate this slice).
+    row("Machine ID", machine.machine_id),
+    row("Enrolled", formatDateTime(machine.enrolled_at)),
+  ].filter((r): r is Row => r !== null);
 
   return (
     <Card>
