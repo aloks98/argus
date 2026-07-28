@@ -82,29 +82,34 @@ impl AgentService for AgentSvc {
         // used" becomes permanently unanswerable the moment the row is
         // written: `enrollment_tokens` keeps no per-use history, only a bare
         // `uses` counter.
-        let token_name = match repo::consume_enrollment_token(&mut *tx, &req.join_token)
-            .await
-            .map_err(|e| internal_error("checking enrollment token", &e))?
-        {
-            TokenCheck::Valid { token_name } => token_name,
-            TokenCheck::Invalid => {
-                drop(tx);
-                // No token was ever resolved here, so unlike the paths below
-                // there is no name to put in `detail` either.
-                repo::audit(
-                    &self.pool,
-                    repo::Actor::System,
-                    "agent.enroll",
-                    None,
-                    "denied",
-                )
+        let (token_name, token_display_name, token_tags) =
+            match repo::consume_enrollment_token(&mut *tx, &req.join_token)
                 .await
-                .map_err(|e| internal_error("writing audit log", &e))?;
-                return Err(Status::unauthenticated(
-                    "invalid or exhausted enrollment token",
-                ));
-            }
-        };
+                .map_err(|e| internal_error("checking enrollment token", &e))?
+            {
+                TokenCheck::Valid {
+                    token_name,
+                    display_name,
+                    tags,
+                } => (token_name, display_name, tags),
+                TokenCheck::Invalid => {
+                    drop(tx);
+                    // No token was ever resolved here, so unlike the paths below
+                    // there is no name to put in `detail` either.
+                    repo::audit(
+                        &self.pool,
+                        repo::Actor::System,
+                        "agent.enroll",
+                        None,
+                        "denied",
+                    )
+                    .await
+                    .map_err(|e| internal_error("writing audit log", &e))?;
+                    return Err(Status::unauthenticated(
+                        "invalid or exhausted enrollment token",
+                    ));
+                }
+            };
 
         let info = match &req.info {
             Some(info) if !info.machine_id.is_empty() => info,
@@ -137,6 +142,15 @@ impl AgentService for AgentSvc {
             let agent_id = repo::upsert_machine(&mut *tx, &info_row)
                 .await
                 .map_err(|e| internal_error("upserting machine", &e))?;
+
+            repo::apply_token_identity(
+                &mut *tx,
+                agent_id,
+                token_display_name.as_deref(),
+                &token_tags,
+            )
+            .await
+            .map_err(|e| internal_error("applying token identity", &e))?;
 
             let signed = self.ca.sign_csr(&req.csr_pem, agent_id).map_err(|e| {
                 tracing::warn!(error = %e, "enroll: CSR rejected");
@@ -243,21 +257,38 @@ impl AgentService for AgentSvc {
         let (tx, rx) = mpsc::channel::<Result<ServerFrame, Status>>(16);
         let pool = self.pool.clone();
         let hub = self.hub.clone();
-        let epoch = hub.register(machine_id, tx.clone());
+        let (epoch, shutdown) = hub.register(machine_id, tx.clone());
         let mut inbound = request.into_inner();
 
         tokio::spawn(async move {
-            while let Some(item) = inbound.next().await {
-                match item {
-                    Ok(frame) => {
-                        if let Err(e) =
-                            handle_agent_frame(&pool, &hub, machine_id, frame, &tx).await
-                        {
-                            tracing::warn!(error = %e, %machine_id, "session: error handling agent frame");
+            loop {
+                tokio::select! {
+                    item = inbound.next() => {
+                        match item {
+                            Some(Ok(frame)) => {
+                                if let Err(e) =
+                                    handle_agent_frame(&pool, &hub, machine_id, frame, &tx).await
+                                {
+                                    tracing::warn!(error = %e, %machine_id, "session: error handling agent frame");
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!(error = %e, %machine_id, "session: inbound stream error");
+                                break;
+                            }
+                            None => break,
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, %machine_id, "session: inbound stream error");
+                    // Fired by `Hub::register` when a later Session for this
+                    // same machine replaces this one: this connection can no
+                    // longer be routed to (the hub's `conns` entry is already
+                    // the new session's), so continuing to read `inbound`
+                    // here would just keep pumping heartbeats for a session
+                    // the hub can't dispatch verbs/logs/terminal to anymore.
+                    // Exit through the SAME teardown path a normal disconnect
+                    // takes, below.
+                    _ = shutdown.notified() => {
+                        tracing::info!(%machine_id, "session: superseded by a new connection for this machine");
                         break;
                     }
                 }

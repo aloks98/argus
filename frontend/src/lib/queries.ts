@@ -13,9 +13,18 @@ import {
   getMachine,
   getMetrics,
   getSystemd,
+  listTokens,
+  mintToken,
+  patchMachine,
+  revokeToken,
   unitAction,
 } from "../api";
-import type { ContainerAction, UnitAction } from "../api";
+import type {
+  ContainerAction,
+  MachinePatchBody,
+  MintTokenBody,
+  UnitAction,
+} from "../api";
 
 /** Polling cadences (ms). Fleet is the scan view, so it refreshes faster. */
 const FLEET_INTERVAL = 5_000;
@@ -30,13 +39,21 @@ export const qk = {
   metrics: (id: string, range: Range) => ["metrics", id, range] as const,
   docker: (id: string) => ["docker", id] as const,
   systemd: (id: string) => ["systemd", id] as const,
+  enrollmentTokens: ["enrollment-tokens"] as const,
 };
 
-export function useFleet() {
+/**
+ * `enabled` defaults to `true` (the fleet page's normal always-on poll); the
+ * command palette (Task 10) passes `enabled: open` so mounting it app-wide
+ * doesn't add a permanent background poll to pages that don't otherwise need
+ * the fleet.
+ */
+export function useFleet(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: qk.fleet,
     queryFn: getFleet,
     refetchInterval: FLEET_INTERVAL,
+    enabled: options?.enabled ?? true,
   });
 }
 
@@ -45,6 +62,27 @@ export function useMachine(id: string) {
     queryKey: qk.machine(id),
     queryFn: () => getMachine(id),
     refetchInterval: MACHINE_INTERVAL,
+  });
+}
+
+/**
+ * Identity edits (display name, tags, notes) — Task 8's `MachineIdentity`
+ * card. Unlike the verb mutations below, success writes the server's
+ * refreshed `MachineDetail` straight into the cache rather than
+ * invalidating: `patchMachine` already returns the authoritative post-write
+ * row (server-normalized tags included), so a direct cache write skips a
+ * redundant refetch. The fleet list can't be patched the same way (its rows
+ * are `FleetRow`, a different shape) so that one is just invalidated — it
+ * also refetches on its own 5s interval regardless.
+ */
+export function useUpdateMachine(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (patch: MachinePatchBody) => patchMachine(id, patch),
+    onSuccess: (data) => {
+      qc.setQueryData(qk.machine(id), data);
+      void qc.invalidateQueries({ queryKey: qk.fleet });
+    },
   });
 }
 
@@ -106,6 +144,43 @@ export function useUnitAction(id: string) {
       unitAction(id, vars.unit, vars.action),
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: qk.systemd(id) });
+    },
+  });
+}
+
+/**
+ * Enrollment tokens (Task 9's `/enroll` page). No `refetchInterval` — unlike
+ * the fleet/machine polls, this list only changes in response to this same
+ * page's own mint/revoke mutations, which already invalidate it below.
+ */
+export function useEnrollmentTokens() {
+  return useQuery({
+    queryKey: qk.enrollmentTokens,
+    queryFn: listTokens,
+  });
+}
+
+/**
+ * The raw token in the response is deliberately NOT written anywhere here —
+ * only the caller's local component state holds it (see `EnrollPage`'s
+ * result panel), matching "shown once" (design "Enroll page").
+ */
+export function useMintToken() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: MintTokenBody) => mintToken(body),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: qk.enrollmentTokens });
+    },
+  });
+}
+
+export function useRevokeToken() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => revokeToken(id),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: qk.enrollmentTokens });
     },
   });
 }

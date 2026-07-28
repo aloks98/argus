@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, machine_id, hostname, os, kernel, arch,\n               host(primary_ip) as \"primary_ip?\", agent_version, status,\n               last_seen_at, enrolled_at, tags, notes, capabilities\n        FROM machines\n        WHERE id = $1\n        ",
+  "query": "\n        SELECT id, machine_id, hostname, display_name, os, kernel, arch,\n               host(primary_ip) as \"primary_ip?\", agent_version, status,\n               last_seen_at, enrolled_at, tags, notes, capabilities\n        FROM machines\n        WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -38,6 +38,17 @@
       },
       {
         "ordinal": 3,
+        "name": "display_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "display_name"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
         "name": "os",
         "type_info": "Text",
         "origin": {
@@ -48,7 +59,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "kernel",
         "type_info": "Text",
         "origin": {
@@ -59,7 +70,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "arch",
         "type_info": "Text",
         "origin": {
@@ -70,13 +81,13 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "primary_ip?",
         "type_info": "Text",
         "origin": "Expression"
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "agent_version",
         "type_info": "Text",
         "origin": {
@@ -87,7 +98,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "status",
         "type_info": "Text",
         "origin": {
@@ -98,7 +109,7 @@
         }
       },
       {
-        "ordinal": 9,
+        "ordinal": 10,
         "name": "last_seen_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -109,7 +120,7 @@
         }
       },
       {
-        "ordinal": 10,
+        "ordinal": 11,
         "name": "enrolled_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -120,7 +131,7 @@
         }
       },
       {
-        "ordinal": 11,
+        "ordinal": 12,
         "name": "tags",
         "type_info": "TextArray",
         "origin": {
@@ -131,7 +142,7 @@
         }
       },
       {
-        "ordinal": 12,
+        "ordinal": 13,
         "name": "notes",
         "type_info": "Text",
         "origin": {
@@ -142,7 +153,7 @@
         }
       },
       {
-        "ordinal": 13,
+        "ordinal": 14,
         "name": "capabilities",
         "type_info": "TextArray",
         "origin": {
@@ -165,6 +176,7 @@
       true,
       true,
       true,
+      true,
       null,
       true,
       false,
@@ -175,5 +187,5 @@
       true
     ]
   },
-  "hash": "e8cbef99e4052960aa553a615f554a00eb6136c5615a30653c7794c0576e0d21"
+  "hash": "5e9a05203a899b629ce432733827f74182778e03aef2cc1a30b178a8d370787e"
 }

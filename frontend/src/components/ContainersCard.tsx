@@ -161,6 +161,7 @@ export default function ContainersCard({
                             size="sm"
                             variant="outline"
                             render={<Link to={`?tab=containers&logs=${encodeURIComponent(`docker:${c.id}`)}`} />}
+                            nativeButton={false}
                           >
                             Logs
                           </Button>

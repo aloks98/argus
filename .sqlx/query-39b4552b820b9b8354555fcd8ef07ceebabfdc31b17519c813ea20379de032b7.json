@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            CREATE FUNCTION test_reject_machine_update_audit() RETURNS trigger AS $$\n            BEGIN\n                RAISE EXCEPTION 'injected failure: machine.update audit blocked for test';\n            END;\n            $$ LANGUAGE plpgsql\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "39b4552b820b9b8354555fcd8ef07ceebabfdc31b17519c813ea20379de032b7"
+}

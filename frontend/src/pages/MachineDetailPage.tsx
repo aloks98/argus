@@ -9,6 +9,7 @@ import {
   Alert,
   AlertDescription,
   AlertTitle,
+  Badge,
   Breadcrumb,
   BreadcrumbItem,
   BreadcrumbLink,
@@ -22,16 +23,23 @@ import {
   CardDescription,
   CardHeader,
   CardTitle,
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogHeader,
+  DialogTitle,
   EmptyState,
   Tabs,
   TabsContent,
   TabsList,
   TabsTrigger,
 } from "@e412/rnui-react";
+import { Pencil } from "lucide-react";
 import ContainersCard from "../components/ContainersCard";
 import LogDialog from "../components/LogDialog";
 import LogFilterBar from "../components/LogFilterBar";
 import LogViewer from "../components/LogViewer";
+import MachineIdentity from "../components/MachineIdentity";
 import SpecStrip from "../components/SpecStrip";
 import type { SpecItem } from "../components/SpecStrip";
 import StatusBadge from "../components/StatusBadge";
@@ -41,6 +49,7 @@ import type { ChartSeries } from "../components/TimeSeriesChart";
 import UnitsCard from "../components/UnitsCard";
 import { BOOT_LOGS, CAP_DOCKER, CAP_JOURNAL, CAP_SYSTEMD, SYSTEM_JOURNAL } from "../api";
 import { cn } from "../lib/cn";
+import { displayName } from "../lib/fleet";
 import { useLogFilters } from "../lib/logFilters";
 import { formatBytesPerSec, formatRelative } from "../lib/format";
 import {
@@ -102,6 +111,10 @@ function MetricChartCard({
 export default function MachineDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [range, setRange] = useState<Range>("1h");
+
+  // The identity editor lives in a Dialog, not inline in the Overview tab
+  // (Task 8 fix round 1 — the user rejected the inline-card placement).
+  const [editOpen, setEditOpen] = useState(false);
 
   // The active tab lives in the URL (`?tab=units`) rather than component state,
   // so a reload keeps the tab and a link to "the units on this box" is
@@ -239,7 +252,6 @@ export default function MachineDetailPage() {
     ...(machine.arch !== null ? [{ label: "Arch", value: machine.arch }] : []),
     ...(machine.agent_version !== null ? [{ label: "Agent", value: machine.agent_version }] : []),
     { label: "Last seen", value: formatRelative(machine.last_seen_at) },
-    ...(machine.tags.length > 0 ? [{ label: "Tags", value: machine.tags.join(", ") }] : []),
   ];
 
   return (
@@ -269,12 +281,73 @@ export default function MachineDetailPage() {
           </BreadcrumbList>
         </Breadcrumb>
 
-        <h1 className="mt-2 mb-3 font-display text-2xl uppercase tracking-tight">
-          {machine.hostname}
-        </h1>
+        {/* Renamed machines show the operator-set name as the headline, with
+            the hostname demoted to a muted mono line beneath — same pairing
+            FleetPage's Name column uses (AssetTag + hostname), so a renamed
+            machine reads the same way whether you're scanning the fleet
+            table or looking at its detail page. Un-renamed machines (the
+            common case) show just the hostname, unchanged from before. The
+            Edit control sits in this same row rather than in SpecStrip —
+            editing identity isn't "a fact about the machine" the way OS/IP/
+            kernel are.
+
+            Tags live here too, as chips, rather than comma-joined in
+            SpecStrip (browser-review decision) — same `Badge
+            variant="outline"` FleetPage's Tags column uses, so a machine's
+            tags read identically whether you're scanning the fleet table or
+            its own detail page. Omitted entirely when the machine has none,
+            same as every other conditional line in this block. */}
+        <div className="mt-2 mb-3">
+          <div className="flex flex-wrap items-center gap-3">
+            <h1 className="font-display text-2xl uppercase tracking-tight">
+              {displayName(machine)}
+            </h1>
+            <Button variant="outline" size="sm" onClick={() => setEditOpen(true)}>
+              <Pencil className="size-3.5" />
+              Edit
+            </Button>
+          </div>
+          {machine.display_name !== null && (
+            <p className="mt-1 font-mono text-[11px] text-muted-foreground">
+              {machine.hostname}
+            </p>
+          )}
+          {machine.tags.length > 0 && (
+            <div className="mt-2 flex flex-wrap gap-1">
+              {machine.tags.map((tag) => (
+                <Badge key={tag} variant="outline">
+                  {tag}
+                </Badge>
+              ))}
+            </div>
+          )}
+        </div>
 
         <SpecStrip items={specItems} />
       </div>
+
+      {/* Identity editing lives in a Dialog rather than inline on the page
+          (Task 8 fix round 1) — LogDialog is the in-repo precedent for a
+          Dialog whose content depends on this page's own state/params.
+          `MachineIdentity` itself is otherwise unchanged by this; only its
+          host is — `onSaved` is the one seam added so the dialog can close
+          itself on a successful PATCH, while staying open on a validation/
+          server error so the Alert inside it is visible.
+
+          The dialog owns the ONE heading (Task 8 fix round 2): `MachineIdentity`
+          no longer renders its own Card/CardHeader — nesting a bordered Card
+          inside DialogContent's own bordered popup rendered as a visible
+          double border, and two headings ("Identity" from the Card, an
+          sr-only one here) was one too many anyway. */}
+      <Dialog open={editOpen} onOpenChange={setEditOpen}>
+        <DialogContent className="sm:max-w-lg">
+          <DialogHeader>
+            <DialogTitle>Edit identity</DialogTitle>
+            <DialogDescription>Rename, tag, and annotate this machine.</DialogDescription>
+          </DialogHeader>
+          <MachineIdentity machine={machine} onSaved={() => setEditOpen(false)} />
+        </DialogContent>
+      </Dialog>
 
       <Tabs value={tab} onValueChange={(value) => setTab(String(value))}>
         <TabsList>

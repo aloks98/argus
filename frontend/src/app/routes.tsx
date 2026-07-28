@@ -1,5 +1,6 @@
 import type { ReactElement } from "react";
-import { Server, type LucideIcon } from "lucide-react";
+import { Plus, Server, type LucideIcon } from "lucide-react";
+import EnrollPage from "../pages/EnrollPage";
 import FleetPage from "../pages/FleetPage";
 import MachineDetailPage from "../pages/MachineDetailPage";
 
@@ -32,6 +33,11 @@ export const ROUTES: AppRoute[] = [
     path: "/machines",
     element: <FleetPage />,
     nav: { label: "Machines", section: "Fleet", icon: Server },
+  },
+  {
+    path: "/enroll",
+    element: <EnrollPage />,
+    nav: { label: "Enroll", section: "Fleet", icon: Plus },
   },
   { path: "/machines/:id", element: <MachineDetailPage /> },
 ];

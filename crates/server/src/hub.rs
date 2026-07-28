@@ -14,7 +14,7 @@ use argus_proto::v1::{
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use tokio::sync::{mpsc, oneshot};
+use tokio::sync::{mpsc, oneshot, Notify};
 use tonic::Status;
 use uuid::Uuid;
 
@@ -46,10 +46,22 @@ struct PtyFlowInner {
 /// counter for the fresh non-zero `stream_id` each dispatched command gets. The
 /// `epoch` distinguishes successive connections of the same machine so a
 /// lingering old session's teardown can't evict a freshly-reconnected one.
+///
+/// `shutdown` is the other half of that story: the epoch guard stops a STALE
+/// disconnect from evicting a NEWER registration, but by itself does nothing
+/// to stop the STALE session's server-side loop from continuing to run --
+/// left alone, it would keep pumping heartbeats (marking the machine online)
+/// while no longer reachable via `conns` for verb/log/terminal dispatch. Each
+/// `register` hands the caller a clone of ITS OWN handle's `shutdown`, for the
+/// session loop to select on; when a later `register` for the same machine
+/// replaces this handle, it fires `shutdown` so that loop notices promptly
+/// and exits through the normal teardown path instead of lingering
+/// alive-but-unroutable.
 struct ConnHandle {
     tx: mpsc::Sender<Result<ServerFrame, Status>>,
     next_stream_id: AtomicU64,
     epoch: u64,
+    shutdown: Arc<Notify>,
 }
 
 /// Why a command couldn't be dispatched.
@@ -94,19 +106,34 @@ impl Hub {
         Hub::default()
     }
 
-    /// Register a live connection, returning its epoch. A re-register for the
-    /// same machine replaces the old handle (last writer wins).
-    pub fn register(&self, machine_id: Uuid, tx: mpsc::Sender<Result<ServerFrame, Status>>) -> u64 {
+    /// Register a live connection, returning its epoch and a shutdown signal
+    /// for the CALLER's own session loop to select on. A re-register for the
+    /// same machine replaces the old handle (last writer wins) -- and, unlike
+    /// before, fires the OLD handle's shutdown signal on the way out, so that
+    /// superseded session's loop wakes promptly and exits through the normal
+    /// teardown path (rather than lingering alive-but-unroutable: still
+    /// pumping heartbeats server-side with no way for the hub to route verbs/
+    /// logs/terminal to it anymore).
+    pub fn register(
+        &self,
+        machine_id: Uuid,
+        tx: mpsc::Sender<Result<ServerFrame, Status>>,
+    ) -> (u64, Arc<Notify>) {
         let epoch = self.epoch_counter.fetch_add(1, Ordering::Relaxed) + 1;
-        self.conns.lock().unwrap().insert(
+        let shutdown = Arc::new(Notify::new());
+        let old = self.conns.lock().unwrap().insert(
             machine_id,
             ConnHandle {
                 tx,
                 next_stream_id: AtomicU64::new(1),
                 epoch,
+                shutdown: shutdown.clone(),
             },
         );
-        epoch
+        if let Some(old) = old {
+            old.shutdown.notify_one();
+        }
+        (epoch, shutdown)
     }
 
     /// Remove a connection only if it is still the one with this `epoch` — a
@@ -725,15 +752,72 @@ mod tests {
         let hub = Hub::new();
         let m = Uuid::new_v4();
         let (tx1, _rx1) = mpsc::channel(1);
-        let epoch1 = hub.register(m, tx1);
+        let (epoch1, _shutdown1) = hub.register(m, tx1);
         // Machine reconnects: a second register replaces the first.
         let (tx2, _rx2) = mpsc::channel(1);
-        let _epoch2 = hub.register(m, tx2);
+        let (_epoch2, _shutdown2) = hub.register(m, tx2);
         // The OLD session's teardown must not remove the new connection.
         hub.unregister(m, epoch1);
         assert!(
             hub.conns.lock().unwrap().contains_key(&m),
             "newer connection must survive a stale unregister"
+        );
+    }
+
+    #[test]
+    fn a_normal_single_session_disconnect_still_unregisters() {
+        // No supersession involved at all: a lone session's own teardown
+        // must still remove its handle -- the epoch guard added for the
+        // stale-disconnect case must not accidentally make unregister a
+        // no-op in the common case.
+        let hub = Hub::new();
+        let m = Uuid::new_v4();
+        let (tx, _rx) = mpsc::channel(1);
+        let (epoch, _shutdown) = hub.register(m, tx);
+        hub.unregister(m, epoch);
+        assert!(
+            !hub.conns.lock().unwrap().contains_key(&m),
+            "a session's own disconnect must unregister it"
+        );
+    }
+
+    #[tokio::test]
+    async fn register_replacing_a_live_handle_fires_the_old_handles_shutdown_signal() {
+        // The exact inversion of the bug: A connects, then B connects for the
+        // same machine (replacing A). A's shutdown signal must fire so its
+        // session loop can exit, and the hub must still route to B -- its tx
+        // works and the registry is non-empty.
+        let hub = Hub::new();
+        let m = Uuid::new_v4();
+        let (tx_a, _rx_a) = mpsc::channel(1);
+        let (epoch_a, shutdown_a) = hub.register(m, tx_a);
+        let (tx_b, mut rx_b) = mpsc::channel(4);
+        let (epoch_b, _shutdown_b) = hub.register(m, tx_b);
+        assert_ne!(epoch_a, epoch_b, "each registration gets a fresh epoch");
+
+        // A's shutdown signal fired: a permit is already stored, so this
+        // resolves immediately rather than hanging.
+        tokio::time::timeout(std::time::Duration::from_millis(100), shutdown_a.notified())
+            .await
+            .expect("the replaced session's shutdown signal must fire promptly");
+
+        // The hub still routes to B: dispatch succeeds and B's channel
+        // receives the frame.
+        hub.send_command(
+            m,
+            "cmd-super".into(),
+            Verb::ContainerStart,
+            "c1".into(),
+            repo::Actor::System,
+        )
+        .await
+        .expect("the hub must still route to the surviving session B");
+        let frame = rx_b.recv().await.expect("B receives the dispatched frame");
+        assert!(frame.is_ok());
+
+        assert!(
+            hub.conns.lock().unwrap().contains_key(&m),
+            "the registry must still hold B's live connection"
         );
     }
 

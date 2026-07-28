@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO enrollment_tokens (name, token_hash, display_name, tags)\n               VALUES ('t1', sha256('raw1'::bytea), 'Media box', '{media,infra}')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "48dc2728ca2a389a3fe94b18b273f0d7744dd345e672351f33550b7fe539df2a"
+}

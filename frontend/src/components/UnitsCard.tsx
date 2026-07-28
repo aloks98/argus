@@ -257,6 +257,7 @@ export default function UnitsCard({
                               size="sm"
                               variant="outline"
                               render={<Link to={`?tab=units&logs=${encodeURIComponent(`journal:${u.name}`)}`} />}
+                              nativeButton={false}
                             >
                               Logs
                             </Button>

@@ -4,6 +4,7 @@
 //! `sqlx::query!`/`query_as!` against the live dev Postgres (`DATABASE_URL`).
 
 use anyhow::Result;
+use rand::Rng;
 use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -16,7 +17,17 @@ pub enum TokenCheck {
     // but it's still the only server-verified record of which token
     // authorized the call, so `enroll` now stamps it into every
     // `agent.enroll` row's `detail` instead (`repo::audit_with_detail`).
-    Valid { token_name: String },
+    //
+    // `display_name`/`tags` carry the identity the token was minted with
+    // (Task 4's `mint_enrollment_token`) so the enroll handler can apply it
+    // to the machine right after `upsert_machine` (`apply_token_identity`
+    // below) -- a null/empty value here means the token never set that
+    // field, not that it should clear the machine's existing one.
+    Valid {
+        token_name: String,
+        display_name: Option<String>,
+        tags: Vec<String>,
+    },
     Invalid,
 }
 
@@ -56,7 +67,7 @@ pub async fn consume_enrollment_token(
           AND NOT revoked
           AND (expires_at IS NULL OR expires_at > now())
           AND (max_uses IS NULL OR uses < max_uses)
-        RETURNING name
+        RETURNING name, display_name, tags as "tags!"
         "#,
         token_hash,
     )
@@ -66,9 +77,131 @@ pub async fn consume_enrollment_token(
     Ok(match row {
         Some(row) => TokenCheck::Valid {
             token_name: row.name,
+            display_name: row.display_name,
+            tags: row.tags,
         },
         None => TokenCheck::Invalid,
     })
+}
+
+/// 32-character alphanumeric enrollment token, generated the same way
+/// `auth::password::generate_password` builds its credential (an index drawn
+/// per character via `rand::rng().random_range`), but over the full
+/// `[A-Za-z0-9]` alphabet rather than password.rs's ambiguous-char-excluding
+/// one: an enrollment token is copy-pasted into a join command, never
+/// hand-transcribed from a screen under pressure, so the 0/O/1/l/I collision
+/// risk that motivates password.rs's narrower alphabet doesn't apply here.
+const TOKEN_LEN: usize = 32;
+const TOKEN_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+fn generate_token() -> String {
+    let alphabet: Vec<char> = TOKEN_ALPHABET.chars().collect();
+    let mut rng = rand::rng();
+    (0..TOKEN_LEN)
+        .map(|_| alphabet[rng.random_range(0..alphabet.len())])
+        .collect()
+}
+
+/// One `enrollment_tokens` row as returned to the browser -- never the hash,
+/// never the raw token (the raw token exists only in
+/// `mint_enrollment_token`'s return value, once).
+pub struct TokenRow {
+    pub id: Uuid,
+    pub name: String,
+    pub display_name: Option<String>,
+    pub tags: Vec<String>,
+    pub max_uses: Option<i32>,
+    pub uses: i32,
+    pub expires_at: Option<OffsetDateTime>,
+    pub revoked: bool,
+    pub created_by: Option<String>,
+    pub created_at: OffsetDateTime,
+}
+
+/// Newest-first, for the enrollment-tokens admin table.
+pub async fn list_enrollment_tokens(executor: impl sqlx::PgExecutor<'_>) -> Result<Vec<TokenRow>> {
+    let rows = sqlx::query_as!(
+        TokenRow,
+        r#"
+        SELECT id, name, display_name, tags as "tags!", max_uses, uses, expires_at,
+               revoked, created_by, created_at
+        FROM enrollment_tokens
+        ORDER BY created_at DESC
+        "#
+    )
+    .fetch_all(executor)
+    .await?;
+    Ok(rows)
+}
+
+/// Mint a new join token: generate the raw 32-char credential, store only its
+/// sha256, and compute the expiry in SQL. `expires_in_hours: None` stores
+/// "never" -- confirmed against the dev DB
+/// (`SELECT now() + make_interval(hours => NULL)` -> `NULL`; `make_interval`
+/// propagates a NULL argument straight to a NULL result), so passing the
+/// `Option<i32>` through to `make_interval(hours => $6)` needs no extra
+/// `CASE`.
+pub async fn mint_enrollment_token(
+    executor: impl sqlx::PgExecutor<'_>,
+    name: &str,
+    display_name: Option<&str>,
+    tags: &[String],
+    max_uses: Option<i32>,
+    // `int4` (Postgres `make_interval`'s `hours` parameter is `int`, not
+    // `bigint`) -- 8760 (the handler's upper clamp, one year) fits
+    // comfortably, so this is not a real range restriction.
+    expires_in_hours: Option<i32>,
+    created_by: &str,
+) -> Result<(TokenRow, String)> {
+    let raw = generate_token();
+    let token_hash = Sha256::digest(raw.as_bytes()).to_vec();
+    let row = sqlx::query_as!(
+        TokenRow,
+        r#"
+        INSERT INTO enrollment_tokens (name, token_hash, display_name, tags, max_uses, expires_at, created_by)
+        VALUES ($1, $2, $3, $4, $5, now() + make_interval(hours => $6), $7)
+        RETURNING id, name, display_name, tags as "tags!", max_uses, uses, expires_at, revoked, created_by, created_at
+        "#,
+        name,
+        token_hash,
+        display_name,
+        tags,
+        max_uses,
+        expires_in_hours,
+        created_by,
+    )
+    .fetch_one(executor)
+    .await?;
+    Ok((row, raw))
+}
+
+/// Look up an enrollment token's `name` by id -- used by the revoke handler
+/// to fetch the name BEFORE revoking (inside the same transaction as the
+/// revoke), so the `enroll_token.revoke` audit row's detail can name the
+/// token without a second round trip after the mutation.
+pub async fn enrollment_token_name(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: Uuid,
+) -> Result<Option<String>> {
+    let name = sqlx::query_scalar!("SELECT name FROM enrollment_tokens WHERE id = $1", id)
+        .fetch_optional(executor)
+        .await?;
+    Ok(name)
+}
+
+/// Revoke a token by id. `true` iff a row with this id existed (revoking an
+/// already-revoked token still returns `true` -- idempotent, not an error).
+pub async fn revoke_enrollment_token(
+    executor: impl sqlx::PgExecutor<'_>,
+    id: Uuid,
+) -> Result<bool> {
+    let res = sqlx::query!(
+        "UPDATE enrollment_tokens SET revoked = true WHERE id = $1",
+        id,
+    )
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected() == 1)
 }
 
 /// Insert-or-update a machine's inventory row by `machine_id` (the stable
@@ -153,6 +286,34 @@ pub async fn update_machine_inventory(
     .execute(executor)
     .await?;
 
+    Ok(())
+}
+
+/// Apply a token's identity fields to the machine it just enrolled — ONLY
+/// where the token actually set them (design "Enrollment flow"): a null
+/// display_name / empty tags on the token leaves the machine's existing
+/// values untouched, which is what makes re-enrollment after CA rotation
+/// identity-preserving by default.
+pub async fn apply_token_identity(
+    executor: impl sqlx::PgExecutor<'_>,
+    machine_id: Uuid,
+    display_name: Option<&str>,
+    tags: &[String],
+) -> Result<()> {
+    sqlx::query!(
+        r#"
+        UPDATE machines SET
+            display_name = coalesce($2, display_name),
+            tags         = CASE WHEN cardinality($3::text[]) > 0 THEN $3 ELSE tags END,
+            updated_at   = now()
+        WHERE id = $1
+        "#,
+        machine_id,
+        display_name,
+        tags,
+    )
+    .execute(executor)
+    .await?;
     Ok(())
 }
 
@@ -521,6 +682,7 @@ pub struct MachineDetail {
     pub id: Uuid,
     pub machine_id: String,
     pub hostname: String,
+    pub display_name: Option<String>,
     pub os: Option<String>,
     pub kernel: Option<String>,
     pub arch: Option<String>,
@@ -544,7 +706,7 @@ pub async fn machine_detail(
     let row = sqlx::query_as!(
         MachineDetail,
         r#"
-        SELECT id, machine_id, hostname, os, kernel, arch,
+        SELECT id, machine_id, hostname, display_name, os, kernel, arch,
                host(primary_ip) as "primary_ip?", agent_version, status,
                last_seen_at, enrolled_at, tags, notes, capabilities
         FROM machines
@@ -556,6 +718,38 @@ pub async fn machine_detail(
     .await?;
 
     Ok(row)
+}
+
+/// Partial identity update. Each field is guarded by its own `apply` flag so
+/// one static, compile-time-checked query covers every PATCH combination --
+/// no dynamic SQL. Returns false when the machine id does not exist.
+pub async fn update_machine_identity(
+    executor: impl sqlx::PgExecutor<'_>,
+    machine_id: Uuid,
+    display_name: Option<Option<&str>>,
+    notes: Option<Option<&str>>,
+    tags: Option<&[String]>,
+) -> Result<bool> {
+    let res = sqlx::query!(
+        r#"
+        UPDATE machines SET
+            display_name = CASE WHEN $2 THEN $3::text ELSE display_name END,
+            notes        = CASE WHEN $4 THEN $5::text ELSE notes END,
+            tags         = CASE WHEN $6 THEN $7::text[] ELSE tags END,
+            updated_at   = now()
+        WHERE id = $1
+        "#,
+        machine_id,
+        display_name.is_some(),
+        display_name.flatten(),
+        notes.is_some(),
+        notes.flatten(),
+        tags.is_some(),
+        tags.unwrap_or(&[]),
+    )
+    .execute(executor)
+    .await?;
+    Ok(res.rows_affected() == 1)
 }
 
 /// An authenticated human. Minted only by the auth middleware, which is what
@@ -739,7 +933,7 @@ mod tests {
             .await
             .expect("consume")
         {
-            TokenCheck::Valid { token_name } => assert_eq!(token_name, "test-token-name"),
+            TokenCheck::Valid { token_name, .. } => assert_eq!(token_name, "test-token-name"),
             TokenCheck::Invalid => panic!("expected Valid on first use"),
         }
         assert!(matches!(
@@ -811,6 +1005,79 @@ mod tests {
         .execute(&pool)
         .await
         .expect("cleanup expired token");
+    }
+
+    /// Minimal `AgentInfoRow` for tests that only care about machine identity
+    /// (machine_id/hostname), not the full inventory snapshot exercised by
+    /// `upsert_machine_is_idempotent_by_machine_id_and_updates_inventory` below.
+    fn test_agent_info(machine_id: &str) -> AgentInfoRow {
+        AgentInfoRow {
+            machine_id: machine_id.into(),
+            hostname: machine_id.into(),
+            os: None,
+            kernel: None,
+            arch: None,
+            primary_ip: None,
+            agent_version: None,
+            capabilities: None,
+        }
+    }
+
+    #[sqlx::test]
+    async fn token_identity_applies_on_enroll_and_preserves_on_reenroll(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        // A token WITH identity: applies both fields.
+        sqlx::query!(
+            r#"INSERT INTO enrollment_tokens (name, token_hash, display_name, tags)
+               VALUES ('t1', sha256('raw1'::bytea), 'Media box', '{media,infra}')"#
+        )
+        .execute(&pool)
+        .await?;
+        let TokenCheck::Valid {
+            display_name, tags, ..
+        } = consume_enrollment_token(&pool, "raw1").await?
+        else {
+            panic!("token should be valid")
+        };
+        let info = test_agent_info("m-ident");
+        let id = upsert_machine(&pool, &info).await?;
+        apply_token_identity(&pool, id, display_name.as_deref(), &tags).await?;
+        let row = sqlx::query!("SELECT display_name, tags FROM machines WHERE id = $1", id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(row.display_name.as_deref(), Some("Media box"));
+        assert_eq!(row.tags, vec!["media", "infra"]);
+
+        // Re-enroll with a BARE token (no identity): everything preserved.
+        sqlx::query!(
+            r#"INSERT INTO enrollment_tokens (name, token_hash) VALUES ('t2', sha256('raw2'::bytea))"#
+        )
+        .execute(&pool)
+        .await?;
+        let TokenCheck::Valid {
+            display_name, tags, ..
+        } = consume_enrollment_token(&pool, "raw2").await?
+        else {
+            panic!("token should be valid")
+        };
+        let id2 = upsert_machine(&pool, &info).await?; // same machine_id => same row
+        assert_eq!(id, id2);
+        apply_token_identity(&pool, id2, display_name.as_deref(), &tags).await?;
+        let row = sqlx::query!("SELECT display_name, tags FROM machines WHERE id = $1", id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            row.display_name.as_deref(),
+            Some("Media box"),
+            "bare re-enroll must not clear the name"
+        );
+        assert_eq!(
+            row.tags,
+            vec!["media", "infra"],
+            "bare re-enroll must not clear tags"
+        );
+        Ok(())
     }
 
     #[tokio::test]

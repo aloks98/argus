@@ -69,6 +69,8 @@ manual real-host gate instead.
 > container and fail.
 
 ## Enroll an agent
+The `/enroll` page in the UI is the normal way to mint a token; the `psql` steps
+below are the no-UI fallback.
 ```bash
 # 1. Grab the CA cert the agent needs to verify the server:
 docker exec argus-pg psql -U postgres -d argus -tAc \
@@ -99,6 +101,31 @@ later start it *loads* that identity and skips enrollment — but `ARGUS_JOIN_TO
 must still be set (any value): config validation requires it unconditionally.
 
 Open http://127.0.0.1:8080 — the fleet page shows the machine `online`.
+
+### Alternative: `--config <path>` (env-file, survives a restart)
+Env vars are fine for a one-shot manual run, but the enroll page's `sudo -n env
+VAR=... ./argus-agent` recipe does not survive a reboot. `--config` reads the
+same four keys from a file instead. The format is a subset of systemd's
+`EnvironmentFile=` (`KEY=VALUE` per line, `#`-comments and blank lines ignored,
+surrounding quotes stripped), so the same file doubles as a unit's
+`EnvironmentFile=` unchanged later:
+```bash
+cat > /tmp/argus-agent.env <<'EOF'
+ARGUS_AGENT_ENDPOINT=https://localhost:9443
+ARGUS_JOIN_TOKEN=devtoken
+ARGUS_CA_CERT=/tmp/argus-ca.crt
+ARGUS_DATA_DIR=/tmp/argus-agent
+EOF
+chmod 600 /tmp/argus-agent.env
+
+cargo build -p argus-agent
+sudo -n ./target/debug/argus-agent --config /tmp/argus-agent.env
+```
+Real environment variables still win over the same key in the file — useful
+under `sudo -n`, which does not carry your shell's exports through, unlike the
+`sudo -n env VAR=...` form above. Unknown keys in the file are logged as a
+`tracing::warn!` (typo detection) and otherwise ignored, not a hard error; a
+missing or unreadable `--config` path IS a hard startup error.
 
 ## Spine end-to-end verification (2026-07-06)
 Verified manually per the plan's Task 11 (`docs/plans/2026-07-05-spine-slice.md`):
@@ -1287,3 +1314,44 @@ touched `ca_material` again); the vite dev server on `:5173` was never
 stopped. The dev agent enrolled before this task remains orphaned by the
 `--ignored` gate's CA rotation (see above) and needs re-enrolling before any
 agent-facing check.
+
+## Fleet identity & navigation — live verification (2026-07-28)
+
+Design of record: `docs/superpowers/specs/2026-07-28-fleet-identity-design.md`.
+API-level pass run with curl against the dev control plane (branch build,
+migration 0006 applied on startup) and the real dev agent. All green:
+
+- **Mint** (`POST /api/enrollment-tokens`, local-admin session): body tags
+  `["Dev ", " e2e", "dev"]` came back `["dev", "e2e"]` — trim/lowercase/dedupe
+  happens server-side at mint. Defaults confirmed: `max_uses: 1`,
+  `expires_at` ≈ now+24h, `created_by: "local:admin"`, raw `token` present in
+  the 201 and in no other response.
+- **Enroll-time identity** (the Task 5 seam, live): killed the dev agent,
+  wiped `ARGUS_DATA_DIR`, re-enrolled with the minted token → the SAME
+  machine row (keyed on `machine_id`) picked up `display_name "Fatman (dev)"`
+  and `tags {dev,e2e}`; token then shows `uses 1/1` ("used" in the list API).
+- **PATCH** `/api/machines/{id}`: rename/retag/notes round-trip in one call;
+  `{"tags": ["has space"]}` → 400 with the actionable message naming the tag;
+  partial semantics verified (revert PATCH left unlisted fields alone).
+- **Fleet payload** carries `display_name`, `tags`, `capabilities`.
+  **`GET /api/ca.pem`** serves the CA PEM behind auth.
+- **Revoke** → 204; list-state derivation shows `revoked` / `used` / `active`
+  correctly across the table's real history.
+- **Audit**: `machine.update` rows carry field NAMES only (never values);
+  `enroll_token.create`/`enroll_token.revoke` carry the label (and, after the
+  final-review fix, the token id — names are not unique).
+
+One operational note: the enroll page (and any new `/api` route) 404-falls
+through to the SPA on a control plane built before this slice — the browser
+then shows "Unexpected token '<'" from parsing `index.html` as JSON. That is
+a stale-binary symptom, not a routing bug: rebuild and restart `argus`.
+
+Local admin was reset during this pass (the previous password had been
+rotated during the PR #12 checks): the break-glass credential in use is the
+one issued 2026-07-28 by `argus local-admin reset`.
+
+Browser checklist (operator): identity dialog single-border both themes;
+chip-count contrast inside the selected Badge; server-400 Alert in the
+dialog via an invalid-charset tag; Enter-with-highlight commits the
+suggestion; enroll page mint/copy/revoke flow; grouped view duplicating a
+multi-tag machine; URL round-trip in a fresh tab; Ctrl+K from a cold page.

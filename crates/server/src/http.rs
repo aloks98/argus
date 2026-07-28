@@ -17,7 +17,7 @@ use axum::{
         sse::{Event, KeepAlive, Sse},
         IntoResponse, Json, Response,
     },
-    routing::{get, post},
+    routing::{delete, get, post},
     Router,
 };
 use sqlx::PgPool;
@@ -101,7 +101,7 @@ fn router(state: AppState) -> Router {
     let api = Router::new()
         .route("/api/me", get(me))
         .route("/api/fleet", get(fleet))
-        .route("/api/machines/{id}", get(machine))
+        .route("/api/machines/{id}", get(machine).patch(patch_machine))
         .route("/api/machines/{id}/metrics", get(machine_metrics))
         .route("/api/machines/{id}/docker", get(machine_docker))
         .route(
@@ -124,6 +124,11 @@ fn router(state: AppState) -> Router {
         // `require_auth` layer and `SameSite=Lax` cookie as every other verb,
         // not under the public `/auth/*` prefix.
         .route("/api/local-admin/rotate", post(crate::auth::local::rotate))
+        .route("/api/enrollment-tokens", get(list_tokens).post(mint_token))
+        .route("/api/enrollment-tokens/{id}", delete(revoke_token))
+        // Not secret (PRD §5), but nothing under /api is served unauthenticated;
+        // see `ca_pem`'s doc comment.
+        .route("/api/ca.pem", get(ca_pem))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_auth,
@@ -167,12 +172,19 @@ async fn readyz() -> impl IntoResponse {
 struct FleetRow {
     id: Uuid,
     hostname: String,
+    /// Operator-set name; `None` = "display the hostname". The fallback lives
+    /// client-side so a hostname change keeps showing through.
+    display_name: Option<String>,
     os: Option<String>,
     primary_ip: Option<String>,
     status: String,
     #[serde(with = "time::serde::rfc3339::option")]
     last_seen_at: Option<OffsetDateTime>,
     tags: Vec<String>,
+    /// Same tri-state as the detail payload: `None` = agent never reported =
+    /// gate nothing. Carried on the fleet row for the command palette, which
+    /// builds per-machine tab entries without fetching every detail page.
+    capabilities: Option<Vec<String>>,
     cpu_pct: Option<f32>,
     mem_pct: Option<f64>,
     /// Count of units in the `failed` state in the machine's **last reported**
@@ -202,8 +214,8 @@ struct SparkSeries {
 /// Behind `require_auth` (mounted once on the whole `/api` router).
 async fn fleet(State(state): State<AppState>) -> Result<Json<Vec<FleetRow>>, StatusCode> {
     let rows = sqlx::query!(
-        r#"SELECT id, hostname, os, host(primary_ip) as "primary_ip?", status,
-                  last_seen_at, tags FROM machines ORDER BY hostname"#
+        r#"SELECT id, hostname, display_name, os, host(primary_ip) as "primary_ip?", status,
+                  last_seen_at, tags, capabilities FROM machines ORDER BY hostname"#
     )
     .fetch_all(&state.pool)
     .await
@@ -245,11 +257,13 @@ async fn fleet(State(state): State<AppState>) -> Result<Json<Vec<FleetRow>>, Sta
             FleetRow {
                 id: r.id,
                 hostname: r.hostname,
+                display_name: r.display_name,
                 os: r.os,
                 primary_ip: r.primary_ip,
                 status: r.status,
                 last_seen_at: r.last_seen_at,
                 tags: r.tags,
+                capabilities: r.capabilities,
                 cpu_pct,
                 mem_pct,
                 failed_units,
@@ -269,6 +283,7 @@ struct MachineDetailDto {
     id: Uuid,
     machine_id: String,
     hostname: String,
+    display_name: Option<String>,
     os: Option<String>,
     kernel: Option<String>,
     arch: Option<String>,
@@ -291,6 +306,7 @@ impl From<repo::MachineDetail> for MachineDetailDto {
             id: d.id,
             machine_id: d.machine_id,
             hostname: d.hostname,
+            display_name: d.display_name,
             os: d.os,
             kernel: d.kernel,
             arch: d.arch,
@@ -320,6 +336,398 @@ async fn machine(
     match detail {
         Some(d) => Ok(Json(d.into())),
         None => Err(StatusCode::NOT_FOUND),
+    }
+}
+
+/// Body of `PATCH /api/machines/{id}`. The double `Option` distinguishes an
+/// absent key (leave the field alone) from an explicit `null` (clear it) --
+/// plain `Option<String>` cannot represent that difference after serde.
+#[derive(serde::Deserialize)]
+struct MachinePatch {
+    #[serde(default, deserialize_with = "double_option")]
+    display_name: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    notes: Option<Option<String>>,
+    #[serde(default)]
+    tags: Option<Vec<String>>,
+}
+
+/// Generic over `T` so both `MachinePatch` (`Option<Option<String>>`) and the
+/// enrollment-token mint body (`Option<Option<i32>>` / `Option<Option<i64>>`)
+/// can share this: absent key vs. explicit JSON `null` carry different
+/// meanings in both bodies, and plain `Option<T>` cannot represent that
+/// difference after serde.
+fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    use serde::Deserialize;
+    Ok(Some(Option::<T>::deserialize(d)?))
+}
+
+/// `PATCH /api/machines/{id}` -- display name / notes / tags. Only the fields
+/// present in the body change. Every outcome that MUTATED is audited; a 400
+/// mutates nothing and is not.
+async fn patch_machine(
+    State(state): State<AppState>,
+    crate::auth::AuthUser(identity): crate::auth::AuthUser,
+    Path(id): Path<Uuid>,
+    Json(patch): Json<MachinePatch>,
+) -> Response {
+    // Validate everything BEFORE touching the database.
+    let display_name = match &patch.display_name {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(raw)) => match crate::identity::normalize_display_name(raw) {
+            Ok(v) => Some(v),
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        },
+    };
+    let notes = match &patch.notes {
+        None => None,
+        Some(None) => Some(None),
+        Some(Some(raw)) => match crate::identity::validate_notes(raw) {
+            Ok(()) => Some(Some(raw.clone())),
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        },
+    };
+    let tags = match &patch.tags {
+        None => None,
+        Some(raw) => match crate::identity::normalize_tags(raw) {
+            Ok(v) => Some(v),
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        },
+    };
+    let mut fields: Vec<&str> = Vec::new();
+    if display_name.is_some() {
+        fields.push("display_name");
+    }
+    if notes.is_some() {
+        fields.push("notes");
+    }
+    if tags.is_some() {
+        fields.push("tags");
+    }
+    if fields.is_empty() {
+        return (StatusCode::BAD_REQUEST, "no fields to update").into_response();
+    }
+
+    let dn_arg: Option<Option<&str>> = display_name.as_ref().map(|o| o.as_deref());
+    let notes_arg: Option<Option<&str>> = notes.as_ref().map(|o| o.as_deref());
+
+    // Fail closed (CLAUDE.md: every verb goes through the audit log from the
+    // start): the mutation and its `machine.update` row are ONE transaction,
+    // committed together or not at all. `run_verb` gets fail-closed by
+    // auditing BEFORE dispatch, but that ordering isn't available here --
+    // "does this machine exist" (the 404) can only be answered by attempting
+    // the update itself, so the update necessarily runs first. Sharing a `tx`
+    // instead means a failed audit write rolls the update back with it: an
+    // unaudited mutation must never persist, and a client told "500" must
+    // find the database agrees.
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to begin machine identity update transaction");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let updated =
+        match repo::update_machine_identity(&mut *tx, id, dn_arg, notes_arg, tags.as_deref()).await
+        {
+            Ok(u) => u,
+            Err(err) => {
+                tracing::error!(error = %err, "failed to update machine identity");
+                return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+            }
+        };
+    if !updated {
+        // `tx` drops here un-committed -- there was nothing to roll back (no
+        // row matched), but this keeps the "never commit without an audit
+        // row" invariant true unconditionally rather than by accident.
+        return StatusCode::NOT_FOUND.into_response();
+    }
+
+    // detail = which fields changed, never the values: notes may hold anything.
+    if let Err(err) = repo::audit_with_detail(
+        &mut *tx,
+        repo::Actor::User(&identity),
+        "machine.update",
+        Some(id),
+        "ok",
+        serde_json::json!({ "fields": fields }),
+    )
+    .await
+    {
+        tracing::error!(error = %err, "failed to audit machine.update; rolling back the update");
+        // `tx` drops here un-committed, which rolls the update back: the
+        // whole point of sharing a transaction with the write above.
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(err) = tx.commit().await {
+        tracing::error!(error = %err, "failed to commit machine identity update");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    // Return the refreshed detail so the client can cache-swap in one round trip.
+    match repo::machine_detail(&state.pool, id).await {
+        Ok(Some(d)) => Json(MachineDetailDto::from(d)).into_response(),
+        Ok(None) => StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to reload machine detail");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+// === Enrollment tokens (fleet-identity slice, Task 4) ===
+
+/// One `enrollment_tokens` row for the browser. `token` is `None` -- and
+/// thus omitted via `skip_serializing_if` -- on every path except the mint
+/// response, where it carries the raw credential exactly once: never
+/// persisted, never returned again.
+#[derive(serde::Serialize)]
+struct TokenDto {
+    id: Uuid,
+    name: String,
+    display_name: Option<String>,
+    tags: Vec<String>,
+    max_uses: Option<i32>,
+    uses: i32,
+    #[serde(with = "time::serde::rfc3339::option")]
+    expires_at: Option<OffsetDateTime>,
+    revoked: bool,
+    created_by: Option<String>,
+    #[serde(with = "time::serde::rfc3339")]
+    created_at: OffsetDateTime,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    token: Option<String>,
+}
+
+impl From<repo::TokenRow> for TokenDto {
+    fn from(r: repo::TokenRow) -> Self {
+        TokenDto {
+            id: r.id,
+            name: r.name,
+            display_name: r.display_name,
+            tags: r.tags,
+            max_uses: r.max_uses,
+            uses: r.uses,
+            expires_at: r.expires_at,
+            revoked: r.revoked,
+            created_by: r.created_by,
+            created_at: r.created_at,
+            token: None,
+        }
+    }
+}
+
+/// `GET /api/enrollment-tokens` -- newest first. Never the hash or raw token.
+async fn list_tokens(State(state): State<AppState>) -> Response {
+    match repo::list_enrollment_tokens(&state.pool).await {
+        Ok(rows) => Json(rows.into_iter().map(TokenDto::from).collect::<Vec<_>>()).into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to list enrollment tokens");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
+    }
+}
+
+/// Body of `POST /api/enrollment-tokens`. `max_uses`/`expires_in_hours` reuse
+/// `double_option`: an absent key takes the default (`1` use / 24h), an
+/// explicit JSON `null` means unlimited/never, and an explicit number is
+/// clamped into range. `tags` has no such tri-state -- there is no existing
+/// row to "leave alone" on a create -- so an absent key is simply "no tags".
+#[derive(serde::Deserialize)]
+struct MintTokenBody {
+    name: String,
+    display_name: Option<String>,
+    #[serde(default)]
+    tags: Vec<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    max_uses: Option<Option<i32>>,
+    #[serde(default, deserialize_with = "double_option")]
+    expires_in_hours: Option<Option<i64>>,
+}
+
+/// `POST /api/enrollment-tokens` -- mint a join token. Absent `max_uses` ⇒
+/// 1, absent `expires_in_hours` ⇒ 24h; explicit JSON `null` for either ⇒
+/// unlimited/never; an explicit number is clamped into range rather than
+/// rejected.
+///
+/// The insert and its `enroll_token.create` audit row share one transaction
+/// -- the same fail-closed convention `patch_machine` established (see its
+/// doc comment): a minted-but-unaudited token is exactly the gap CLAUDE.md's
+/// audit rule rules out, so a failed audit write rolls the mint back with it.
+async fn mint_token(
+    State(state): State<AppState>,
+    crate::auth::AuthUser(identity): crate::auth::AuthUser,
+    Json(body): Json<MintTokenBody>,
+) -> Response {
+    // Validate everything BEFORE touching the database.
+    let name = match crate::identity::normalize_display_name(&body.name) {
+        Ok(Some(n)) => n,
+        Ok(None) => return (StatusCode::BAD_REQUEST, "name must not be empty").into_response(),
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    let display_name = match body.display_name.as_deref() {
+        None => None,
+        Some(raw) => match crate::identity::normalize_display_name(raw) {
+            Ok(v) => v,
+            Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+        },
+    };
+    let tags = match crate::identity::normalize_tags(&body.tags) {
+        Ok(v) => v,
+        Err(msg) => return (StatusCode::BAD_REQUEST, msg).into_response(),
+    };
+    let max_uses = match body.max_uses {
+        None => Some(1),
+        Some(None) => None,
+        Some(Some(n)) => Some(n.max(1)),
+    };
+    // Clamped in i64 first (an arbitrarily large JSON number must not
+    // overflow before it's brought into range), then narrowed to i32 for
+    // Postgres's `make_interval(hours => ...)`, whose parameter is `int4`.
+    let expires_in_hours: Option<i32> = match body.expires_in_hours {
+        None => Some(24),
+        Some(None) => None,
+        Some(Some(n)) => Some(n.clamp(1, 8760) as i32),
+    };
+
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to begin enrollment token mint transaction");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let (row, raw) = match repo::mint_enrollment_token(
+        &mut *tx,
+        &name,
+        display_name.as_deref(),
+        &tags,
+        max_uses,
+        expires_in_hours,
+        identity.actor_str(),
+    )
+    .await
+    {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to mint enrollment token");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    if let Err(err) = repo::audit_with_detail(
+        &mut *tx,
+        repo::Actor::User(&identity),
+        "enroll_token.create",
+        None,
+        "ok",
+        // `id`, not just `name`: `enrollment_tokens.name` has no unique
+        // constraint, so under duplicate labels the name alone can't say
+        // which token this audit row is about.
+        serde_json::json!({ "name": name, "id": row.id }),
+    )
+    .await
+    {
+        tracing::error!(error = %err, "failed to audit enroll_token.create; rolling back the mint");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(err) = tx.commit().await {
+        tracing::error!(error = %err, "failed to commit enrollment token mint");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    let mut dto = TokenDto::from(row);
+    dto.token = Some(raw);
+    (StatusCode::CREATED, Json(dto)).into_response()
+}
+
+/// `DELETE /api/enrollment-tokens/{id}` -- revoke a join token. 404 when
+/// `id` doesn't match any token; the only way to learn that before the
+/// UPDATE runs is to fetch the name up front, which conveniently is also
+/// what the audit detail needs (brief's "fetch the name before revoking").
+/// Same share-one-transaction, fail-closed convention as `mint_token` /
+/// `patch_machine`.
+async fn revoke_token(
+    State(state): State<AppState>,
+    crate::auth::AuthUser(identity): crate::auth::AuthUser,
+    Path(id): Path<Uuid>,
+) -> Response {
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to begin enrollment token revoke transaction");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let name = match repo::enrollment_token_name(&mut *tx, id).await {
+        Ok(Some(n)) => n,
+        Ok(None) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to look up enrollment token before revoke");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    match repo::revoke_enrollment_token(&mut *tx, id).await {
+        Ok(true) => {}
+        // Only reachable via a race with a concurrent delete of the same row
+        // between the lookup above and this UPDATE -- the name lookup already
+        // confirmed existence, but nothing holds a lock across the gap.
+        Ok(false) => return StatusCode::NOT_FOUND.into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to revoke enrollment token");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    if let Err(err) = repo::audit_with_detail(
+        &mut *tx,
+        repo::Actor::User(&identity),
+        "enroll_token.revoke",
+        None,
+        "ok",
+        // Same reasoning as `mint_token`'s audit detail: `name` alone can't
+        // disambiguate duplicate labels, so carry the id too.
+        serde_json::json!({ "name": name, "id": id }),
+    )
+    .await
+    {
+        tracing::error!(error = %err, "failed to audit enroll_token.revoke; rolling back the revoke");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(err) = tx.commit().await {
+        tracing::error!(error = %err, "failed to commit enrollment token revoke");
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    StatusCode::NO_CONTENT.into_response()
+}
+
+/// The CA certificate for the enroll page's download button. Behind auth like
+/// the rest of `/api` (the cert is not secret, but nothing here is served
+/// unauthenticated). 503 when the CA hasn't been initialized yet.
+async fn ca_pem(State(state): State<AppState>) -> Response {
+    match sqlx::query_scalar!("SELECT cert_pem FROM ca_material WHERE id = 1")
+        .fetch_optional(&state.pool)
+        .await
+    {
+        Ok(Some(pem)) => ([(header::CONTENT_TYPE, "text/plain")], pem).into_response(),
+        Ok(None) => StatusCode::SERVICE_UNAVAILABLE.into_response(),
+        Err(err) => {
+            tracing::error!(error = %err, "failed to load CA cert");
+            StatusCode::INTERNAL_SERVER_ERROR.into_response()
+        }
     }
 }
 
@@ -1130,6 +1538,16 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["hostname"], "a-online-host");
         assert_eq!(rows[0]["status"], "online");
+        // `contains_key` first: indexing a Value returns Null for an ABSENT
+        // key too, so the `assert_eq!` alone would keep passing if the field
+        // were dropped from FleetRow entirely.
+        let row_obj = rows[0].as_object().unwrap();
+        assert!(
+            row_obj.contains_key("display_name"),
+            "display_name must be in the fleet payload"
+        );
+        assert_eq!(row_obj["display_name"], serde_json::Value::Null);
+        assert!(row_obj.contains_key("capabilities"));
         assert_eq!(rows[1]["hostname"], "z-offline-host");
         assert_eq!(rows[1]["status"], "offline");
 
@@ -1350,6 +1768,231 @@ mod tests {
         )
         .await?;
         Ok(format!("{}={}", argus_common::SESSION_COOKIE, token))
+    }
+
+    /// Drives an authenticated JSON request straight through the router --
+    /// method, uri, the session cookie, and a serialized JSON body -- for the
+    /// handlers that take a body (`PATCH /api/machines/{id}` and
+    /// `POST /api/enrollment-tokens`). Mirrors the file's existing
+    /// `Request::builder()...oneshot()` style used throughout this module,
+    /// just consolidated so body-carrying tests don't repeat the same five
+    /// lines per call.
+    async fn request_json(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        cookie: &str,
+        body: serde_json::Value,
+    ) -> axum::http::Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("cookie", cookie)
+                    .header("content-type", "application/json")
+                    .body(Body::from(serde_json::to_vec(&body).unwrap()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Drives an authenticated, bodyless request straight through the router
+    /// -- the `GET`/`DELETE` counterpart to `request_json` above, for the
+    /// enrollment-token endpoints' list/revoke tests.
+    async fn request(
+        app: &Router,
+        method: &str,
+        uri: &str,
+        cookie: &str,
+    ) -> axum::http::Response<Body> {
+        app.clone()
+            .oneshot(
+                Request::builder()
+                    .method(method)
+                    .uri(uri)
+                    .header("cookie", cookie)
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap()
+    }
+
+    /// Parses a response body as JSON, consuming the response. Pairs with
+    /// `request`/`request_json` so token tests can go straight from response
+    /// to `serde_json::Value` without repeating the `to_bytes` dance.
+    async fn body_json<T: serde::de::DeserializeOwned>(
+        res: axum::http::Response<Body>,
+    ) -> anyhow::Result<T> {
+        let body = to_bytes(res.into_body(), usize::MAX).await?;
+        Ok(serde_json::from_slice(&body)?)
+    }
+
+    #[sqlx::test]
+    async fn token_mint_defaults_and_raw_once(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool.clone()));
+        let res = request_json(
+            &app,
+            "POST",
+            "/api/enrollment-tokens",
+            &cookie,
+            serde_json::json!({ "name": "pve1-media", "tags": ["media"] }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body: serde_json::Value = body_json(res).await?;
+        let raw = body["token"].as_str().unwrap();
+        assert_eq!(raw.len(), 32);
+        assert_eq!(body["max_uses"], 1);
+        // Not just non-null: pinned to ~now+24h so a default regression to,
+        // say, +1h fails here instead of only in the wild.
+        let expires_at_str = body["expires_at"].as_str().expect("expires_at string");
+        let expires_at = OffsetDateTime::parse(
+            expires_at_str,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("expires_at must be RFC3339");
+        let now = OffsetDateTime::now_utc();
+        assert!(
+            expires_at > now + time::Duration::hours(23)
+                && expires_at < now + time::Duration::hours(25),
+            "expected expires_at ~24h from now, got {expires_at} (now = {now})"
+        );
+
+        // The raw token is NOT in the list payload -- only in the mint response.
+        let list = request(&app, "GET", "/api/enrollment-tokens", &cookie).await;
+        let rows: serde_json::Value = body_json(list).await?;
+        assert!(rows[0].get("token").is_none());
+        assert!(rows[0].get("token_hash").is_none());
+
+        // The minted token actually works against the consume path.
+        let check = repo::consume_enrollment_token(&pool, raw).await?;
+        assert!(matches!(check, repo::TokenCheck::Valid { .. }));
+        // ...and, being single-use, only once.
+        let again = repo::consume_enrollment_token(&pool, raw).await?;
+        assert!(matches!(again, repo::TokenCheck::Invalid));
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn token_revoke_and_audit_rows(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool.clone()));
+        let res = request_json(
+            &app,
+            "POST",
+            "/api/enrollment-tokens",
+            &cookie,
+            serde_json::json!({ "name": "t", "max_uses": null }),
+        )
+        .await;
+        let body: serde_json::Value = body_json(res).await?;
+        assert!(body["max_uses"].is_null()); // explicit null = unlimited
+        let id = body["id"].as_str().unwrap().to_string();
+        let raw = body["token"].as_str().unwrap().to_string();
+
+        let del = request(
+            &app,
+            "DELETE",
+            &format!("/api/enrollment-tokens/{id}"),
+            &cookie,
+        )
+        .await;
+        assert_eq!(del.status(), StatusCode::NO_CONTENT);
+        // Revoked -> the consume path refuses it.
+        let check = repo::consume_enrollment_token(&pool, &raw).await?;
+        assert!(matches!(check, repo::TokenCheck::Invalid));
+
+        // This test mints exactly one token (one `enroll_token.create`) and
+        // revokes it (one `enroll_token.revoke`) -- recounted from what this
+        // test actually did, not copied from the plan.
+        let n: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "n!" FROM audit_log
+               WHERE action IN ('enroll_token.create', 'enroll_token.revoke')"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(n, 2);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn token_revoke_unknown_id_is_404(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool));
+        let res = request(
+            &app,
+            "DELETE",
+            &format!("/api/enrollment-tokens/{}", Uuid::new_v4()),
+            &cookie,
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn token_mint_rejects_empty_name_and_clamps_bounds(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool));
+
+        // Whitespace-only name normalizes to empty and is rejected.
+        let res = request_json(
+            &app,
+            "POST",
+            "/api/enrollment-tokens",
+            &cookie,
+            serde_json::json!({ "name": "   " }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+
+        // max_uses below 1 clamps up to 1; expires_in_hours above the cap
+        // clamps down to 8760 (1 year), rather than being rejected.
+        let res = request_json(
+            &app,
+            "POST",
+            "/api/enrollment-tokens",
+            &cookie,
+            serde_json::json!({ "name": "clamp-test", "max_uses": 0, "expires_in_hours": 999_999 }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let body: serde_json::Value = body_json(res).await?;
+        assert_eq!(body["max_uses"], 1);
+        Ok(())
+    }
+
+    /// The dev DB fact this whole slice leans on: `make_interval` propagates
+    /// a NULL `hours` argument straight through to a NULL result, which is
+    /// what lets `mint_enrollment_token` store "never expires" by simply
+    /// passing `None` into `make_interval(hours => $6)` with no `CASE`.
+    /// Verified directly against the container this crate's tests run
+    /// against (`docker exec argus-pg psql ...`), and pinned here so a
+    /// future Postgres version that changed this behavior would fail loudly
+    /// in CI instead of silently expiring "unlimited" tokens.
+    #[sqlx::test]
+    async fn make_interval_of_null_hours_is_null(pool: PgPool) -> anyhow::Result<()> {
+        let expires_at: Option<OffsetDateTime> = sqlx::query_scalar!(
+            r#"SELECT now() + make_interval(hours => $1) as "expires_at""#,
+            None::<i32>,
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert!(expires_at.is_none());
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn ca_pem_503_when_ca_not_initialized(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool));
+        let res = request(&app, "GET", "/api/ca.pem", &cookie).await;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+        Ok(())
     }
 
     #[sqlx::test]
@@ -2607,7 +3250,12 @@ mod tests {
             assert_eq!(res.status(), StatusCode::OK, "{path} must stay public");
         }
 
-        for path in ["/api/fleet", "/api/me"] {
+        for path in [
+            "/api/fleet",
+            "/api/me",
+            "/api/enrollment-tokens",
+            "/api/ca.pem",
+        ] {
             let res = app
                 .clone()
                 .oneshot(Request::builder().uri(path).body(Body::empty())?)
@@ -3094,6 +3742,215 @@ mod tests {
                 .fetch_one(&pool)
                 .await?;
         assert_eq!(audited.result.as_deref(), Some("ok"));
+
+        Ok(())
+    }
+
+    /// Three PATCH calls, each mutating exactly one thing, each producing its
+    /// own `machine.update` audit row: tags-only leaves `display_name`
+    /// untouched; setting `display_name` then clearing it with an explicit
+    /// `null` proves the double-`Option` distinguishes "absent" from "clear".
+    #[sqlx::test]
+    async fn patch_machine_partial_update_and_audit(pool: PgPool) -> anyhow::Result<()> {
+        // Seed a machine directly (raw SQL precondition, per the standing lesson).
+        let id: Uuid = sqlx::query_scalar!(
+            r#"INSERT INTO machines (machine_id, hostname, tags) VALUES ('m-1', 'host-1', '{old}')
+               RETURNING id"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool.clone()));
+
+        // tags only: display_name must be untouched (null), old tags replaced.
+        let res = request_json(
+            &app,
+            "PATCH",
+            &format!("/api/machines/{id}"),
+            &cookie,
+            serde_json::json!({ "tags": [" Infra ", "media", "infra"] }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let row = sqlx::query!("SELECT display_name, tags FROM machines WHERE id = $1", id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(row.display_name, None);
+        assert_eq!(row.tags, vec!["infra", "media"]);
+
+        // display_name set, then cleared with null.
+        request_json(
+            &app,
+            "PATCH",
+            &format!("/api/machines/{id}"),
+            &cookie,
+            serde_json::json!({ "display_name": "Media box" }),
+        )
+        .await;
+        request_json(
+            &app,
+            "PATCH",
+            &format!("/api/machines/{id}"),
+            &cookie,
+            serde_json::json!({ "display_name": null }),
+        )
+        .await;
+        let dn = sqlx::query_scalar!("SELECT display_name FROM machines WHERE id = $1", id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(dn, None);
+
+        // Audit rows written, naming the changed fields: one per PATCH call
+        // above (tags, then display_name, then display_name again to clear
+        // it) -- three calls, three mutations, three rows.
+        let audits = sqlx::query!(
+            r#"SELECT detail FROM audit_log WHERE action = 'machine.update' ORDER BY ts"#
+        )
+        .fetch_all(&pool)
+        .await?;
+        assert_eq!(audits.len(), 3);
+        assert_eq!(audits[0].detail["fields"][0], "tags");
+        Ok(())
+    }
+
+    /// Every rejection class (bad tag, over-length display name, empty body)
+    /// returns 400 and writes nothing -- neither to `machines` nor
+    /// `audit_log`. An unknown machine id is a well-formed request that
+    /// simply doesn't match anything, so it 404s instead of 400 and likewise
+    /// audits nothing.
+    #[sqlx::test]
+    async fn patch_machine_rejects_bad_input(pool: PgPool) -> anyhow::Result<()> {
+        let id: Uuid = sqlx::query_scalar!(
+            r#"INSERT INTO machines (machine_id, hostname) VALUES ('m-2', 'host-2') RETURNING id"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool.clone()));
+
+        for bad in [
+            serde_json::json!({ "tags": ["has space"] }),
+            serde_json::json!({ "display_name": "x".repeat(65) }),
+            serde_json::json!({}),
+        ] {
+            let res =
+                request_json(&app, "PATCH", &format!("/api/machines/{id}"), &cookie, bad).await;
+            assert_eq!(res.status(), StatusCode::BAD_REQUEST);
+        }
+        // None of the three 400s above mutated anything, so no audit row.
+        let n: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "n!" FROM audit_log WHERE action = 'machine.update'"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(n, 0);
+        // Unknown machine: 404, and still no audit row.
+        let res = request_json(
+            &app,
+            "PATCH",
+            &format!("/api/machines/{}", Uuid::new_v4()),
+            &cookie,
+            serde_json::json!({ "tags": [] }),
+        )
+        .await;
+        assert_eq!(res.status(), StatusCode::NOT_FOUND);
+        let n: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "n!" FROM audit_log WHERE action = 'machine.update'"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(n, 0);
+        Ok(())
+    }
+
+    /// Fail-closed proof for the transactional fix (review round 1): forces
+    /// the `machine.update` audit write to fail while the machine row it
+    /// would attach to genuinely exists, then asserts the mutation did not
+    /// survive that failure.
+    ///
+    /// This can't reuse `verb_fails_closed_when_the_dispatched_audit_write_fails`'s
+    /// FK-violation trick verbatim (a "ghost" `machine_id` with no `machines`
+    /// row, so the audit insert's FK fails): `patch_machine` uses the SAME
+    /// `id` for both the update and the audit row, and reaching the audit
+    /// write at all requires the update to have matched a real row first --
+    /// so by construction that FK can never be what fails here. Instead, a
+    /// `BEFORE INSERT` trigger scoped to this test's own isolated database
+    /// rejects any `audit_log` insert whose `action = 'machine.update'`,
+    /// which fails the write for a reason orthogonal to whether the
+    /// referenced machine exists -- the same *class* of injected DB-level
+    /// failure, adapted to an ordering where the FK approach doesn't apply.
+    #[sqlx::test]
+    async fn patch_machine_rolls_back_the_update_when_the_audit_write_fails(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        sqlx::query!(
+            r#"
+            CREATE FUNCTION test_reject_machine_update_audit() RETURNS trigger AS $$
+            BEGIN
+                RAISE EXCEPTION 'injected failure: machine.update audit blocked for test';
+            END;
+            $$ LANGUAGE plpgsql
+            "#
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query!(
+            r#"
+            CREATE TRIGGER test_reject_machine_update_audit
+                BEFORE INSERT ON audit_log
+                FOR EACH ROW
+                WHEN (NEW.action = 'machine.update')
+                EXECUTE FUNCTION test_reject_machine_update_audit()
+            "#
+        )
+        .execute(&pool)
+        .await?;
+
+        let id: Uuid = sqlx::query_scalar!(
+            r#"INSERT INTO machines (machine_id, hostname, tags) VALUES ('m-3', 'host-3', '{orig}')
+               RETURNING id"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool.clone()));
+
+        let res = request_json(
+            &app,
+            "PATCH",
+            &format!("/api/machines/{id}"),
+            &cookie,
+            serde_json::json!({ "display_name": "should not stick", "tags": ["new"] }),
+        )
+        .await;
+        assert_eq!(
+            res.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a failed audit write must fail closed"
+        );
+
+        let row = sqlx::query!("SELECT display_name, tags FROM machines WHERE id = $1", id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            row.display_name, None,
+            "the update must have rolled back with the failed audit write"
+        );
+        assert_eq!(
+            row.tags,
+            vec!["orig"],
+            "the update must have rolled back with the failed audit write"
+        );
+
+        let n: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "n!" FROM audit_log WHERE action = 'machine.update'"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            n, 0,
+            "the rejected audit insert must not have landed either"
+        );
 
         Ok(())
     }

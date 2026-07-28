@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE machines SET\n            display_name = coalesce($2, display_name),\n            tags         = CASE WHEN cardinality($3::text[]) > 0 THEN $3 ELSE tags END,\n            updated_at   = now()\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "9b739c299b09c58ee990b59f63198357abd128e6f5bb3fbd8a68021a9c877863"
+}
