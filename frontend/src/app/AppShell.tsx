@@ -74,7 +74,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
         </Alert>
       )}
       <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} />
-      <FleetSidebar onAccountError={setAccountError} onOpenPalette={() => setPaletteOpen(true)} />
+      <FleetSidebar onAccountError={setAccountError} />
       {/* min-w-0 + overflow-x-hidden are load-bearing for wide content (the
           units table runs ~130 rows with 90-char unit names): SidebarInset is a
           flex child, and a flex item defaults to `min-width: auto`, so without
@@ -82,7 +82,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           document grows wider than the viewport, and the PAGE takes the
           horizontal scroll instead of the table's own scroll container. */}
       <SidebarInset className="min-w-0 overflow-x-hidden">
-        <TopBar />
+        <TopBar onOpenPalette={() => setPaletteOpen(true)} />
         <div className="mx-auto w-full min-w-0 max-w-6xl p-4">{children}</div>
       </SidebarInset>
     </SidebarProvider>
@@ -95,7 +95,7 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
  * fully off-canvas when closed — a control inside it would be unreachable. One
  * button in a fixed place beats two that appear conditionally.
  */
-function TopBar() {
+function TopBar({ onOpenPalette }: { onOpenPalette: () => void }) {
   const { data: rows } = useFleet();
   const summary =
     rows === undefined
@@ -110,33 +110,37 @@ function TopBar() {
           {summary}
         </span>
       )}
+      {/* Search + theme controls live in the header (user decision — moved
+          out of the sidebar footer, which is a sheet on mobile and a ~3rem
+          rail when collapsed: the header is the one place these are always
+          one tap away). `ml-auto` on the summary keeps the whole cluster
+          right-aligned; when the fleet query hasn't resolved the controls
+          take the `ml-auto` themselves via `last:*`-free simple ordering. */}
+      <div className={summary === null ? "ml-auto flex items-center gap-2" : "flex items-center gap-2"}>
+        <CommandPaletteTrigger onOpen={onOpenPalette} />
+        <ThemeToggle showLabel={false} />
+      </div>
     </header>
   );
 }
 
 /**
- * The Ctrl/Cmd+K trigger, first control in the footer above the account
- * controls. Matches `ThemeToggle`'s own rail/full split: an icon-only
- * `size-8` square in the rail, icon + label + shortcut hint at full width —
- * there's no room for the label or the `Kbd` hint at rail width either.
+ * The Ctrl/Cmd+K trigger, in the top bar. Compact: icon plus the shortcut
+ * hint; the hint disappears below `md` where there's no hardware keyboard
+ * to honor it anyway.
  */
-function CommandPaletteTrigger({ rail, onOpen }: { rail: boolean; onOpen: () => void }) {
+function CommandPaletteTrigger({ onOpen }: { onOpen: () => void }) {
   return (
     <Button
       variant="outline"
       size="sm"
       aria-label="Search"
       title="Search"
-      className={rail ? "size-8 justify-center p-0" : "w-full justify-start gap-2"}
+      className="gap-2"
       onClick={onOpen}
     >
       <Search className="size-4 shrink-0" />
-      {!rail && (
-        <>
-          <span className="flex-1 text-left">Search</span>
-          <Kbd>{isMacPlatform() ? "⌘K" : "Ctrl K"}</Kbd>
-        </>
-      )}
+      <Kbd className="hidden md:inline-flex">{isMacPlatform() ? "⌘K" : "Ctrl K"}</Kbd>
     </Button>
   );
 }
@@ -210,12 +214,10 @@ function AccountFooter({
           {identity}
         </div>
       )}
-      <div className={rail ? "flex flex-col items-center gap-1" : "flex w-full items-center justify-between gap-2"}>
-        <ThemeToggle showLabel={!rail} />
-        {/* The two icon-only account actions grouped together so
-            `justify-between` above still reads as "toggle on the left,
-            actions on the right" with a third control added; in the rail
-            this nested flex just continues the same vertical stack. */}
+      {/* ThemeToggle moved to the TopBar (user decision) — the footer now
+          holds only the account actions, right-aligned where the toggle
+          used to balance them. */}
+      <div className={rail ? "flex flex-col items-center gap-1" : "flex w-full items-center justify-end gap-2"}>
         <div className={rail ? "flex flex-col items-center gap-1" : "flex items-center gap-1"}>
           <RotateLocalAdmin
             onError={(message) =>
@@ -249,10 +251,8 @@ function AccountFooter({
  */
 function FleetSidebar({
   onAccountError,
-  onOpenPalette,
 }: {
   onAccountError: (error: AccountError | null) => void;
-  onOpenPalette: () => void;
 }) {
   const location = useLocation();
   const { state, isMobile } = useSidebar();
@@ -339,7 +339,6 @@ function FleetSidebar({
             : "gap-1 border-t border-border px-3 py-2"
         }
       >
-        <CommandPaletteTrigger rail={rail} onOpen={onOpenPalette} />
         <AccountFooter rail={rail} onAccountError={onAccountError} />
       </SidebarFooter>
 
