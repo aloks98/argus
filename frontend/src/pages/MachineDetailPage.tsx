@@ -43,6 +43,7 @@ import MachineIdentity from "../components/MachineIdentity";
 import SpecStrip from "../components/SpecStrip";
 import type { SpecItem } from "../components/SpecStrip";
 import StatusBadge from "../components/StatusBadge";
+import SystemCard from "../components/SystemCard";
 import TerminalView from "../components/TerminalView";
 import TimeSeriesChart from "../components/TimeSeriesChart";
 import type { ChartSeries } from "../components/TimeSeriesChart";
@@ -161,6 +162,10 @@ export default function MachineDetailPage() {
   const lacks = (cap: string) => caps !== null && !caps.includes(cap);
   const TABS: { key: string; label: string; disabled?: boolean; reason?: string }[] = [
     { key: "overview", label: "Overview" },
+    // Not capability-gated: every machine has system facts (or the omission
+    // rule renders an empty-ish card), unlike Containers/Units/Logs which
+    // depend on the agent's reported capabilities.
+    { key: "system", label: "System" },
     {
       key: "containers",
       label: "Containers",
@@ -256,6 +261,17 @@ export default function MachineDetailPage() {
   const latestNet =
     netPoints.length > 0 ? netPoints[netPoints.length - 1] : null;
 
+  // `!= null` (not `!==`): boot_time is an additive proto column, so a
+  // frontend newer than the server it's talking to sees `undefined` here,
+  // not `null` — strict equality would let that slip through to
+  // formatUptime and render "up NaNm". Same reasoning applies wherever this
+  // page and SystemCard read the inventory/resource fields added this slice.
+  const uptime = machine.boot_time != null ? formatUptime(machine.boot_time) : "";
+
+  // Slimmed to five items (live review: the nine-item version was too
+  // crowded) — Kernel/Arch/Agent/Processor/Virtualization/Disk/Memory/Swap
+  // moved to the System tab (SystemCard). Uptime stays: tiny and ops-useful
+  // at a glance.
   const specItems: SpecItem[] = [
     {
       label: "Status",
@@ -263,38 +279,7 @@ export default function MachineDetailPage() {
     },
     ...(machine.os !== null ? [{ label: "OS", value: machine.os }] : []),
     ...(machine.primary_ip !== null ? [{ label: "Address", value: machine.primary_ip }] : []),
-    ...(machine.kernel !== null ? [{ label: "Kernel", value: machine.kernel }] : []),
-    ...(machine.arch !== null ? [{ label: "Arch", value: machine.arch }] : []),
-    ...(machine.agent_version !== null ? [{ label: "Agent", value: machine.agent_version }] : []),
-    ...(machine.cpu_model !== null
-      ? [{
-          label: "Processor",
-          value: machine.cpu_cores !== null
-            ? `${machine.cpu_model} · ${machine.cpu_cores} cores`
-            : machine.cpu_model,
-        }]
-      : []),
-    ...(machine.boot_time !== null
-      ? [{ label: "Uptime", value: formatUptime(machine.boot_time) }]
-      : []),
-    ...(machine.virt !== null
-      ? [{ label: "Virtualization", value: machine.virt === "none" ? "bare metal" : machine.virt }]
-      : []),
-    ...(resources.disk !== null
-      ? [{
-          label: "Disk",
-          value: `${formatBytes(resources.disk.used)} / ${formatBytes(resources.disk.total)} (${((100 * resources.disk.used) / resources.disk.total).toFixed(0)}%)`,
-        }]
-      : []),
-    ...(memNow !== null
-      ? [{ label: "Memory", value: formatBytes(memNow.total) }]
-      : []),
-    ...(resources.swap !== null && resources.swap.total > 0
-      ? [{
-          label: "Swap",
-          value: `${formatBytes(resources.swap.used)} / ${formatBytes(resources.swap.total)}`,
-        }]
-      : []),
+    ...(uptime !== "" ? [{ label: "Uptime", value: uptime }] : []),
     { label: "Last seen", value: formatRelative(machine.last_seen_at) },
   ];
 
@@ -536,6 +521,10 @@ export default function MachineDetailPage() {
               format={formatBytesPerSec}
             />
           </div>
+        </TabsContent>
+
+        <TabsContent value="system" className="mt-4">
+          <SystemCard machine={machine} resources={resources} memNow={memNow} />
         </TabsContent>
 
         <TabsContent value="containers" className="mt-4">

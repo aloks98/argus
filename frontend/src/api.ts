@@ -104,6 +104,8 @@ export async function getFleet(): Promise<FleetRow[]> {
 
 export type MachineDetail = {
   id: string;
+  /** `/etc/machine-id` — distinct from `id` (the control plane's own row id). */
+  machine_id: string;
   hostname: string;
   display_name: string | null;
   os: string | null;

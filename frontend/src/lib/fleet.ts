@@ -77,6 +77,7 @@ export function paletteEntries(rows: FleetRow[]): PaletteEntry[] {
     const caps = r.capabilities;
     const has = (c: string) => caps === null || caps.includes(c);
     const tabs: [string, string, boolean][] = [
+      ["System", "system", true],
       ["Containers", "containers", has(CAP_DOCKER)],
       ["Units", "units", has(CAP_SYSTEMD)],
       ["Logs", "logs", has(CAP_JOURNAL)],
