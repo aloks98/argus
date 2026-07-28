@@ -174,3 +174,25 @@
   height: 8px;
   margin-right: 5px;
 }
+
+/* shiki dual-theme activation. rnui's CodeBlock renders with
+   `defaultColor: false`, so every token carries ONLY `--shiki-light` /
+   `--shiki-dark` custom properties and no inline color — without these
+   rules the block renders in the inherited foreground (i.e. no
+   highlighting at all). Neither rnui-react nor rnui-themes ships this
+   mapping; it is the consumer's job (shiki docs, "dual themes").
+   Dark mode is `.dark` on <html> (next-themes), same as everywhere else. */
+.shiki,
+.shiki span {
+  color: var(--shiki-light);
+  background-color: var(--shiki-light-bg);
+  font-style: var(--shiki-light-font-style);
+  font-weight: var(--shiki-light-font-weight);
+}
+.dark .shiki,
+.dark .shiki span {
+  color: var(--shiki-dark);
+  background-color: var(--shiki-dark-bg);
+  font-style: var(--shiki-dark-font-style);
+  font-weight: var(--shiki-dark-font-weight);
+}
