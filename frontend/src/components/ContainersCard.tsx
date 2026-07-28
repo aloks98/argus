@@ -121,7 +121,7 @@ export default function ContainersCard({
                   action.isPending && action.variables?.container === c.id;
                 return (
                   <TableRow key={c.id}>
-                    <TableCell className="font-medium">
+                    <TableCell className="font-medium" title={c.name}>
                       <AssetTag tone={containerTone(c.state)} className="max-w-[16ch] md:max-w-[30ch]">
                         <span className="min-w-0 truncate">{c.name}</span>
                       </AssetTag>
