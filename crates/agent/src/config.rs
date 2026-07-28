@@ -34,9 +34,14 @@ impl Config {
     ///
     /// A `--config` path that cannot be read is a hard startup error, not a
     /// silent fallback to bare env vars -- an operator who pointed at a file
-    /// wants that file.
+    /// wants that file. Same for a DANGLING `--config` (the flag present with
+    /// no path after it): an operator who typed `--config` and forgot the
+    /// path believes their file is in use, so this must not quietly resolve
+    /// to env-only either -- unlike `argus`'s `--username` flag (whose
+    /// "absent or dangling" is one case because the caller has a safe
+    /// default either way), `--config` has no such default to fall back to.
     pub fn load(args: &[String]) -> Result<Self> {
-        match config_file_path(args) {
+        match config_file_path(args)? {
             Some(path) => {
                 let contents = std::fs::read_to_string(&path)
                     .with_context(|| format!("failed to read --config file {path}"))?;
@@ -67,15 +72,21 @@ impl Config {
 }
 
 /// Look for `--config <path>` anywhere in the trailing args (mirrors
-/// `argus`'s `--username` flag parsing in `crates/server/src/main.rs`).
-fn config_file_path(args: &[String]) -> Option<String> {
+/// `argus`'s `--username` flag parsing in `crates/server/src/main.rs`, except
+/// a DANGLING `--config` -- present with nothing after it -- is an error
+/// rather than treated the same as the flag being absent; see
+/// [`Config::load`]'s doc comment for why).
+fn config_file_path(args: &[String]) -> Result<Option<String>> {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
         if arg == "--config" {
-            return iter.next().cloned();
+            return match iter.next() {
+                Some(path) => Ok(Some(path.clone())),
+                None => anyhow::bail!("--config requires a path argument"),
+            };
         }
     }
-    None
+    Ok(None)
 }
 
 /// Keys `--config` recognizes. Anything else in the file is ignored (with a
@@ -282,7 +293,7 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(
-            config_file_path(&args),
+            config_file_path(&args).expect("path is present"),
             Some("/tmp/argus-agent.env".to_string())
         );
     }
@@ -290,7 +301,29 @@ mod tests {
     #[test]
     fn config_file_path_is_none_when_the_flag_is_absent() {
         let args: Vec<String> = ["argus-agent"].iter().map(|s| s.to_string()).collect();
-        assert_eq!(config_file_path(&args), None);
+        assert_eq!(
+            config_file_path(&args).expect("flag is absent, not an error"),
+            None
+        );
+    }
+
+    /// The fix this test guards: `--config` with nothing after it must be a
+    /// hard error, not silently treated the same as the flag being absent --
+    /// see [`Config::load`]'s doc comment for why that distinction matters
+    /// (an operator who typed `--config` and forgot the path believes their
+    /// file is in use).
+    #[test]
+    fn config_file_path_errors_when_the_flag_is_dangling() {
+        let args: Vec<String> = ["argus-agent", "--config"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let err = config_file_path(&args).expect_err("dangling --config must be an error");
+        assert!(
+            err.to_string()
+                .contains("--config requires a path argument"),
+            "error must name the problem, got: {err}"
+        );
     }
 
     /// The precedence rule this module exists to guarantee: a real
