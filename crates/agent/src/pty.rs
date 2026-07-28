@@ -6,15 +6,15 @@
 //! `read()` (a shared condvar), so the kernel PTY buffer fills and the writing
 //! process blocks — real backpressure to the true source.
 //!
-//! Writes are the mirror-image problem (review finding 3): the master's
-//! writer is ALSO blocking (portable-pty 0.9 never sets `O_NONBLOCK`), and
-//! the tty's canonical input queue is only ~4 KB. A paste larger than that
-//! into a program not reading stdin (`sleep 300`, a hung editor) makes
-//! `write_all` block for as long as the program doesn't read. Calling that
-//! inline on the agent's async gRPC inbound-dispatch loop -- as this used to
-//! -- stalls processing of every OTHER frame for the machine, `PtyClose`
-//! included, while holding the `inbound_ptys` registry mutex the whole time.
-//! So writes get their own dedicated OS thread too (`open`, below), fed by an
+//! Writes are the mirror-image problem: the master's writer is ALSO blocking
+//! (portable-pty 0.9 never sets `O_NONBLOCK`), and the tty's canonical input
+//! queue is only ~4 KB. A paste larger than that into a program not reading
+//! stdin (`sleep 300`, a hung editor) makes `write_all` block for as long as
+//! the program doesn't read. Calling that inline on the agent's async gRPC
+//! inbound-dispatch loop would stall processing of every OTHER frame for the
+//! machine, `PtyClose` included, while holding the `inbound_ptys` registry
+//! mutex the whole time. So writes get their own dedicated OS thread too
+//! (`open`, below), fed by an
 //! unbounded, in-order `std::sync::mpsc` channel: `write_input` (called
 //! inline from the async dispatch loop) only ever pushes onto that channel,
 //! which is O(1) and never blocks, and returns immediately. The blocking
@@ -95,9 +95,9 @@ impl PtyHandle {
     /// Park or wake the reader thread (server flow control).
     ///
     /// A poisoned pause mutex must never strand a session without its
-    /// closing EOF: recover the guard rather than silently no-op'ing (as this
-    /// used to) or panicking (as the reader thread's own lock/wait used to) --
-    /// both would leave the reader either stuck or dead without cleanup.
+    /// closing EOF: recover the guard rather than silently no-op'ing or
+    /// panicking -- both would leave the reader either stuck or dead
+    /// without cleanup.
     pub fn set_paused(&self, paused: bool) {
         let (lock, cvar) = &*self.pause;
         {
@@ -117,12 +117,11 @@ impl PtyHandle {
             return; // already torn down (explicit close(), then Drop)
         }
 
-        // Recover a poisoned lock rather than skipping the kill (as a bare
-        // `if let Ok(..)` used to): `set_paused` and the reader thread's own
-        // lock/wait already recover from poison, so a poisoned `child` lock
-        // must too, or teardown silently skips the kill while still joining
-        // the reader below -- reintroducing the unbounded hang a poisoned
-        // lock is supposed to be recovered FROM.
+        // Recover a poisoned lock rather than skipping the kill: `set_paused`
+        // and the reader thread's own lock/wait already recover from poison,
+        // so a poisoned `child` lock must too, or teardown silently skips
+        // the kill while still joining the reader below -- reintroducing
+        // the unbounded hang poison-recovery is supposed to prevent.
         {
             let mut c = self
                 .child
@@ -134,10 +133,10 @@ impl PtyHandle {
         // Drop the writer's channel sender so its `recv()` returns `Err`
         // once any already-queued input drains, and join it. This happens
         // AFTER the kill above on purpose: a writer thread parked inside a
-        // blocking `write_all` (the paste-into-a-wedged-program case this
-        // fix exists for) only unblocks once the child is dead and the pty
-        // slave has no more readers (the write then fails with EIO), so
-        // killing first is what bounds this join.
+        // blocking `write_all` (e.g. a paste into a wedged program) only
+        // unblocks once the child is dead and the pty slave has no more
+        // readers (the write then fails with EIO), so killing first is what
+        // bounds this join.
         self.input_tx = None;
         if let Some(h) = self.writer_thread.take() {
             let _ = h.join();
@@ -385,8 +384,8 @@ mod tests {
              (still present in /proc -- zombie or otherwise not cleaned up)"
         );
 
-        // Independent corroboration via `ps`, matching the exact check the
-        // review asked for: no process at this pid at all (not even a `Z`).
+        // Independent corroboration via `ps`: no process at this pid at all
+        // (not even a `Z`).
         let ps = std::process::Command::new("ps")
             .args(["-o", "stat=", "-p", &pid.to_string()])
             .output()
@@ -409,7 +408,7 @@ mod tests {
     /// child (e.g. a backgrounded `sleep`) would keep its own copy of the pty
     /// slave open regardless of what happens to the shell, which would be
     /// testing process-tree fd inheritance rather than the signal escalation
-    /// this fix is actually responsible for.
+    /// this test verifies.
     #[tokio::test]
     #[ignore = "spawns a real shell; run on a host with /bin/sh"]
     async fn live_close_returns_promptly_when_the_shell_ignores_sighup() {
@@ -430,15 +429,13 @@ mod tests {
         );
     }
 
-    /// Review finding 3: `write_input` must return immediately even when the
-    /// PTY's own write would block -- e.g. a paste larger than the ~4 KB
-    /// canonical tty input queue into a program that never reads stdin.
-    /// `exec sleep 300` replaces the shell with a real child that never
-    /// reads its controlling tty, reproducing the exact "hung program"
-    /// scenario the finding describes. Before the fix this would call
-    /// `write_all` inline and block for as long as the program doesn't
-    /// read -- here, on the agent's async gRPC inbound loop, that would have
-    /// stalled every other frame for the machine.
+    /// `write_input` must return immediately even when the PTY's own write
+    /// would block -- e.g. a paste larger than the ~4 KB canonical tty input
+    /// queue into a program that never reads stdin. `exec sleep 300`
+    /// replaces the shell with a real child that never reads its
+    /// controlling tty, reproducing that "hung program" scenario: called
+    /// inline on the agent's async gRPC inbound loop, a blocking `write_all`
+    /// here would stall every other frame for the machine.
     #[tokio::test]
     #[ignore = "spawns a real shell; run on a host with /bin/sh"]
     async fn live_write_input_does_not_block_the_caller_against_a_wedged_program() {

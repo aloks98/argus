@@ -1,5 +1,5 @@
-//! Docker collection + verb execution (Docker slice). Talks ONLY to the local
-//! daemon over its unix socket via bollard — never TCP/TLS, so the musl-static
+//! Docker collection + verb execution. Talks ONLY to the local daemon over
+//! its unix socket via bollard — never TCP/TLS, so the musl-static
 //! build stays free of openssl (see Cargo.toml). Mapping is factored into pure
 //! functions so it's unit-testable without a running daemon.
 

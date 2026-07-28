@@ -1,4 +1,4 @@
-//! Enrollment handshake (PRD §5.2). The highest-risk slice -- build first.
+//! Enrollment handshake (PRD §5.2).
 
 use crate::config::Config;
 use crate::identity;

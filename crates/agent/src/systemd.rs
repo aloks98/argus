@@ -1,5 +1,5 @@
-//! Systemd collection + unit verb execution (systemd slice). Talks to the local
-//! D-Bus **system bus** via zbus — no network, no TLS, so the musl-static build
+//! Systemd collection + unit verb execution. Talks to the local D-Bus
+//! **system bus** via zbus — no network, no TLS, so the musl-static build
 //! stays clean. Mapping and policy are factored into pure functions so they are
 //! unit-testable without a running bus (mirrors `docker.rs`).
 //!

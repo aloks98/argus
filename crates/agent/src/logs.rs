@@ -1,6 +1,6 @@
-//! Log tailing (log slice): journal via a `journalctl` subprocess, Docker via
-//! bollard. Parsing, validation and record mapping are pure functions so they
-//! are testable without a subprocess or a daemon — same shape as `docker.rs`
+//! Log tailing: journal via a `journalctl` subprocess, Docker via bollard.
+//! Parsing, validation and record mapping are pure functions so they are
+//! testable without a subprocess or a daemon — same shape as `docker.rs`
 //! and `systemd.rs`.
 
 use argus_proto::v1::{agent_frame, AgentFrame, LogChunk};
@@ -300,10 +300,10 @@ fn try_emit(
 /// journal child is killed on drop because `Command` is configured with
 /// `kill_on_drop`.
 ///
-/// `before_cursor` and `filters` pushed this to 9 params (from 7, same
-/// reasoning as `run_docker` below): splitting into a context struct would
-/// obscure the straight-line handoff to `run_journal`/`run_docker` for no
-/// benefit.
+/// 9 parameters, `#[allow(clippy::too_many_arguments)]`: splitting into a
+/// context struct would obscure the straight-line handoff to
+/// `run_journal`/`run_docker` for no benefit (same reasoning as `run_docker`
+/// below).
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tail(
     source: Source,
@@ -402,14 +402,11 @@ pub async fn run_tail(
 }
 
 /// A missing journalctl (a non-systemd guest, e.g. Alpine) fails at spawn.
-/// Before this marker existed that already propagated as an `Err` out of
-/// `run_journal`/`run_journal_page` into `run_tail`'s error arm, which pushes
-/// its own generic `log tail ended: <error>` line — so the operator was never
-/// looking at a blank view. This marker only improves the DIAGNOSTIC: a
-/// specific "journalctl could not be started" line instead of the generic
-/// wrapper text. Both `run_journal` and `run_journal_page` hit this on
-/// `cmd.spawn()` failure and need the identical marker, so it's built once
-/// here.
+/// This gives that failure a specific "journalctl could not be started" line
+/// instead of falling through to `run_tail`'s generic `log tail ended:
+/// <error>` wrapper text. Both `run_journal` and `run_journal_page` hit this
+/// on `cmd.spawn()` failure and need the identical marker, so it's built
+/// once here.
 fn spawn_failure_marker(e: &std::io::Error) -> LogLine {
     LogLine {
         ts: now_ms(),
@@ -747,19 +744,16 @@ fn floor_to_epoch_second(since_ms: u64) -> i64 {
 /// The `since_ms` cutoff lives here rather than in the argv because journalctl
 /// rejects `--since` alongside `--cursor`.
 ///
-/// It is a `take_while`, not a per-record `filter`: dropped entries must be a
-/// structural SUFFIX of the descending page, because the server's existing
-/// `reached_start = lines.len() < limit` rule assumes exactly that and fires
-/// unchanged, meaning "start of the window". `__REALTIME_TIMESTAMP` is not
-/// guaranteed monotonic within a page (a backward clock step, or reading
-/// across merged journal files spanning a clock adjustment) — a per-record
-/// filter would excise just that one out-of-order entry from the middle of the
-/// page and silently resume past it, shortening the page by exactly one and
-/// permanently latching `reached_start` on the client for a page that never
-/// actually reached the window's edge. `take_while` makes the cut
-/// deterministic: once the descending scan drops below the cutoff, everything
-/// from that point on is dropped too, exactly like genuinely reaching the end
-/// of the window would.
+/// `take_while`, not a per-record `filter`: dropped entries must be a
+/// structural SUFFIX of the descending page, because the server's
+/// `reached_start = lines.len() < limit` rule assumes exactly that.
+/// `__REALTIME_TIMESTAMP` is not guaranteed monotonic within a page (a
+/// backward clock step, or a read spanning merged journal files), so a
+/// per-record `filter` could excise one out-of-order entry and silently
+/// resume past it -- shortening the page and permanently latching
+/// `reached_start` on the client for a page that never actually reached the
+/// window's edge. `take_while` cuts once, at the first crossing, and keeps
+/// everything after it dropped too.
 pub fn finalize_page(records: Vec<LogLine>, before_cursor: &str, since_ms: u64) -> Vec<LogLine> {
     let mut kept: Vec<LogLine> = records
         .into_iter()

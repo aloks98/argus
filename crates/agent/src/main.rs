@@ -3,9 +3,6 @@
 //! Thin, read-mostly. Dials outbound to the control plane and holds one persistent
 //! mTLS `Session` stream over which everything is multiplexed (PRD §2, §4). Built
 //! static against `x86_64-unknown-linux-musl` for release so it runs on Flatcar.
-//!
-//! This is the skeleton: the enrollment handshake (slice #1) and session loop are
-//! stubbed with their intended shape.
 
 mod capabilities;
 mod config;
@@ -40,9 +37,9 @@ async fn main() -> Result<()> {
     let cfg = config::Config::load(&args)?;
     tracing::info!(endpoint = %cfg.endpoint, "argus-agent starting");
 
-    // Build slice #1 (Spine): ensure enrolled (obtain a client cert), then hold a
-    // single persistent mTLS Session, reconnecting with backoff + jitter and
-    // re-sending a Hello snapshot on reconnect (PRD §5).
+    // Ensure enrolled (obtain a client cert), then hold a single persistent
+    // mTLS Session, reconnecting with backoff + jitter and re-sending a Hello
+    // snapshot on reconnect (PRD §5).
     let identity = enroll::ensure_enrolled(&cfg).await?;
     session::run(&cfg, identity).await
 }

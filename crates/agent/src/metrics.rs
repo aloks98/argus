@@ -1,50 +1,23 @@
-//! Host metrics sampler (Metrics slice, task 5): reads CPU/mem/swap/load/disk/
-//! net/uptime via `sysinfo` and fills a proto `MetricsSample`. Sending it over
-//! the Session (multiplexed as an `AgentFrame::metrics` payload) is task 6's
-//! job -- this module only produces the sample.
+//! Host metrics sampler: reads CPU/mem/swap/load/disk/net/uptime via
+//! `sysinfo` and fills a proto `MetricsSample`. Sending it over the Session
+//! (multiplexed as an `AgentFrame::metrics` payload) happens elsewhere --
+//! this module only produces the sample.
 //!
-//! ## Spike: confirmed `sysinfo` 0.39 API
+//! `System::refresh_cpu_usage` reports a *delta* between two calls at least
+//! `MINIMUM_CPU_UPDATE_INTERVAL` (~200ms) apart; the first call after
+//! construction has no prior reading to diff against, hence `Sampler::new`
+//! takes one throwaway reading so the next `sample()` gets a real delta.
+//! `System::load_average()` and `System::uptime()` are **associated
+//! functions** (no `&self`) that read fresh OS state on every call,
+//! independent of any `System` instance's refresh state.
+//! `NetworkData::total_received`/`total_transmitted` are cumulative
+//! counters -- deltas are computed control-plane side, per the proto's
+//! comment on `net_rx_bytes`/`net_tx_bytes`.
 //!
-//! Read from the vendored source (`cargo fetch`'d into
-//! `~/.cargo/registry/src/index.crates.io-*/sysinfo-0.39.5/src/common/{system,disk,network}.rs`)
-//! since the `sysinfo` surface has shifted across versions:
-//!
-//! - `System::new() -> Self` is an instance constructor equivalent to
-//!   `new_with_specifics(RefreshKind::nothing())` -- nothing is populated until
-//!   you refresh. `System::new_all()` refreshes everything up front.
-//! - `System::refresh_cpu_usage(&mut self)` / `refresh_memory(&mut self)` are
-//!   instance methods. CPU usage is a *delta* between two `refresh_cpu_usage`
-//!   calls at least `MINIMUM_CPU_UPDATE_INTERVAL` (~200ms) apart; the very
-//!   first call after construction has no prior reading to diff against and is
-//!   unreliable -- hence `Sampler::new` takes one throwaway reading so the
-//!   *next* `sample()` call gets a real delta.
-//! - `System::global_cpu_usage(&self) -> f32`.
-//! - `System::used_memory` / `total_memory` / `used_swap` /
-//!   `total_swap(&self) -> u64` (bytes).
-//! - `System::load_average() -> LoadAvg` and `System::uptime() -> u64` are
-//!   **associated functions** (no `&self` -- they read fresh OS state, e.g.
-//!   `/proc`, on every call, independent of any `System` instance's refresh
-//!   state). `LoadAvg { one, five, fifteen }`, all `f64`.
-//! - `Networks::new_with_refreshed_list() -> Self`; `Networks::refresh(&mut
-//!   self, remove_not_listed_interfaces: bool)` updates an existing instance in
-//!   place (so we don't re-enumerate interfaces every tick). `Networks` derefs
-//!   to `HashMap<String, NetworkData>`, so `.values()` iterates interfaces.
-//!   `NetworkData::total_received` / `total_transmitted(&self) -> u64` are
-//!   cumulative counters -- deltas are computed control-plane-side per the
-//!   proto's comment on `net_rx_bytes`/`net_tx_bytes`.
-//! - `Disks::new_with_refreshed_list() -> Self`; `Disks::refresh(&mut self,
-//!   remove_not_listed_disks: bool)`; `Disks` derefs to `[Disk]`, so `.iter()`
-//!   walks the list. `Disk::total_space` / `available_space(&self) -> u64`.
-//! - Default features (`system`, `disk`, `network`, `component`, `user`)
-//!   already cover everything above -- no `features = [...]` override needed
-//!   in `Cargo.toml`.
-//!
-//! Note: the proto `MetricsSample` has **no `agent_version` field** -- that
-//! lives on `AgentInfo`, sent once in the `Hello` frame at connect time (see
-//! `info.rs::gather` and `session.rs`). So `sample()` takes no such parameter;
-//! threading one through here would just be dead weight with nowhere to land
-//! in the proto.
-//!
+//! The proto `MetricsSample` has no `agent_version` field -- that lives on
+//! `AgentInfo`, sent once in the `Hello` frame at connect time (see
+//! `info.rs::gather` and `session.rs`); `sample()` takes no such parameter.
+
 use argus_proto::v1::MetricsSample;
 use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, Networks, System};

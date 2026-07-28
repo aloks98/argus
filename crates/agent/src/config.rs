@@ -307,11 +307,10 @@ mod tests {
         );
     }
 
-    /// The fix this test guards: `--config` with nothing after it must be a
-    /// hard error, not silently treated the same as the flag being absent --
-    /// see [`Config::load`]'s doc comment for why that distinction matters
-    /// (an operator who typed `--config` and forgot the path believes their
-    /// file is in use).
+    /// `--config` with nothing after it must be a hard error, not silently
+    /// treated the same as the flag being absent -- see [`Config::load`]'s
+    /// doc comment for why that distinction matters (an operator who typed
+    /// `--config` and forgot the path believes their file is in use).
     #[test]
     fn config_file_path_errors_when_the_flag_is_dangling() {
         let args: Vec<String> = ["argus-agent", "--config"]
