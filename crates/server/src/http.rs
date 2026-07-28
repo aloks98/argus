@@ -629,7 +629,10 @@ async fn mint_token(
         "enroll_token.create",
         None,
         "ok",
-        serde_json::json!({ "name": name }),
+        // `id`, not just `name`: `enrollment_tokens.name` has no unique
+        // constraint, so under duplicate labels the name alone can't say
+        // which token this audit row is about.
+        serde_json::json!({ "name": name, "id": row.id }),
     )
     .await
     {
@@ -693,7 +696,9 @@ async fn revoke_token(
         "enroll_token.revoke",
         None,
         "ok",
-        serde_json::json!({ "name": name }),
+        // Same reasoning as `mint_token`'s audit detail: `name` alone can't
+        // disambiguate duplicate labels, so carry the id too.
+        serde_json::json!({ "name": name, "id": id }),
     )
     .await
     {
@@ -1767,10 +1772,11 @@ mod tests {
 
     /// Drives an authenticated JSON request straight through the router --
     /// method, uri, the session cookie, and a serialized JSON body -- for the
-    /// handlers that take a body (only `PATCH /api/machines/{id}` so far).
-    /// Mirrors the file's existing `Request::builder()...oneshot()` style
-    /// used throughout this module, just consolidated so PATCH tests don't
-    /// repeat the same five lines per call.
+    /// handlers that take a body (`PATCH /api/machines/{id}` and
+    /// `POST /api/enrollment-tokens`). Mirrors the file's existing
+    /// `Request::builder()...oneshot()` style used throughout this module,
+    /// just consolidated so body-carrying tests don't repeat the same five
+    /// lines per call.
     async fn request_json(
         app: &Router,
         method: &str,
@@ -1841,7 +1847,20 @@ mod tests {
         let raw = body["token"].as_str().unwrap();
         assert_eq!(raw.len(), 32);
         assert_eq!(body["max_uses"], 1);
-        assert!(!body["expires_at"].is_null()); // ~now+24h
+        // Not just non-null: pinned to ~now+24h so a default regression to,
+        // say, +1h fails here instead of only in the wild.
+        let expires_at_str = body["expires_at"].as_str().expect("expires_at string");
+        let expires_at = OffsetDateTime::parse(
+            expires_at_str,
+            &time::format_description::well_known::Rfc3339,
+        )
+        .expect("expires_at must be RFC3339");
+        let now = OffsetDateTime::now_utc();
+        assert!(
+            expires_at > now + time::Duration::hours(23)
+                && expires_at < now + time::Duration::hours(25),
+            "expected expires_at ~24h from now, got {expires_at} (now = {now})"
+        );
 
         // The raw token is NOT in the list payload -- only in the mint response.
         let list = request(&app, "GET", "/api/enrollment-tokens", &cookie).await;
@@ -3231,7 +3250,12 @@ mod tests {
             assert_eq!(res.status(), StatusCode::OK, "{path} must stay public");
         }
 
-        for path in ["/api/fleet", "/api/me"] {
+        for path in [
+            "/api/fleet",
+            "/api/me",
+            "/api/enrollment-tokens",
+            "/api/ca.pem",
+        ] {
             let res = app
                 .clone()
                 .oneshot(Request::builder().uri(path).body(Body::empty())?)
