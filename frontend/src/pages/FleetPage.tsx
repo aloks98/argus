@@ -205,17 +205,10 @@ export default function FleetPage() {
   const [params, setParams] = useSearchParams();
 
   const q = params.get("q") ?? "";
-  // Tags are stored lowercase server-side and `visibleFleet` matches with an
-  // exact `includes` — a hand-edited URL with stray case would otherwise
-  // silently match nothing.
-  const selectedTags = (params.get("tags") ?? "")
-    .split(",")
-    .map((t) => t.trim().toLowerCase())
-    .filter(Boolean);
   // Absent/empty = flat (no grouping); otherwise the tag whose section is
-  // shown in place of the flat table. Lowercased for the same reason
-  // `selectedTags` is — a hand-edited URL with stray case would otherwise
-  // silently match no section.
+  // shown in place of the flat table. Lowercased because tags are stored
+  // lowercase server-side — a hand-edited URL with stray case would
+  // otherwise silently match no section.
   const rawGroup = params.get("group");
   const group = rawGroup !== null && rawGroup.trim() !== "" ? rawGroup.trim().toLowerCase() : null;
 
@@ -233,16 +226,9 @@ export default function FleetPage() {
     );
   }
 
-  function toggleTag(tag: string) {
-    const next = selectedTags.includes(tag)
-      ? selectedTags.filter((t) => t !== tag)
-      : [...selectedTags, tag];
-    setParam("tags", next.join(","));
-  }
-
   const tags = fleetTags(rows);
-  const filtered = visibleFleet(rows, q, selectedTags);
-  // The group tag composes with q/tags: `groupFleet` is run on the
+  const filtered = visibleFleet(rows, q);
+  // The group tag composes with q: `groupFleet` is run on the
   // already-filtered rows, then the one section for the active group tag is
   // picked out of it — `groupFleet` still owns "a machine under every tag it
   // carries" so that semantics isn't duplicated here. A group tag that
@@ -292,33 +278,6 @@ export default function FleetPage() {
           aria-label="Filter machines"
           className="max-w-xs font-mono text-xs"
         />
-        {tags.length > 0 && (
-          <div className="flex flex-wrap gap-1">
-            {tags.map(({ tag }) => {
-              const selected = selectedTags.includes(tag);
-              return (
-                // A plain `<button>` wrapping the Badge rather than Badge's own
-                // `render` prop: Tailwind's preflight already strips native
-                // button chrome (border-width, padding, background), so the
-                // wrapper adds nothing visually but keeps the toggle semantics
-                // (aria-pressed, click) independent of Badge's own prop surface.
-                //
-                // No count here (browser-review decision) — counts now live
-                // only in the "Group by" dropdown below, so a chip is just
-                // the tag itself.
-                <button
-                  key={tag}
-                  type="button"
-                  aria-pressed={selected}
-                  onClick={() => toggleTag(tag)}
-                >
-                  <Badge variant={selected ? "default" : "outline"}>{tag}</Badge>
-                </button>
-              );
-            })}
-          </div>
-        )}
-
         {/* Replaces the old Flat/Grouped ToggleGroup (browser-review
             decision) — a single dropdown whose trigger names the active
             group, with per-tag counts moved here (off the filter chips
