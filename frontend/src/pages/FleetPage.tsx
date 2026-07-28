@@ -70,7 +70,7 @@ function FleetTable({ rows }: { rows: FleetRow[] }) {
       <Table>
         <TableHeader>
           <TableRow>
-            <TableHead>Hostname</TableHead>
+            <TableHead>Name</TableHead>
             <TableHead>Status</TableHead>
             <TableHead>IP</TableHead>
             <TableHead>OS</TableHead>
@@ -267,7 +267,11 @@ export default function FleetPage() {
       ) : (
         <div className="space-y-6">
           {groupFleet(filtered).map((section) => (
-            <div key={section.tag ?? "untagged"}>
+            // `""` (not "untagged") — a real tag literally named "untagged"
+            // is a distinct section from the untagged one, so both need
+            // distinct keys; the tag charset regex requires a first
+            // character, so "" can never collide with an actual tag.
+            <div key={section.tag ?? ""}>
               <div className="flex flex-wrap items-baseline gap-2 pb-2">
                 <h2 className="font-display text-sm uppercase tracking-widest">
                   {section.tag ?? "Untagged"}
