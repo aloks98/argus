@@ -82,29 +82,34 @@ impl AgentService for AgentSvc {
         // used" becomes permanently unanswerable the moment the row is
         // written: `enrollment_tokens` keeps no per-use history, only a bare
         // `uses` counter.
-        let token_name = match repo::consume_enrollment_token(&mut *tx, &req.join_token)
-            .await
-            .map_err(|e| internal_error("checking enrollment token", &e))?
-        {
-            TokenCheck::Valid { token_name } => token_name,
-            TokenCheck::Invalid => {
-                drop(tx);
-                // No token was ever resolved here, so unlike the paths below
-                // there is no name to put in `detail` either.
-                repo::audit(
-                    &self.pool,
-                    repo::Actor::System,
-                    "agent.enroll",
-                    None,
-                    "denied",
-                )
+        let (token_name, token_display_name, token_tags) =
+            match repo::consume_enrollment_token(&mut *tx, &req.join_token)
                 .await
-                .map_err(|e| internal_error("writing audit log", &e))?;
-                return Err(Status::unauthenticated(
-                    "invalid or exhausted enrollment token",
-                ));
-            }
-        };
+                .map_err(|e| internal_error("checking enrollment token", &e))?
+            {
+                TokenCheck::Valid {
+                    token_name,
+                    display_name,
+                    tags,
+                } => (token_name, display_name, tags),
+                TokenCheck::Invalid => {
+                    drop(tx);
+                    // No token was ever resolved here, so unlike the paths below
+                    // there is no name to put in `detail` either.
+                    repo::audit(
+                        &self.pool,
+                        repo::Actor::System,
+                        "agent.enroll",
+                        None,
+                        "denied",
+                    )
+                    .await
+                    .map_err(|e| internal_error("writing audit log", &e))?;
+                    return Err(Status::unauthenticated(
+                        "invalid or exhausted enrollment token",
+                    ));
+                }
+            };
 
         let info = match &req.info {
             Some(info) if !info.machine_id.is_empty() => info,
@@ -137,6 +142,15 @@ impl AgentService for AgentSvc {
             let agent_id = repo::upsert_machine(&mut *tx, &info_row)
                 .await
                 .map_err(|e| internal_error("upserting machine", &e))?;
+
+            repo::apply_token_identity(
+                &mut *tx,
+                agent_id,
+                token_display_name.as_deref(),
+                &token_tags,
+            )
+            .await
+            .map_err(|e| internal_error("applying token identity", &e))?;
 
             let signed = self.ca.sign_csr(&req.csr_pem, agent_id).map_err(|e| {
                 tracing::warn!(error = %e, "enroll: CSR rejected");

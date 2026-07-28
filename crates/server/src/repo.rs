@@ -17,7 +17,17 @@ pub enum TokenCheck {
     // but it's still the only server-verified record of which token
     // authorized the call, so `enroll` now stamps it into every
     // `agent.enroll` row's `detail` instead (`repo::audit_with_detail`).
-    Valid { token_name: String },
+    //
+    // `display_name`/`tags` carry the identity the token was minted with
+    // (Task 4's `mint_enrollment_token`) so the enroll handler can apply it
+    // to the machine right after `upsert_machine` (`apply_token_identity`
+    // below) -- a null/empty value here means the token never set that
+    // field, not that it should clear the machine's existing one.
+    Valid {
+        token_name: String,
+        display_name: Option<String>,
+        tags: Vec<String>,
+    },
     Invalid,
 }
 
@@ -57,7 +67,7 @@ pub async fn consume_enrollment_token(
           AND NOT revoked
           AND (expires_at IS NULL OR expires_at > now())
           AND (max_uses IS NULL OR uses < max_uses)
-        RETURNING name
+        RETURNING name, display_name, tags as "tags!"
         "#,
         token_hash,
     )
@@ -67,6 +77,8 @@ pub async fn consume_enrollment_token(
     Ok(match row {
         Some(row) => TokenCheck::Valid {
             token_name: row.name,
+            display_name: row.display_name,
+            tags: row.tags,
         },
         None => TokenCheck::Invalid,
     })
@@ -274,6 +286,34 @@ pub async fn update_machine_inventory(
     .execute(executor)
     .await?;
 
+    Ok(())
+}
+
+/// Apply a token's identity fields to the machine it just enrolled — ONLY
+/// where the token actually set them (design "Enrollment flow"): a null
+/// display_name / empty tags on the token leaves the machine's existing
+/// values untouched, which is what makes re-enrollment after CA rotation
+/// identity-preserving by default.
+pub async fn apply_token_identity(
+    executor: impl sqlx::PgExecutor<'_>,
+    machine_id: Uuid,
+    display_name: Option<&str>,
+    tags: &[String],
+) -> Result<()> {
+    sqlx::query!(
+        r#"
+        UPDATE machines SET
+            display_name = coalesce($2, display_name),
+            tags         = CASE WHEN cardinality($3::text[]) > 0 THEN $3 ELSE tags END,
+            updated_at   = now()
+        WHERE id = $1
+        "#,
+        machine_id,
+        display_name,
+        tags,
+    )
+    .execute(executor)
+    .await?;
     Ok(())
 }
 
@@ -893,7 +933,7 @@ mod tests {
             .await
             .expect("consume")
         {
-            TokenCheck::Valid { token_name } => assert_eq!(token_name, "test-token-name"),
+            TokenCheck::Valid { token_name, .. } => assert_eq!(token_name, "test-token-name"),
             TokenCheck::Invalid => panic!("expected Valid on first use"),
         }
         assert!(matches!(
@@ -965,6 +1005,79 @@ mod tests {
         .execute(&pool)
         .await
         .expect("cleanup expired token");
+    }
+
+    /// Minimal `AgentInfoRow` for tests that only care about machine identity
+    /// (machine_id/hostname), not the full inventory snapshot exercised by
+    /// `upsert_machine_is_idempotent_by_machine_id_and_updates_inventory` below.
+    fn test_agent_info(machine_id: &str) -> AgentInfoRow {
+        AgentInfoRow {
+            machine_id: machine_id.into(),
+            hostname: machine_id.into(),
+            os: None,
+            kernel: None,
+            arch: None,
+            primary_ip: None,
+            agent_version: None,
+            capabilities: None,
+        }
+    }
+
+    #[sqlx::test]
+    async fn token_identity_applies_on_enroll_and_preserves_on_reenroll(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        // A token WITH identity: applies both fields.
+        sqlx::query!(
+            r#"INSERT INTO enrollment_tokens (name, token_hash, display_name, tags)
+               VALUES ('t1', sha256('raw1'::bytea), 'Media box', '{media,infra}')"#
+        )
+        .execute(&pool)
+        .await?;
+        let TokenCheck::Valid {
+            display_name, tags, ..
+        } = consume_enrollment_token(&pool, "raw1").await?
+        else {
+            panic!("token should be valid")
+        };
+        let info = test_agent_info("m-ident");
+        let id = upsert_machine(&pool, &info).await?;
+        apply_token_identity(&pool, id, display_name.as_deref(), &tags).await?;
+        let row = sqlx::query!("SELECT display_name, tags FROM machines WHERE id = $1", id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(row.display_name.as_deref(), Some("Media box"));
+        assert_eq!(row.tags, vec!["media", "infra"]);
+
+        // Re-enroll with a BARE token (no identity): everything preserved.
+        sqlx::query!(
+            r#"INSERT INTO enrollment_tokens (name, token_hash) VALUES ('t2', sha256('raw2'::bytea))"#
+        )
+        .execute(&pool)
+        .await?;
+        let TokenCheck::Valid {
+            display_name, tags, ..
+        } = consume_enrollment_token(&pool, "raw2").await?
+        else {
+            panic!("token should be valid")
+        };
+        let id2 = upsert_machine(&pool, &info).await?; // same machine_id => same row
+        assert_eq!(id, id2);
+        apply_token_identity(&pool, id2, display_name.as_deref(), &tags).await?;
+        let row = sqlx::query!("SELECT display_name, tags FROM machines WHERE id = $1", id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            row.display_name.as_deref(),
+            Some("Media box"),
+            "bare re-enroll must not clear the name"
+        );
+        assert_eq!(
+            row.tags,
+            vec!["media", "infra"],
+            "bare re-enroll must not clear tags"
+        );
+        Ok(())
     }
 
     #[tokio::test]
