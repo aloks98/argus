@@ -345,89 +345,61 @@ fn removed_cookie(name: &'static str) -> Cookie<'static> {
 /// not an API call), and detail is logged server-side rather than returned
 /// (design doc §14). `message` is always a fixed string this module controls,
 /// never request input, so no escaping is needed.
-/// A standalone HTML page for the auth failures that happen *outside* the SPA.
+/// The markup for the auth failures that happen *outside* the SPA, kept in
+/// `templates/error.html` rather than inline in this file. `include_str!`
+/// embeds it at compile time, so there is no runtime file read and no risk of
+/// the binary and its templates drifting apart on a deploy.
 ///
-/// These are reached by a top-level browser navigation mid-redirect, so the
-/// React bundle and its stylesheet are not in play — the page has to carry its
-/// own styling. The colours below are the same tokens `frontend/src/index.css`
-/// defines (`--background`, `--foreground`, `--muted-foreground`, `--border`,
-/// `--primary`, `--destructive`), inlined rather than imported, and the
-/// `prefers-color-scheme` block mirrors the app's `.dark` values so this does
-/// not flash white on a product that is dark by default.
+/// One page with two placeholders does not justify a templating engine; the
+/// project's convention is to add a dependency when its slice needs it, and
+/// this one needs `str::replace`.
+const ERROR_TEMPLATE: &str = include_str!("templates/error.html");
+
+/// Escape text before it goes into the template.
 ///
-/// Duplicating six hex values is the deliberate trade: the alternative is
-/// serving a stylesheet to unauthenticated callers purely for error states, and
-/// these values change roughly never. `--radius: 0rem` is why nothing here is
-/// rounded — square corners are the identity, not an oversight.
-///
-/// Deliberately no ARGUS wordmark. The app sets it in Archivo Black, and this
-/// page cannot have that face without also serving font files to
-/// unauthenticated callers — so it would render in a substitute and read as
-/// subtly wrong every time. The heading and message carry the page on their
-/// own; a mark that is almost right is worse than none.
-fn error_page(status: StatusCode, message: &str) -> Response {
-    // The heading follows the status, because not every one of these is a
-    // failed sign-in: a 404 is "this server has no SSO configured", which is a
-    // statement about the deployment rather than about the attempt.
-    let heading = match status {
+/// Every `message` passed today is a string literal in this file, so nothing
+/// is injectable right now. This exists so that stays true: the obvious future
+/// edit is to surface a provider's `error_description`, which is attacker-
+/// influenced, and a `str::replace` template has no escaping of its own to
+/// catch it. Cheaper to be correct now than to remember later.
+fn escape_html(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    for c in raw.chars() {
+        match c {
+            '&' => out.push_str("&amp;"),
+            '<' => out.push_str("&lt;"),
+            '>' => out.push_str("&gt;"),
+            '"' => out.push_str("&quot;"),
+            '\'' => out.push_str("&#39;"),
+            _ => out.push(c),
+        }
+    }
+    out
+}
+
+/// Render a standalone auth error page.
+/// The heading follows the status, because not every one of these is a failed
+/// sign-in: a 404 is "this server has no SSO configured", which is a statement
+/// about the deployment rather than about the attempt.
+fn error_heading(status: StatusCode) -> &'static str {
+    match status {
         StatusCode::NOT_FOUND => "Not available",
         StatusCode::SERVICE_UNAVAILABLE => "Temporarily unavailable",
         _ => "Sign-in failed",
-    };
-    let body = format!(
-        r#"<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>{heading} — Argus</title>
-<style>
-  :root {{
-    --bg: #FFFFFF; --fg: #0A0A0B; --muted: #6B6B70;
-    --border: #D4D4D8; --accent: #14161A; --alert: #FF1744;
-  }}
-  @media (prefers-color-scheme: dark) {{
-    :root {{
-      --bg: #000000; --fg: #F5F5F5; --muted: #8A8A8A;
-      --border: #242424; --accent: #FFE600; --alert: #FF1744;
-    }}
-  }}
-  * {{ box-sizing: border-box; }}
-  body {{
-    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
-    align-items: center; justify-content: center; gap: 1.5rem; padding: 1.5rem;
-    background: var(--bg); color: var(--fg);
-    font-family: ui-monospace, "IBM Plex Mono", SFMono-Regular, Menlo, monospace;
-  }}
-  .panel {{
-    width: 100%; max-width: 24rem; border: 1px solid var(--border);
-    border-left: 3px solid var(--alert); padding: 1rem 1.25rem;
-  }}
-  h1 {{
-    margin: 0 0 0.5rem; font-size: 0.6875rem; font-weight: 600;
-    text-transform: uppercase; letter-spacing: 0.16em; color: var(--alert);
-  }}
-  p {{ margin: 0; font-size: 0.8125rem; line-height: 1.5; }}
-  nav {{ display: flex; gap: 1.25rem; }}
-  a {{
-    color: var(--muted); font-size: 0.6875rem; text-transform: uppercase;
-    letter-spacing: 0.16em; text-decoration: none; text-underline-offset: 2px;
-  }}
-  a:hover {{ color: var(--fg); text-decoration: underline; }}
-</style>
-</head>
-<body>
-<div class="panel">
-<h1>{heading}</h1>
-<p>{message}</p>
-</div>
-<nav>
-<a href="/auth/login">Try again</a>
-<a href="/">Back to sign-in</a>
-</nav>
-</body>
-</html>"#
-    );
+    }
+}
+
+/// Substitute into the template. Split from `error_page` so the rendering can
+/// be asserted on directly — a `Response` body is awkward to inspect from a
+/// sync test, and "did the escaping actually happen" is the part worth pinning.
+fn render_error_page(heading: &str, message: &str) -> String {
+    ERROR_TEMPLATE
+        .replace("{{heading}}", &escape_html(heading))
+        .replace("{{message}}", &escape_html(message))
+}
+
+fn error_page(status: StatusCode, message: &str) -> Response {
+    let body = render_error_page(error_heading(status), message);
     (status, Html(body)).into_response()
 }
 
@@ -988,6 +960,50 @@ mod tests {
     /// obvious fix — trusting extra audiences — would have removed the audience
     /// guarantee entirely, because `openidconnect` 4.0.1 has its azp check
     /// commented out. These cases pin the pairing.
+    #[test]
+    fn error_template_substitutes_both_placeholders() {
+        let html = render_error_page("Not available", "Single sign-on is not configured.");
+        assert!(html.contains("<h1>Not available</h1>"));
+        assert!(html.contains("<p>Single sign-on is not configured.</p>"));
+        assert!(html.contains("<title>Not available — Argus</title>"));
+        // A renamed or misspelled placeholder would otherwise ship a page with
+        // a literal `{{heading}}` on it and nothing would fail.
+        assert!(
+            !html.contains("{{"),
+            "every placeholder must be substituted, found a leftover in:\n{html}"
+        );
+    }
+
+    /// `str::replace` templating has no escaping of its own. Every message
+    /// passed today is a literal in this file, so nothing is injectable now --
+    /// this is what keeps that true when someone surfaces a provider's
+    /// `error_description`, which is attacker-influenced.
+    #[test]
+    fn rendered_messages_are_html_escaped() {
+        let html = render_error_page("Sign-in failed", "<script>alert('x')</script> & \"quoted\"");
+        assert!(
+            !html.contains("<script>"),
+            "raw script tag reached the page"
+        );
+        assert!(html.contains("&lt;script&gt;"));
+        assert!(html.contains("&amp;"));
+        assert!(html.contains("&quot;"));
+        assert!(html.contains("&#39;"));
+    }
+
+    #[test]
+    fn error_heading_follows_the_status() {
+        // A 404 here means "no SSO on this deployment", which is not a failed
+        // attempt -- it used to read "Sign-in failed" over text saying so.
+        assert_eq!(error_heading(StatusCode::NOT_FOUND), "Not available");
+        assert_eq!(
+            error_heading(StatusCode::SERVICE_UNAVAILABLE),
+            "Temporarily unavailable"
+        );
+        assert_eq!(error_heading(StatusCode::BAD_GATEWAY), "Sign-in failed");
+        assert_eq!(error_heading(StatusCode::BAD_REQUEST), "Sign-in failed");
+    }
+
     #[test]
     fn multi_audience_tokens_require_azp_to_be_this_client() {
         const US: &str = "383369216612370205";
