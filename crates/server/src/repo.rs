@@ -521,6 +521,7 @@ pub struct MachineDetail {
     pub id: Uuid,
     pub machine_id: String,
     pub hostname: String,
+    pub display_name: Option<String>,
     pub os: Option<String>,
     pub kernel: Option<String>,
     pub arch: Option<String>,
@@ -544,7 +545,7 @@ pub async fn machine_detail(
     let row = sqlx::query_as!(
         MachineDetail,
         r#"
-        SELECT id, machine_id, hostname, os, kernel, arch,
+        SELECT id, machine_id, hostname, display_name, os, kernel, arch,
                host(primary_ip) as "primary_ip?", agent_version, status,
                last_seen_at, enrolled_at, tags, notes, capabilities
         FROM machines

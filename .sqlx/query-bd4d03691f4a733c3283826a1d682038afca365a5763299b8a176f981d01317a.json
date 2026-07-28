@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, hostname, os, host(primary_ip) as \"primary_ip?\", status,\n                  last_seen_at, tags FROM machines ORDER BY hostname",
+  "query": "SELECT id, hostname, display_name, os, host(primary_ip) as \"primary_ip?\", status,\n                  last_seen_at, tags, capabilities FROM machines ORDER BY hostname",
   "describe": {
     "columns": [
       {
@@ -27,6 +27,17 @@
       },
       {
         "ordinal": 2,
+        "name": "display_name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "display_name"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
         "name": "os",
         "type_info": "Text",
         "origin": {
@@ -37,13 +48,13 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "primary_ip?",
         "type_info": "Text",
         "origin": "Expression"
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "status",
         "type_info": "Text",
         "origin": {
@@ -54,7 +65,7 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 6,
         "name": "last_seen_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -65,13 +76,24 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "tags",
         "type_info": "TextArray",
         "origin": {
           "Table": {
             "table": "machines",
             "name": "tags"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "capabilities",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "capabilities"
           }
         }
       }
@@ -83,11 +105,13 @@
       false,
       false,
       true,
+      true,
       null,
       false,
       true,
-      false
+      false,
+      true
     ]
   },
-  "hash": "cf45633cc2019c9c7e1498ce8296a64dd9c8849e0ab5a913e00415bb915178dd"
+  "hash": "bd4d03691f4a733c3283826a1d682038afca365a5763299b8a176f981d01317a"
 }

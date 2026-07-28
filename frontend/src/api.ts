@@ -81,11 +81,14 @@ export async function rotateLocalAdmin(): Promise<string> {
 export type FleetRow = {
   id: string;
   hostname: string;
+  display_name: string | null;
   os: string | null;
   primary_ip: string | null;
   status: "pending" | "online" | "offline";
   last_seen_at: string | null;
   tags: string[];
+  /** `null` = the agent never reported; gate nothing. */
+  capabilities: string[] | null;
   cpu_pct: number | null;
   mem_pct: number | null;
   failed_units: number;
@@ -102,6 +105,7 @@ export async function getFleet(): Promise<FleetRow[]> {
 export type MachineDetail = {
   id: string;
   hostname: string;
+  display_name: string | null;
   os: string | null;
   kernel: string | null;
   arch: string | null;

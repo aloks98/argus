@@ -167,12 +167,19 @@ async fn readyz() -> impl IntoResponse {
 struct FleetRow {
     id: Uuid,
     hostname: String,
+    /// Operator-set name; `None` = "display the hostname". The fallback lives
+    /// client-side so a hostname change keeps showing through.
+    display_name: Option<String>,
     os: Option<String>,
     primary_ip: Option<String>,
     status: String,
     #[serde(with = "time::serde::rfc3339::option")]
     last_seen_at: Option<OffsetDateTime>,
     tags: Vec<String>,
+    /// Same tri-state as the detail payload: `None` = agent never reported =
+    /// gate nothing. Carried on the fleet row for the command palette, which
+    /// builds per-machine tab entries without fetching every detail page.
+    capabilities: Option<Vec<String>>,
     cpu_pct: Option<f32>,
     mem_pct: Option<f64>,
     /// Count of units in the `failed` state in the machine's **last reported**
@@ -202,8 +209,8 @@ struct SparkSeries {
 /// Behind `require_auth` (mounted once on the whole `/api` router).
 async fn fleet(State(state): State<AppState>) -> Result<Json<Vec<FleetRow>>, StatusCode> {
     let rows = sqlx::query!(
-        r#"SELECT id, hostname, os, host(primary_ip) as "primary_ip?", status,
-                  last_seen_at, tags FROM machines ORDER BY hostname"#
+        r#"SELECT id, hostname, display_name, os, host(primary_ip) as "primary_ip?", status,
+                  last_seen_at, tags, capabilities FROM machines ORDER BY hostname"#
     )
     .fetch_all(&state.pool)
     .await
@@ -245,11 +252,13 @@ async fn fleet(State(state): State<AppState>) -> Result<Json<Vec<FleetRow>>, Sta
             FleetRow {
                 id: r.id,
                 hostname: r.hostname,
+                display_name: r.display_name,
                 os: r.os,
                 primary_ip: r.primary_ip,
                 status: r.status,
                 last_seen_at: r.last_seen_at,
                 tags: r.tags,
+                capabilities: r.capabilities,
                 cpu_pct,
                 mem_pct,
                 failed_units,
@@ -269,6 +278,7 @@ struct MachineDetailDto {
     id: Uuid,
     machine_id: String,
     hostname: String,
+    display_name: Option<String>,
     os: Option<String>,
     kernel: Option<String>,
     arch: Option<String>,
@@ -291,6 +301,7 @@ impl From<repo::MachineDetail> for MachineDetailDto {
             id: d.id,
             machine_id: d.machine_id,
             hostname: d.hostname,
+            display_name: d.display_name,
             os: d.os,
             kernel: d.kernel,
             arch: d.arch,
@@ -1130,6 +1141,8 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["hostname"], "a-online-host");
         assert_eq!(rows[0]["status"], "online");
+        assert_eq!(rows[0]["display_name"], serde_json::Value::Null);
+        assert!(rows[0].as_object().unwrap().contains_key("capabilities"));
         assert_eq!(rows[1]["hostname"], "z-offline-host");
         assert_eq!(rows[1]["status"], "offline");
 
