@@ -1,6 +1,6 @@
-//! Server-side DB repository: enrollment-token consumption, machine
-//! inventory upsert, issued-cert bookkeeping, online/offline status, and the
-//! audit log. Every query is compile-time-checked via
+//! Server-side DB repository (PRD §5, §6.1): enrollment-token consumption,
+//! machine inventory upsert, issued-cert bookkeeping, online/offline status,
+//! and the audit log. Every query is compile-time-checked via
 //! `sqlx::query!`/`query_as!` against the live dev Postgres (`DATABASE_URL`).
 
 use anyhow::Result;
@@ -57,7 +57,7 @@ pub struct AgentInfoRow {
 /// Hash `token_plain` with sha256 and atomically check-and-consume the
 /// matching `enrollment_tokens` row: rejects revoked/expired/uses-exhausted
 /// tokens, otherwise increments `uses` and returns the token's `name`. The
-/// raw token is never stored -- only its hash is ever looked up.
+/// raw token is never stored -- only its hash is ever looked up (PRD §5.2).
 /// The check and the increment happen in one `UPDATE ... RETURNING` so two
 /// concurrent enrollments can't both slip through on the last remaining use.
 pub async fn consume_enrollment_token(
@@ -332,7 +332,7 @@ pub async fn apply_token_identity(
     Ok(())
 }
 
-/// Record a freshly-issued client cert against its machine.
+/// Record a freshly-issued client cert against its machine (PRD §5.3).
 /// `serial` is the decimal serial string from `ca::SignedCert::serial`;
 /// binding it through `::numeric` avoids pulling in sqlx's `bigdecimal`
 /// feature just to accept a `numeric` column.
@@ -363,7 +363,7 @@ pub async fn insert_agent_cert(
 
 /// Look up the machine identified by a client cert's `fingerprint`, if it
 /// matches a non-revoked, unexpired `agent_certs` row -- the mTLS identity
-/// check every agent gRPC call rides on.
+/// check every agent gRPC call rides on (PRD §5).
 pub async fn cert_is_active(pool: &PgPool, fingerprint: &str) -> Result<Option<Uuid>> {
     let row = sqlx::query!(
         r#"
@@ -777,7 +777,7 @@ pub struct Identity {
 
 impl Identity {
     /// Email reads better in an audit trail; `subject` is the stable identity
-    /// and is always present. Both are on the session row.
+    /// and is always present. Both are on the session row (PRD §7).
     pub fn actor_str(&self) -> &str {
         self.email.as_deref().unwrap_or(&self.subject)
     }
