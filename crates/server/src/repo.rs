@@ -719,6 +719,10 @@ pub struct MachineDetail {
     pub notes: Option<String>,
     /// `None` = never reported; the client must gate nothing in that case.
     pub capabilities: Option<Vec<String>>,
+    pub cpu_model: Option<String>,
+    pub cpu_cores: Option<i32>,
+    pub boot_time: Option<OffsetDateTime>,
+    pub virt: Option<String>,
 }
 
 /// Look up one machine's full inventory row for the detail page, or `None`
@@ -732,7 +736,8 @@ pub async fn machine_detail(
         r#"
         SELECT id, machine_id, hostname, display_name, os, kernel, arch,
                host(primary_ip) as "primary_ip?", agent_version, status,
-               last_seen_at, enrolled_at, tags, notes, capabilities
+               last_seen_at, enrolled_at, tags, notes, capabilities,
+               cpu_model, cpu_cores, boot_time, virt
         FROM machines
         WHERE id = $1
         "#,

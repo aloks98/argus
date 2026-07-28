@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT id, machine_id, hostname, display_name, os, kernel, arch,\n               host(primary_ip) as \"primary_ip?\", agent_version, status,\n               last_seen_at, enrolled_at, tags, notes, capabilities\n        FROM machines\n        WHERE id = $1\n        ",
+  "query": "\n        SELECT id, machine_id, hostname, display_name, os, kernel, arch,\n               host(primary_ip) as \"primary_ip?\", agent_version, status,\n               last_seen_at, enrolled_at, tags, notes, capabilities,\n               cpu_model, cpu_cores, boot_time, virt\n        FROM machines\n        WHERE id = $1\n        ",
   "describe": {
     "columns": [
       {
@@ -162,6 +162,50 @@
             "name": "capabilities"
           }
         }
+      },
+      {
+        "ordinal": 15,
+        "name": "cpu_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "cpu_model"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "cpu_cores",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "cpu_cores"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "boot_time",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "boot_time"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "virt",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "virt"
+          }
+        }
       }
     ],
     "parameters": {
@@ -184,8 +228,12 @@
       false,
       false,
       true,
+      true,
+      true,
+      true,
+      true,
       true
     ]
   },
-  "hash": "5e9a05203a899b629ce432733827f74182778e03aef2cc1a30b178a8d370787e"
+  "hash": "580c79cafe68812a47e616ff18ffa2240516bb8096018643aa20132413239ce8"
 }

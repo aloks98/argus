@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO machines (machine_id, hostname, status, cpu_model, cpu_cores, boot_time, virt)\n               VALUES ('inv-full', 'inv-full-host', 'online', 'AMD Ryzen 7 5800X', 8, to_timestamp(1700000000), 'kvm')\n               RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "49d55d05309a211e9c22f75faab87deef381ea7d0e06e86de73bf8cf43ac40a5"
+}

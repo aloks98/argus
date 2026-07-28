@@ -298,6 +298,11 @@ struct MachineDetailDto {
     notes: Option<String>,
     /// `None` = never reported; the client must gate nothing in that case.
     capabilities: Option<Vec<String>>,
+    cpu_model: Option<String>,
+    cpu_cores: Option<i32>,
+    #[serde(with = "time::serde::rfc3339::option")]
+    boot_time: Option<OffsetDateTime>,
+    virt: Option<String>,
 }
 
 impl From<repo::MachineDetail> for MachineDetailDto {
@@ -318,6 +323,10 @@ impl From<repo::MachineDetail> for MachineDetailDto {
             tags: d.tags,
             notes: d.notes,
             capabilities: d.capabilities,
+            cpu_model: d.cpu_model,
+            cpu_cores: d.cpu_cores,
+            boot_time: d.boot_time,
+            virt: d.virt,
         }
     }
 }
@@ -1732,6 +1741,78 @@ mod tests {
                 detail["capabilities"], expected,
                 "capabilities JSON mismatch for machine {id}"
             );
+        }
+
+        Ok(())
+    }
+
+    /// The four inventory columns (`cpu_model`/`cpu_cores`/`boot_time`/`virt`)
+    /// must ride along in the detail JSON exactly like `capabilities` does:
+    /// present with values when reported, present as explicit `null` when
+    /// not. Presence is checked with `contains_key`, never bare indexing --
+    /// `serde_json::Value`'s `Index` impl returns `Value::Null` for an
+    /// ABSENT key too, so `detail["cpu_model"] == Value::Null` alone can't
+    /// distinguish "key missing" from "key present, value null". That trap
+    /// bit the fleet-payload test; the fix here is asserting `contains_key`
+    /// first.
+    #[sqlx::test]
+    async fn machine_detail_json_carries_inventory_fields(pool: PgPool) -> anyhow::Result<()> {
+        let with_id: Uuid = sqlx::query!(
+            r#"INSERT INTO machines (machine_id, hostname, status, cpu_model, cpu_cores, boot_time, virt)
+               VALUES ('inv-full', 'inv-full-host', 'online', 'AMD Ryzen 7 5800X', 8, to_timestamp(1700000000), 'kvm')
+               RETURNING id"#
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+
+        let without_id: Uuid = sqlx::query!(
+            r#"INSERT INTO machines (machine_id, hostname, status)
+               VALUES ('inv-none', 'inv-none-host', 'online') RETURNING id"#
+        )
+        .fetch_one(&pool)
+        .await?
+        .id;
+
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool));
+
+        for id in [with_id, without_id] {
+            let response = app
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/api/machines/{id}"))
+                        .header("cookie", &cookie)
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = to_bytes(response.into_body(), usize::MAX).await?;
+            let detail: serde_json::Value = serde_json::from_slice(&body)?;
+            let obj = detail.as_object().expect("detail body is a JSON object");
+
+            for key in ["cpu_model", "cpu_cores", "boot_time", "virt"] {
+                assert!(
+                    obj.contains_key(key),
+                    "key {key} must be present in the detail payload for machine {id}"
+                );
+            }
+
+            if id == with_id {
+                assert_eq!(detail["cpu_model"], serde_json::json!("AMD Ryzen 7 5800X"));
+                assert_eq!(detail["cpu_cores"], serde_json::json!(8));
+                assert_eq!(detail["virt"], serde_json::json!("kvm"));
+                assert!(
+                    detail["boot_time"].is_string(),
+                    "boot_time must serialize as an RFC3339 string when reported"
+                );
+            } else {
+                assert_eq!(detail["cpu_model"], serde_json::Value::Null);
+                assert_eq!(detail["cpu_cores"], serde_json::Value::Null);
+                assert_eq!(detail["boot_time"], serde_json::Value::Null);
+                assert_eq!(detail["virt"], serde_json::Value::Null);
+            }
         }
 
         Ok(())
