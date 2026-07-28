@@ -95,6 +95,30 @@ later start it *loads* that identity and skips enrollment.
 
 Open http://127.0.0.1:8080 — the fleet page shows the machine `online`.
 
+### Alternative: `--config <path>` (env-file, survives a restart)
+Env vars are fine for a one-shot manual run, but the enroll page's `sudo -n env
+VAR=... ./argus-agent` recipe does not survive a reboot. `--config` reads the
+same four keys from a file instead. The format is a subset of systemd's
+`EnvironmentFile=` (`KEY=VALUE` per line, `#`-comments and blank lines ignored,
+surrounding quotes stripped), so the same file doubles as a unit's
+`EnvironmentFile=` unchanged later:
+```bash
+cat > /tmp/argus-agent.env <<'EOF'
+ARGUS_AGENT_ENDPOINT=https://localhost:9443
+ARGUS_JOIN_TOKEN=devtoken
+ARGUS_CA_CERT=/tmp/argus-ca.crt
+ARGUS_DATA_DIR=/tmp/argus-agent
+EOF
+
+cargo build -p argus-agent
+sudo -n ./target/debug/argus-agent --config /tmp/argus-agent.env
+```
+Real environment variables still win over the same key in the file — useful
+under `sudo -n`, which does not carry your shell's exports through, unlike the
+`sudo -n env VAR=...` form above. Unknown keys in the file are logged as a
+`tracing::warn!` (typo detection) and otherwise ignored, not a hard error; a
+missing or unreadable `--config` path IS a hard startup error.
+
 ## Spine end-to-end verification (2026-07-06)
 Verified manually per the plan's Task 11 (`docs/plans/2026-07-05-spine-slice.md`):
 

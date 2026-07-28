@@ -33,7 +33,11 @@ async fn main() -> Result<()> {
     // rustls is pinned to the `ring` provider across the whole workspace.
     let _ = rustls::crypto::ring::default_provider().install_default();
 
-    let cfg = config::Config::from_env()?;
+    // `--config <path>` is an env-file fallback (env vars still win per key,
+    // see `config::Config`'s doc comment) for a restart-surviving alternative
+    // to the enroll page's one-shot `sudo -n env VAR=... ./argus-agent`.
+    let args: Vec<String> = std::env::args().collect();
+    let cfg = config::Config::load(&args)?;
     tracing::info!(endpoint = %cfg.endpoint, "argus-agent starting");
 
     // Build slice #1 (Spine): ensure enrolled (obtain a client cert), then hold a
