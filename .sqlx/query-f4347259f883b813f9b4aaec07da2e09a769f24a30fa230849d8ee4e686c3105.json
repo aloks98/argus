@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n            CREATE TRIGGER test_reject_machine_update_audit\n                BEFORE INSERT ON audit_log\n                FOR EACH ROW\n                WHEN (NEW.action = 'machine.update')\n                EXECUTE FUNCTION test_reject_machine_update_audit()\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "f4347259f883b813f9b4aaec07da2e09a769f24a30fa230849d8ee4e686c3105"
+}

@@ -404,9 +404,26 @@ async fn patch_machine(
 
     let dn_arg: Option<Option<&str>> = display_name.as_ref().map(|o| o.as_deref());
     let notes_arg: Option<Option<&str>> = notes.as_ref().map(|o| o.as_deref());
+
+    // Fail closed (CLAUDE.md: every verb goes through the audit log from the
+    // start): the mutation and its `machine.update` row are ONE transaction,
+    // committed together or not at all. `run_verb` gets fail-closed by
+    // auditing BEFORE dispatch, but that ordering isn't available here --
+    // "does this machine exist" (the 404) can only be answered by attempting
+    // the update itself, so the update necessarily runs first. Sharing a `tx`
+    // instead means a failed audit write rolls the update back with it: an
+    // unaudited mutation must never persist, and a client told "500" must
+    // find the database agrees.
+    let mut tx = match state.pool.begin().await {
+        Ok(tx) => tx,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to begin machine identity update transaction");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
     let updated =
-        match repo::update_machine_identity(&state.pool, id, dn_arg, notes_arg, tags.as_deref())
-            .await
+        match repo::update_machine_identity(&mut *tx, id, dn_arg, notes_arg, tags.as_deref()).await
         {
             Ok(u) => u,
             Err(err) => {
@@ -415,12 +432,15 @@ async fn patch_machine(
             }
         };
     if !updated {
+        // `tx` drops here un-committed -- there was nothing to roll back (no
+        // row matched), but this keeps the "never commit without an audit
+        // row" invariant true unconditionally rather than by accident.
         return StatusCode::NOT_FOUND.into_response();
     }
 
     // detail = which fields changed, never the values: notes may hold anything.
     if let Err(err) = repo::audit_with_detail(
-        &state.pool,
+        &mut *tx,
         repo::Actor::User(&identity),
         "machine.update",
         Some(id),
@@ -429,7 +449,14 @@ async fn patch_machine(
     )
     .await
     {
-        tracing::error!(error = %err, "failed to audit machine.update");
+        tracing::error!(error = %err, "failed to audit machine.update; rolling back the update");
+        // `tx` drops here un-committed, which rolls the update back: the
+        // whole point of sharing a transaction with the write above.
+        return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+    }
+
+    if let Err(err) = tx.commit().await {
+        tracing::error!(error = %err, "failed to commit machine identity update");
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -3370,6 +3397,98 @@ mod tests {
         .fetch_one(&pool)
         .await?;
         assert_eq!(n, 0);
+        Ok(())
+    }
+
+    /// Fail-closed proof for the transactional fix (review round 1): forces
+    /// the `machine.update` audit write to fail while the machine row it
+    /// would attach to genuinely exists, then asserts the mutation did not
+    /// survive that failure.
+    ///
+    /// This can't reuse `verb_fails_closed_when_the_dispatched_audit_write_fails`'s
+    /// FK-violation trick verbatim (a "ghost" `machine_id` with no `machines`
+    /// row, so the audit insert's FK fails): `patch_machine` uses the SAME
+    /// `id` for both the update and the audit row, and reaching the audit
+    /// write at all requires the update to have matched a real row first --
+    /// so by construction that FK can never be what fails here. Instead, a
+    /// `BEFORE INSERT` trigger scoped to this test's own isolated database
+    /// rejects any `audit_log` insert whose `action = 'machine.update'`,
+    /// which fails the write for a reason orthogonal to whether the
+    /// referenced machine exists -- the same *class* of injected DB-level
+    /// failure, adapted to an ordering where the FK approach doesn't apply.
+    #[sqlx::test]
+    async fn patch_machine_rolls_back_the_update_when_the_audit_write_fails(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        sqlx::query!(
+            r#"
+            CREATE FUNCTION test_reject_machine_update_audit() RETURNS trigger AS $$
+            BEGIN
+                RAISE EXCEPTION 'injected failure: machine.update audit blocked for test';
+            END;
+            $$ LANGUAGE plpgsql
+            "#
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query!(
+            r#"
+            CREATE TRIGGER test_reject_machine_update_audit
+                BEFORE INSERT ON audit_log
+                FOR EACH ROW
+                WHEN (NEW.action = 'machine.update')
+                EXECUTE FUNCTION test_reject_machine_update_audit()
+            "#
+        )
+        .execute(&pool)
+        .await?;
+
+        let id: Uuid = sqlx::query_scalar!(
+            r#"INSERT INTO machines (machine_id, hostname, tags) VALUES ('m-3', 'host-3', '{orig}')
+               RETURNING id"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool.clone()));
+
+        let res = request_json(
+            &app,
+            "PATCH",
+            &format!("/api/machines/{id}"),
+            &cookie,
+            serde_json::json!({ "display_name": "should not stick", "tags": ["new"] }),
+        )
+        .await;
+        assert_eq!(
+            res.status(),
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "a failed audit write must fail closed"
+        );
+
+        let row = sqlx::query!("SELECT display_name, tags FROM machines WHERE id = $1", id)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(
+            row.display_name, None,
+            "the update must have rolled back with the failed audit write"
+        );
+        assert_eq!(
+            row.tags,
+            vec!["orig"],
+            "the update must have rolled back with the failed audit write"
+        );
+
+        let n: i64 = sqlx::query_scalar!(
+            r#"SELECT count(*) as "n!" FROM audit_log WHERE action = 'machine.update'"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(
+            n, 0,
+            "the rejected audit insert must not have landed either"
+        );
+
         Ok(())
     }
 }
