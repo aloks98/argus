@@ -97,11 +97,22 @@ export default function TimeSeriesChart({
   series,
   height = 200,
   format = (v) => v.toFixed(2),
+  tooltipFormat,
+  rightAxisFormat,
 }: {
   timestamps: number[];
   series: ChartSeries[];
   height?: number;
+  /** Left axis labels, and the tooltip unless `tooltipFormat` overrides. */
   format?: (v: number) => string;
+  /** Tooltip-only override — e.g. the memory chart shows "8.3 GB (35%)"
+   *  in the tooltip while the axis stays plain "8.3 GB". */
+  tooltipFormat?: (v: number) => string;
+  /** When set, a second y-axis renders on the RIGHT relabeling the SAME
+   *  scale — e.g. bytes on the left, the equivalent percentage on the
+   *  right. Only meaningful when the mapping is a constant factor (memory
+   *  against a fixed total); it is a relabeling, not a second scale. */
+  rightAxisFormat?: (v: number) => string;
 }) {
   const box = useRef<HTMLDivElement>(null);
   const [width, setWidth] = useState(0);
@@ -131,7 +142,7 @@ export default function TimeSeriesChart({
       height,
       cursor: { show: true, y: false, drag: { x: false, y: false } },
       legend: { show: series.length > 1, live: false },
-      plugins: [tooltipPlugin(format)],
+      plugins: [tooltipPlugin(tooltipFormat ?? format)],
       scales: { x: { time: true } },
       axes: [
         {
@@ -159,13 +170,33 @@ export default function TimeSeriesChart({
             return Math.ceil(longest * 6.6) + 18;
           },
         },
+        ...(rightAxisFormat !== undefined
+          ? [
+              {
+                side: 1,
+                scale: "y",
+                stroke: label,
+                // No second grid: the left axis already draws it, and two
+                // overlapping grids at slightly different splits read as noise.
+                grid: { show: false },
+                ticks: { stroke: axis },
+                font: '11px "IBM Plex Mono", monospace',
+                values: (_u: uPlot, vals: number[]) => vals.map(rightAxisFormat),
+                size: (_u: uPlot, vals: string[] | null) => {
+                  const longest =
+                    vals === null ? 3 : vals.reduce((m, v) => Math.max(m, v.length), 0);
+                  return Math.ceil(longest * 6.6) + 18;
+                },
+              } satisfies uPlot.Axis,
+            ]
+          : []),
       ],
       series: [
         {},
         ...series.map((s) => ({ label: s.name, stroke: cssVar(s.colorVar, "#F5F5F5"), width: 2 })),
       ],
     }),
-    [width, height, themeVersion, seriesKey, format],
+    [width, height, themeVersion, seriesKey, format, tooltipFormat, rightAxisFormat],
   );
 
   const data = [timestamps, ...series.map((s) => s.data)] as uPlot.AlignedData;

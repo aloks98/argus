@@ -81,6 +81,8 @@ function MetricChartCard({
   series,
   height = 220,
   format,
+  tooltipFormat,
+  rightAxisFormat,
 }: {
   title: string;
   description: string;
@@ -88,6 +90,8 @@ function MetricChartCard({
   series: ChartSeries[];
   height?: number;
   format?: (v: number) => string;
+  tooltipFormat?: (v: number) => string;
+  rightAxisFormat?: (v: number) => string;
 }) {
   return (
     <Card>
@@ -102,7 +106,14 @@ function MetricChartCard({
             description="Waiting for metrics to accumulate."
           />
         ) : (
-          <TimeSeriesChart timestamps={timestamps} series={series} height={height} format={format} />
+          <TimeSeriesChart
+            timestamps={timestamps}
+            series={series}
+            height={height}
+            format={format}
+            tooltipFormat={tooltipFormat}
+            rightAxisFormat={rightAxisFormat}
+          />
         )}
       </CardContent>
     </Card>
@@ -447,6 +458,16 @@ export default function MachineDetailPage() {
                 },
               ]}
               format={formatBytes}
+              tooltipFormat={
+                memNow !== null
+                  ? (v: number) => `${formatBytes(v)} (${((100 * v) / memNow.total).toFixed(0)}%)`
+                  : undefined
+              }
+              rightAxisFormat={
+                memNow !== null
+                  ? (v: number) => `${((100 * v) / memNow.total).toFixed(0)}%`
+                  : undefined
+              }
             />
             <MetricChartCard
               title="Load average"
