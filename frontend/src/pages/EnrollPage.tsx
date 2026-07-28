@@ -538,7 +538,18 @@ function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
       </Button>
 
       <div className="min-w-0 max-w-full">
-        <CodeBlock code={runBlock} language="bash" showCopy title="Run on the host" />
+        {/* vesper: near-black surface with amber accents — the closest bundled
+            theme to the app's black-and-hazard-yellow identity; min-light is
+            its restrained light-mode counterpart. Any theme named here must
+            ALSO be registered in lib/shiki-slim.ts, or the block silently
+            renders as plain text. */}
+        <CodeBlock
+          code={runBlock}
+          language="bash"
+          showCopy
+          title="Run on the host"
+          themes={{ light: "min-light", dark: "vesper" }}
+        />
         <FieldDescription className="mt-1">
           Replace <code>&lt;agent-endpoint&gt;</code> with the address agents reach the
           control plane on — Argus cannot know its externally routable address.

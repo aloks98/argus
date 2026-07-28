@@ -20,13 +20,16 @@ let highlighter: Promise<HighlighterCore> | undefined;
 
 function load(): Promise<HighlighterCore> {
   highlighter ??= (async () => {
+    // Themes must match what call sites pass to CodeBlock's `themes` prop
+    // (EnrollPage passes min-light/vesper — chosen over CodeBlock's
+    // github-default pair to match the app's black/hazard-yellow identity).
     const [{ createHighlighterCore }, { createJavaScriptRegexEngine }, bash, light, dark] =
       await Promise.all([
         import("shiki/core"),
         import("shiki/engine/javascript"),
         import("@shikijs/langs/bash"),
-        import("@shikijs/themes/github-light-default"),
-        import("@shikijs/themes/github-dark-default"),
+        import("@shikijs/themes/min-light"),
+        import("@shikijs/themes/vesper"),
       ]);
     return createHighlighterCore({
       langs: [bash.default],
