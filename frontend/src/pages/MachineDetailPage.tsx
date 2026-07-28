@@ -316,17 +316,19 @@ export default function MachineDetailPage() {
       {/* Identity editing lives in a Dialog rather than inline on the page
           (Task 8 fix round 1) — LogDialog is the in-repo precedent for a
           Dialog whose content depends on this page's own state/params.
-          `MachineIdentity` itself is unchanged by this; only its host is —
-          `onSaved` is the one seam added so the dialog can close itself on a
-          successful PATCH, while staying open on a validation/server error
-          so the Alert inside it is visible. */}
+          `MachineIdentity` itself is otherwise unchanged by this; only its
+          host is — `onSaved` is the one seam added so the dialog can close
+          itself on a successful PATCH, while staying open on a validation/
+          server error so the Alert inside it is visible.
+
+          The dialog owns the ONE heading (Task 8 fix round 2): `MachineIdentity`
+          no longer renders its own Card/CardHeader — nesting a bordered Card
+          inside DialogContent's own bordered popup rendered as a visible
+          double border, and two headings ("Identity" from the Card, an
+          sr-only one here) was one too many anyway. */}
       <Dialog open={editOpen} onOpenChange={setEditOpen}>
         <DialogContent className="sm:max-w-lg">
-          {/* sr-only: MachineIdentity's own CardTitle/CardDescription
-              ("Identity" / "Rename, tag, and annotate this machine.") are
-              the visible header — this pair exists only so the Dialog has
-              an accessible name, without printing that same text twice. */}
-          <DialogHeader className="sr-only">
+          <DialogHeader>
             <DialogTitle>Edit identity</DialogTitle>
             <DialogDescription>Rename, tag, and annotate this machine.</DialogDescription>
           </DialogHeader>

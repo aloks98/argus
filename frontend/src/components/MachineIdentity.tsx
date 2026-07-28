@@ -21,11 +21,6 @@ import {
   AutocompleteList,
   Badge,
   Button,
-  Card,
-  CardContent,
-  CardDescription,
-  CardHeader,
-  CardTitle,
   Field,
   FieldDescription,
   FieldError,
@@ -107,102 +102,101 @@ export default function MachineIdentity({
   };
 
   return (
-    <Card>
-      <CardHeader>
-        <CardTitle>Identity</CardTitle>
-        <CardDescription>Rename, tag, and annotate this machine.</CardDescription>
-      </CardHeader>
-      <CardContent>
-        {mutation.error !== null && (
-          <Alert variant="destructive" className="mb-4">
-            <AlertTitle>Update failed</AlertTitle>
-            <AlertDescription>{mutation.error.message}</AlertDescription>
-          </Alert>
-        )}
+    // No Card here — this component is dialog-only (MachineDetailPage.tsx
+    // mounts it inside DialogContent, which already supplies the frame and
+    // the visible heading via DialogTitle/DialogDescription). A Card wrapper
+    // previously nested its own border inside the dialog's, rendering as a
+    // visible double border.
+    <>
+      {mutation.error !== null && (
+        <Alert variant="destructive" className="mb-4">
+          <AlertTitle>Update failed</AlertTitle>
+          <AlertDescription>{mutation.error.message}</AlertDescription>
+        </Alert>
+      )}
 
-        {/* `noValidate`: without it the browser's own bubble validation
-            fires first and FieldError never gets a chance to render — see
-            SignIn.tsx's LocalSignInForm for the same note. */}
-        <form
-          noValidate
-          onSubmit={form.handleSubmit(onSubmit)}
-          className="flex flex-col gap-4"
-        >
-          <FieldGroup>
-            <Controller
-              name="display_name"
-              control={form.control}
-              render={({ field, fieldState }) => (
-                <Field data-invalid={fieldState.invalid}>
-                  <FieldLabel htmlFor="identity-display-name">Display name</FieldLabel>
-                  <Input
-                    {...field}
-                    id="identity-display-name"
-                    placeholder={machine.hostname}
-                    aria-invalid={fieldState.invalid}
-                  />
-                  <FieldDescription>
-                    Leave blank to fall back to the hostname ({machine.hostname}).
-                  </FieldDescription>
-                  {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
-                </Field>
-              )}
-            />
+      {/* `noValidate`: without it the browser's own bubble validation
+          fires first and FieldError never gets a chance to render — see
+          SignIn.tsx's LocalSignInForm for the same note. */}
+      <form
+        noValidate
+        onSubmit={form.handleSubmit(onSubmit)}
+        className="flex flex-col gap-4"
+      >
+        <FieldGroup>
+          <Controller
+            name="display_name"
+            control={form.control}
+            render={({ field, fieldState }) => (
+              <Field data-invalid={fieldState.invalid}>
+                <FieldLabel htmlFor="identity-display-name">Display name</FieldLabel>
+                <Input
+                  {...field}
+                  id="identity-display-name"
+                  placeholder={machine.hostname}
+                  aria-invalid={fieldState.invalid}
+                />
+                <FieldDescription>
+                  Leave blank to fall back to the hostname ({machine.hostname}).
+                </FieldDescription>
+                {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+              </Field>
+            )}
+          />
 
-            <Controller
-              name="tags"
-              control={form.control}
-              render={({ field, fieldState }) => (
-                <Field data-invalid={fieldState.invalid}>
-                  <FieldLabel htmlFor="identity-tags">Tags</FieldLabel>
-                  <TagsField
-                    id="identity-tags"
-                    value={field.value}
-                    onChange={field.onChange}
-                    suggestions={suggestions}
-                    invalid={fieldState.invalid}
-                  />
-                  <FieldDescription>
-                    {field.value.length}/16. Type a tag and press Enter, or pick a suggestion.
-                  </FieldDescription>
-                  {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
-                </Field>
-              )}
-            />
+          <Controller
+            name="tags"
+            control={form.control}
+            render={({ field, fieldState }) => (
+              <Field data-invalid={fieldState.invalid}>
+                <FieldLabel htmlFor="identity-tags">Tags</FieldLabel>
+                <TagsField
+                  id="identity-tags"
+                  value={field.value}
+                  onChange={field.onChange}
+                  suggestions={suggestions}
+                  invalid={fieldState.invalid}
+                />
+                <FieldDescription>
+                  {field.value.length}/16. Type a tag and press Enter, or pick a suggestion.
+                </FieldDescription>
+                {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+              </Field>
+            )}
+          />
 
-            <Controller
-              name="notes"
-              control={form.control}
-              render={({ field, fieldState }) => (
-                <Field data-invalid={fieldState.invalid}>
-                  <FieldLabel htmlFor="identity-notes">Notes</FieldLabel>
-                  <Textarea
-                    {...field}
-                    id="identity-notes"
-                    rows={4}
-                    aria-invalid={fieldState.invalid}
-                  />
-                  {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
-                </Field>
-              )}
-            />
-          </FieldGroup>
+          <Controller
+            name="notes"
+            control={form.control}
+            render={({ field, fieldState }) => (
+              <Field data-invalid={fieldState.invalid}>
+                <FieldLabel htmlFor="identity-notes">Notes</FieldLabel>
+                <Textarea
+                  {...field}
+                  id="identity-notes"
+                  rows={4}
+                  aria-invalid={fieldState.invalid}
+                />
+                {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+              </Field>
+            )}
+          />
+        </FieldGroup>
 
-          <div className="flex justify-end">
-            <Button type="submit" disabled={mutation.isPending}>
-              {mutation.isPending ? (
-                <>
-                  <Spinner className="size-3.5" />
-                  Saving…
-                </>
-              ) : (
-                "Save"
-              )}
-            </Button>
-          </div>
-        </form>
-      </CardContent>
-    </Card>
+        <div className="flex justify-end">
+          <Button type="submit" disabled={mutation.isPending}>
+            {mutation.isPending ? (
+              <>
+                <Spinner className="size-3.5" />
+                Saving…
+              </>
+            ) : (
+              "Save"
+            )}
+          </Button>
+        </div>
+      </form>
+    </>
   );
 }
 
