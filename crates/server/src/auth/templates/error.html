@@ -1,0 +1,66 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{heading}} — Argus</title>
+<style>
+  /* These are the tokens frontend/src/index.css defines -- --background,
+     --foreground, --muted-foreground, --border, --primary, --destructive --
+     inlined rather than imported, because this page is reached by a top-level
+     navigation mid-redirect and the React bundle is not in play. The
+     prefers-color-scheme block mirrors the app's .dark values so the page does
+     not flash white on a product that is dark by default.
+
+     Nothing is rounded on purpose: the app sets --radius: 0rem and square
+     corners are the identity.
+
+     Deliberately no ARGUS wordmark. The app sets it in Archivo Black, and this
+     page cannot have that face without also serving font files to
+     unauthenticated callers -- so it would render in a substitute and read as
+     subtly wrong every time. A mark that is almost right is worse than none. */
+  :root {
+    --bg: #FFFFFF; --fg: #0A0A0B; --muted: #6B6B70;
+    --border: #D4D4D8; --alert: #FF1744;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root {
+      --bg: #000000; --fg: #F5F5F5; --muted: #8A8A8A;
+      --border: #242424; --alert: #FF1744;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; min-height: 100vh; display: flex; flex-direction: column;
+    align-items: center; justify-content: center; gap: 1.5rem; padding: 1.5rem;
+    background: var(--bg); color: var(--fg);
+    font-family: ui-monospace, "IBM Plex Mono", SFMono-Regular, Menlo, monospace;
+  }
+  .panel {
+    width: 100%; max-width: 24rem; border: 1px solid var(--border);
+    border-left: 3px solid var(--alert); padding: 1rem 1.25rem;
+  }
+  h1 {
+    margin: 0 0 0.5rem; font-size: 0.6875rem; font-weight: 600;
+    text-transform: uppercase; letter-spacing: 0.16em; color: var(--alert);
+  }
+  p { margin: 0; font-size: 0.8125rem; line-height: 1.5; }
+  nav { display: flex; gap: 1.25rem; }
+  a {
+    color: var(--muted); font-size: 0.6875rem; text-transform: uppercase;
+    letter-spacing: 0.16em; text-decoration: none; text-underline-offset: 2px;
+  }
+  a:hover { color: var(--fg); text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="panel">
+<h1>{{heading}}</h1>
+<p>{{message}}</p>
+</div>
+<nav>
+<a href="/auth/login">Try again</a>
+<a href="/">Back to sign-in</a>
+</nav>
+</body>
+</html>

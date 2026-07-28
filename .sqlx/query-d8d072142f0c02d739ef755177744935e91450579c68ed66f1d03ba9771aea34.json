@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO local_admin (id, username, password_hash) VALUES (false, 'other', 'y')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "d8d072142f0c02d739ef755177744935e91450579c68ed66f1d03ba9771aea34"
+}

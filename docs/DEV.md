@@ -1084,3 +1084,199 @@ Fill in an "Observed" note per row (or add a new dated verification section
 below this one, matching the pattern used elsewhere in this file) once a
 maintainer runs these against the real provider — do not edit this table to
 claim a result that wasn't measured.
+
+## Local admin (break-glass) — dev setup + live verification (2026-07-26)
+
+Design of record: `docs/superpowers/specs/2026-07-26-local-admin-design.md`.
+This is the recovery path for the OIDC slice above: the boot rule becomes
+"OIDC is configured **or** a local admin row exists" (design §4), so a lost
+client secret, a deleted IdP application, or a from-scratch deployment with no
+IdP at all no longer means the control plane refuses to start.
+
+### The CLI: `argus local-admin reset`
+
+```
+$ ARGUS_DATABASE_URL='postgres://postgres:argus@localhost:5432/argus' \
+    ./target/debug/argus local-admin reset
+Local admin created.
+
+  username: admin
+  password: <24 random characters>
+
+This password is shown ONCE and is not recoverable. Store it now.
+Run this command again to issue a new one.
+```
+
+- Reads **only `ARGUS_DATABASE_URL`**, not the full `Config::from_env` — it
+  deliberately does not require the OIDC variables, `ARGUS_FIELD_KEY`, or
+  `ARGUS_PUBLIC_URL`, because a recovery command that needs the configuration
+  that broke is not a recovery command (design §5.1). It works with the
+  server **stopped**, connecting to Postgres directly.
+- The password is **always generated** (24 chars, crypto-secure RNG), never
+  chosen, and is printed **once**. There is no "set this specific password"
+  path and no way to display it again — rerunning the command issues a new
+  one and immediately invalidates the old one (single-row table, `upsert`).
+- The same generate-hash-store routine backs the in-app rotation control
+  (`POST /api/local-admin/rotate`, authenticated, reachable while signed in by
+  either method) — there is exactly one implementation of "rotate", not two
+  that could drift.
+- There is deliberately **no unauthenticated setup page**: a page that can
+  create an admin whenever the table is empty is a takeover vector the moment
+  it re-arms, and it re-arms exactly when a restore-from-backup or a botched
+  migration would also leave the table empty (design §5.3). The CLI is the
+  only way to populate the table from a "nobody can sign in" state.
+
+### The boot rule
+
+`auth_is_configured` (`crates/server/src/main.rs`) refuses to boot only when
+**both** are missing: no `ARGUS_OIDC_*` config **and** no `local_admin` row.
+Either one alone is enough to start. The refusal names the fix:
+
+```
+Error: no authentication is configured: set the OIDC variables, or create a local admin with `argus local-admin reset`
+```
+
+### In-app rotation provisions the credential, not only rotates it
+
+`POST /api/local-admin/rotate` (authenticated, reachable while signed in by
+either method) calls `reset_local_admin` — the same function the CLI calls —
+and that function does not require a `local_admin` row to already exist: when
+the table is empty, rotation *creates* the account (falling back to username
+`admin`) and hands the caller its password, same as if it had rotated an
+existing one.
+
+In an OIDC-only deployment, that means any signed-in user can mint a
+break-glass local credential that did not exist before — and the resulting
+password keeps working after that user is removed from the identity provider,
+through a path the IdP cannot revoke. This is accepted behaviour (design
+§15), not a defect: the action is authenticated and audited
+(`local_admin.rotate` names the actor via `Actor::User`), and it is no worse
+in kind than rotating an existing row. `local_admin.rotate` in the audit log,
+plus `last_login_at`, are how you detect its use.
+
+### Signing in with no identity provider configured at all
+
+Unlike OIDC, `POST /auth/local` is a plain JSON endpoint — no browser redirect
+dance, so `curl` exercises the whole feature:
+
+```bash
+curl -c cookies.txt -X POST http://127.0.0.1:8080/auth/local \
+  -H 'Content-Type: application/json' \
+  -d '{"username":"admin","password":"<the generated password>"}'
+# 200 {"ok":true}, Set-Cookie: argus_session=...; HttpOnly; SameSite=Lax; Max-Age=43200
+```
+
+Success mints a session through the **same `create_session`/`argus_session`
+cookie** the OIDC callback uses, with `subject = "local:admin"` (the `local:`
+prefix can never collide with a provider's `sub`). `/api/me` and `/api/fleet`
+behave identically to an OIDC-sourced session — there is no second session
+concept, and the browser surface's `require_auth` middleware, expiry, and
+logout all work unchanged.
+
+**In the browser**, the same credentials go in via `frontend/src/components/SignIn.tsx`:
+open the app, and beneath the SSO "Sign in" button there is a collapsed **"Use
+a local account"** disclosure — click it to reveal the username/password
+fields, then submit the credentials from the `argus local-admin reset` output
+above. This is
+deliberately not the first thing on the page (SSO stays primary, design §12),
+so during a real incident it is easy to glance at the sign-in screen, see only
+the SSO button, and assume the recovery path isn't there — it is, one click
+down. A live click-through of this exact form (not just the `curl` equivalent
+above) is still worth doing once, the same way the OIDC section above has
+rows it flags as not yet run against a real browser — **not done in this
+pass**; everything measured in this task went through `curl` only.
+
+### CA rotation gotcha applies here too
+
+Same rotation as the OIDC section above ("CA rotation gotcha applies here
+too" / "Two operational gotchas") — `cargo test --workspace -- --ignored`
+deletes and regenerates `ca_material`, orphaning any enrolled agent. Nothing
+about the local-admin slice changes that; it is not a new gotcha, just the
+same one hit again by the same gate run.
+
+### Full gate run (2026-07-26)
+
+Run against the dev Postgres (`argus-pg`), on the `local-admin-slice` branch:
+
+```
+$ npm --prefix frontend run build            # exit 0
+$ cargo fmt --all --check                    # exit 0, clean
+$ SQLX_OFFLINE=true cargo clippy --workspace --all-targets -- -D warnings   # exit 0, clean
+$ cargo sqlx prepare --workspace --check -- --all-targets                  # exit 0, clean (no query changes this task)
+$ cargo test --workspace
+  argus-agent:   64 passed, 0 failed, 10 ignored
+  argus-common:   0 passed, 0 failed,  0 ignored
+  argus-proto:    0 passed, 0 failed,  0 ignored
+  argus-server:  172 passed, 0 failed,  6 ignored
+  tests/local_admin_cli.rs (integration): 1 passed, 0 failed
+$ cargo test --workspace -- --ignored --skip live_
+  argus-server: 6 passed, 0 failed (includes ca::tests::load_or_init_persists_and_reloads_the_same_ca —
+                                     deletes + regenerates ca_material, see the gotcha below)
+  argus-agent/argus-common/argus-proto: 0 run (same as the OIDC pass — the agent's ignored set is
+                                                entirely live_-prefixed and filtered out)
+```
+
+All gates clean. The pre-existing `npm run build` chunk-size warning
+(`index-*.js` now 1,259.80 kB / gzip 382.95 kB, over the 750 kB
+`build.chunkSizeWarningLimit`) is unchanged in kind from the OIDC pass above —
+slightly larger from this task's added auth UI, still a warning not a
+failure.
+
+### Live verification (design §14) — 2026-07-26
+
+Run in order, server stopped between the CLI step and boot, against the dev
+Postgres (`argus-pg`):
+
+1. **`argus local-admin reset`** — created `admin` / a 24-char generated
+   password, printed once, as shown above.
+2. **Booted with every `ARGUS_OIDC_*` variable unset** (`env -u
+   ARGUS_OIDC_ISSUER -u ARGUS_OIDC_CLIENT_ID -u ARGUS_OIDC_CLIENT_SECRET -u
+   ARGUS_OIDC_REQUIRED_ROLE -u ARGUS_OIDC_ROLES_CLAIM -u ARGUS_OIDC_SCOPES -u
+   ARGUS_OIDC_CA_CERT`) — **PASS.** Log: `starting argus control plane` →
+   `migrations applied` → `browser HTTP surface listening` /
+   `agent gRPC surface listening`. No OIDC-related log line at all — this is
+   a deployment with no identity provider configured, full stop.
+3. **`curl -X POST /auth/local`** with the generated credentials — **PASS.**
+   `200 {"ok":true}`, `Set-Cookie: argus_session=...; HttpOnly; SameSite=Lax;
+   Path=/; Max-Age=43200`.
+4. **That cookie against `/api/me` and `/api/fleet`** — **PASS.** `/api/me` →
+   `200 {"display_name":"Local admin","email":null,"subject":"local:admin"}`;
+   `/api/fleet` → `200` with the normal machine list (one machine, `offline`)
+   — an ordinary session, indistinguishable from an OIDC one to the
+   middleware.
+5. **Audit row** —
+   `SELECT actor, action, result, detail FROM audit_log WHERE action LIKE 'auth.%' ORDER BY id DESC LIMIT 3`
+   — **PASS.** Freshest row: `local:admin | auth.login | ok | {"method":
+   "local"}`. (The two rows beneath it were pre-existing `auth.denied` entries
+   from earlier manual testing that pre-dates this run, not from this
+   sequence — included here because the query is a plain `LIMIT 3`.)
+6. **Rotation invalidates the previous password** — **PASS.** Rotated via the
+   authenticated `POST /api/local-admin/rotate` (not the CLI, to exercise the
+   in-app path too) while signed in with the session from step 3; retried
+   `/auth/local` with the *old* password → `401
+   {"error":"invalid username or password"}`; retried with the *new* password
+   → `200 {"ok":true}`.
+7. **Boot refuses with `local_admin` empty and OIDC unset, naming the CLI** —
+   **PASS.** `DELETE FROM local_admin;` (0 rows left), then ran the compiled
+   binary directly (`./target/debug/argus`, same env as step 2) — exited
+   `1` immediately after `migrations applied`, before touching the CA or
+   opening either listener, with:
+   `Error: no authentication is configured: set the OIDC variables, or create a local admin with \`argus local-admin reset\``.
+   One tooling wrinkle, not a product finding: driving this same check through
+   `cargo run -p argus-server` piped into `tail` hung past a 2-minute timeout
+   instead of exiting — invoking the already-built binary directly gave the
+   clean, immediate exit above, so that's what's recorded as the measured
+   result.
+
+All seven steps passed. A local admin row was recreated at the end (a fresh
+`argus local-admin reset`) so the environment was left with a working
+break-glass credential rather than the empty table step 7 requires.
+
+**Environment left running after this pass:** the control plane restarted on
+`:8080` with every `ARGUS_OIDC_*` variable unset (same as step 2, `ca_material`
+reloaded — "loaded existing CA from ca_material" — rather than regenerated,
+since step 2's boot already did that regeneration once and step 7 never
+touched `ca_material` again); the vite dev server on `:5173` was never
+stopped. The dev agent enrolled before this task remains orphaned by the
+`--ignored` gate's CA rotation (see above) and needs re-enrolling before any
+agent-facing check.

@@ -40,13 +40,25 @@ use uuid::Uuid;
 pub struct AppState {
     pub pool: PgPool,
     pub hub: Arc<Hub>,
-    pub oidc: Arc<crate::config::OidcConfig>,
+    /// `None` when OIDC is not configured (local-admin design §4) -- a valid,
+    /// boot-succeeding state. `/auth/login` and `/auth/callback` degrade to a
+    /// 404 rather than unwrap it.
+    pub oidc: Option<Arc<crate::config::OidcConfig>>,
     pub cipher: Arc<crate::crypto::FieldCipher>,
-    pub oidc_client: Arc<crate::auth::oidc::OidcClient>,
+    pub oidc_client: Option<Arc<crate::auth::oidc::OidcClient>>,
+    /// `Config.public_url`, carried independently of `oidc` so the session
+    /// cookie's `Secure` attribute can be decided with no OIDC config present
+    /// at all -- a local login sets a cookie in exactly that state
+    /// (local-admin design §4).
+    pub public_url: String,
+    /// Guards `POST /auth/local` (local-admin design §10). One instance for
+    /// the process's lifetime, shared via this `Arc` clone across every
+    /// request -- a per-request limiter would limit nothing.
+    pub limiter: Arc<crate::auth::ratelimit::LoginLimiter>,
 }
 
 pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
-    let oidc = Arc::new(cfg.oidc.clone());
+    let oidc = cfg.oidc.clone().map(Arc::new);
     let cipher = Arc::new(
         crate::crypto::FieldCipher::from_b64_key(&cfg.field_key_b64)
             .context("building the field cipher for the OIDC flow cookie")?,
@@ -54,9 +66,14 @@ pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
     // Building this is local-only (an HTTP client + an optional local CA cert
     // read); discovery itself happens lazily on first login, never here, so a
     // down IdP at boot cannot delay the agent gRPC surface or health checks.
-    let oidc_client = Arc::new(
-        crate::auth::oidc::OidcClient::new(oidc.clone()).context("building the OIDC client")?,
-    );
+    // Only built when OIDC is configured at all -- otherwise there is no
+    // provider to build a client against.
+    let oidc_client = oidc
+        .clone()
+        .map(crate::auth::oidc::OidcClient::new)
+        .transpose()
+        .context("building the OIDC client")?
+        .map(Arc::new);
 
     let app = router(AppState {
         pool,
@@ -64,6 +81,8 @@ pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
         oidc,
         cipher,
         oidc_client,
+        public_url: cfg.public_url.clone(),
+        limiter: Arc::new(crate::auth::ratelimit::LoginLimiter::new()),
     });
 
     let listener = tokio::net::TcpListener::bind(&cfg.http_addr).await?;
@@ -100,20 +119,27 @@ fn router(state: AppState) -> Router {
             "/api/machines/{id}/terminal",
             axum::routing::any(crate::terminal::terminal_ws),
         )
+        // `POST /api/local-admin/rotate` lives INSIDE this router deliberately
+        // (local-admin design §5.2): it must sit behind the same
+        // `require_auth` layer and `SameSite=Lax` cookie as every other verb,
+        // not under the public `/auth/*` prefix.
+        .route("/api/local-admin/rotate", post(crate::auth::local::rotate))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
             crate::auth::require_auth,
         ));
 
     // Public: infra endpoints (PRD §9.1 puts them outside OIDC), the OIDC flow
-    // itself, and the SPA bundle -- which must render the sign-in view BEFORE
-    // any session exists. The bundle is an empty shell; all data is behind /api.
+    // itself, the local-admin login, and the SPA bundle -- which must render
+    // the sign-in view BEFORE any session exists. The bundle is an empty
+    // shell; all data is behind /api.
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
         .route("/auth/login", get(crate::auth::oidc::login))
         .route("/auth/callback", get(crate::auth::oidc::callback))
         .route("/auth/logout", post(crate::auth::oidc::logout))
+        .route("/auth/local", post(crate::auth::local::login))
         .merge(api)
         .fallback(static_handler)
         .layer(TraceLayer::new_for_http())
@@ -2554,14 +2580,16 @@ mod tests {
         AppState {
             pool,
             hub: Arc::new(Hub::default()),
-            oidc,
+            oidc: Some(oidc),
             cipher: Arc::new(
                 crate::crypto::FieldCipher::from_b64_key(
                     &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
                 )
                 .expect("build test field cipher"),
             ),
-            oidc_client,
+            oidc_client: Some(oidc_client),
+            public_url: "http://localhost:8080".into(),
+            limiter: Arc::new(crate::auth::ratelimit::LoginLimiter::new()),
         }
     }
 
@@ -2739,6 +2767,334 @@ mod tests {
         let me: serde_json::Value = serde_json::from_slice(&body)?;
         assert_eq!(me["subject"], "sub-9");
         assert_eq!(me["email"], "op@example.com");
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn local_login_rejects_bad_credentials_without_setting_a_cookie(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let hash = crate::auth::password::hash_password("the-real-one")?;
+        repo::upsert_local_admin(&pool, "admin", &hash).await?;
+
+        let res = router(test_state(pool.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/local")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"wrong"}"#))?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(
+            res.headers().get("set-cookie").is_none(),
+            "a failed login must not set a session cookie"
+        );
+
+        // CLAUDE.md: every verb goes through the audit log from the start.
+        // Design §9 requires `method` on the row explicitly, not merely "some
+        // audit row got written".
+        let audited =
+            sqlx::query!("SELECT result, detail FROM audit_log WHERE action = 'auth.denied'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(audited.result.as_deref(), Some("denied"));
+        assert_eq!(audited.detail, serde_json::json!({ "method": "local" }));
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn local_login_with_correct_credentials_sets_a_working_session(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let hash = crate::auth::password::hash_password("the-real-one")?;
+        repo::upsert_local_admin(&pool, "admin", &hash).await?;
+        let app = router(test_state(pool.clone()));
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/local")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        r#"{"username":"admin","password":"the-real-one"}"#,
+                    ))?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let cookie = res
+            .headers()
+            .get("set-cookie")
+            .expect("session cookie")
+            .to_str()?
+            .to_string();
+        assert!(
+            cookie.contains("HttpOnly"),
+            "session cookie must be HttpOnly"
+        );
+
+        // The session must resolve through the SAME middleware OIDC sessions use.
+        let me = app
+            .oneshot(
+                Request::builder()
+                    .uri("/api/me")
+                    .header("cookie", cookie.split(';').next().unwrap())
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(me.status(), StatusCode::OK);
+        let me_body = axum::body::to_bytes(me.into_body(), 64 * 1024).await?;
+        let me_json: serde_json::Value = serde_json::from_slice(&me_body)?;
+        // Design §8: the `local:` prefix namespaces the subject so it can
+        // never collide with a provider's `sub`. Nothing else asserts this --
+        // pin it so a future refactor that drops or reshapes the prefix
+        // fails here instead of silently opening a collision path.
+        assert_eq!(me_json["subject"], "local:admin");
+
+        // CLAUDE.md: every verb goes through the audit log from the start,
+        // and design §9 requires `method` be explicit on the row -- nothing
+        // else would notice it silently vanishing.
+        let audited =
+            sqlx::query!("SELECT result, detail FROM audit_log WHERE action = 'auth.login'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(audited.result.as_deref(), Some("ok"));
+        assert_eq!(audited.detail, serde_json::json!({ "method": "local" }));
+        Ok(())
+    }
+
+    /// No admin configured must be indistinguishable from a wrong password.
+    #[sqlx::test]
+    async fn local_login_with_no_admin_configured_returns_the_same_failure(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let res = router(test_state(pool.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/local")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"anything"}"#))?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        assert!(res.headers().get("set-cookie").is_none());
+        Ok(())
+    }
+
+    /// Same failure across all three reasons: wrong password, wrong username
+    /// (a row exists, but the caller names a different one), and no admin
+    /// configured at all. Pins body AND status as byte-identical, not merely
+    /// "some 401" -- design §11's whole point is that these three cases must
+    /// be indistinguishable to the caller.
+    #[sqlx::test]
+    async fn local_login_failure_response_is_identical_across_all_three_reasons(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        async fn body_and_status(
+            app: Router,
+            payload: &str,
+        ) -> anyhow::Result<(StatusCode, Vec<u8>)> {
+            let res = app
+                .oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/auth/local")
+                        .header("content-type", "application/json")
+                        .body(Body::from(payload.to_string()))?,
+                )
+                .await?;
+            let status = res.status();
+            let body = to_bytes(res.into_body(), usize::MAX).await?.to_vec();
+            Ok((status, body))
+        }
+
+        // Case 1: no admin row exists at all.
+        let (status_no_admin, body_no_admin) = body_and_status(
+            router(test_state(pool.clone())),
+            r#"{"username":"admin","password":"whatever"}"#,
+        )
+        .await?;
+
+        let hash = crate::auth::password::hash_password("the-real-one")?;
+        repo::upsert_local_admin(&pool, "admin", &hash).await?;
+
+        // Case 2: a row exists, but the password is wrong.
+        let (status_wrong_password, body_wrong_password) = body_and_status(
+            router(test_state(pool.clone())),
+            r#"{"username":"admin","password":"wrong"}"#,
+        )
+        .await?;
+
+        // Case 3: a row exists, but the username is wrong.
+        let (status_wrong_username, body_wrong_username) = body_and_status(
+            router(test_state(pool.clone())),
+            r#"{"username":"root","password":"the-real-one"}"#,
+        )
+        .await?;
+
+        assert_eq!(status_no_admin, StatusCode::UNAUTHORIZED);
+        assert_eq!(status_no_admin, status_wrong_password);
+        assert_eq!(status_no_admin, status_wrong_username);
+        assert_eq!(
+            body_no_admin, body_wrong_password,
+            "no-admin-configured and wrong-password bodies must be byte-identical"
+        );
+        assert_eq!(
+            body_no_admin, body_wrong_username,
+            "no-admin-configured and wrong-username bodies must be byte-identical"
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn local_login_returns_429_with_retry_after_before_touching_the_database(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let state = test_state(pool);
+        // Exhaust the burst directly against the limiter -- no admin row is
+        // ever created, so if the handler queried the database on this path
+        // it would 401 (or 500, absent a row/table setup), never 429. `check`
+        // itself reserves the slot it grants (the concurrency fix), so
+        // calling it alone -- with no separate `record_failure` -- is enough
+        // to spend the whole burst.
+        let now = std::time::Instant::now();
+        for _ in 0..(crate::auth::ratelimit::BURST + 1) {
+            state.limiter.check(now);
+        }
+        let app = router(state);
+
+        let res = app
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/local")
+                    .header("content-type", "application/json")
+                    .body(Body::from(r#"{"username":"admin","password":"x"}"#))?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::TOO_MANY_REQUESTS);
+        assert!(
+            res.headers().get("retry-after").is_some(),
+            "a 429 must carry Retry-After"
+        );
+        Ok(())
+    }
+
+    /// The concurrency bug this fix round exists for, proven at the real
+    /// router: fire far more than `BURST` requests at `/auth/local`
+    /// SIMULTANEOUSLY (no admin row configured, so every one of them takes
+    /// the real, ~100ms argon2 dummy-hash path -- giving the verifies actual
+    /// overlapping wall-clock time to race in). Under the old
+    /// check-then-record-failure-later design, every one of them would read
+    /// "under budget" before any recorded itself, so all would pass and none
+    /// would ever see a 429. With the reservation folded into `check`, at
+    /// most `BURST` may ever be admitted regardless of how they interleave.
+    #[sqlx::test]
+    async fn concurrent_local_logins_cannot_collectively_exceed_the_burst(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        let app = router(test_state(pool));
+        let total = crate::auth::ratelimit::BURST + 15;
+
+        let mut set = tokio::task::JoinSet::new();
+        for _ in 0..total {
+            let app = app.clone();
+            set.spawn(async move {
+                app.oneshot(
+                    Request::builder()
+                        .method("POST")
+                        .uri("/auth/local")
+                        .header("content-type", "application/json")
+                        .body(Body::from(r#"{"username":"admin","password":"x"}"#))
+                        .expect("request"),
+                )
+                .await
+                .expect("router call")
+                .status()
+            });
+        }
+
+        let mut unauthorized = 0u32;
+        let mut too_many = 0u32;
+        while let Some(res) = set.join_next().await {
+            match res? {
+                StatusCode::UNAUTHORIZED => unauthorized += 1,
+                StatusCode::TOO_MANY_REQUESTS => too_many += 1,
+                other => panic!("unexpected status {other} from a concurrent local login"),
+            }
+        }
+
+        assert_eq!(
+            unauthorized,
+            crate::auth::ratelimit::BURST,
+            "concurrency must not let more than BURST requests past the limiter"
+        );
+        assert_eq!(too_many, total - crate::auth::ratelimit::BURST);
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn local_admin_rotate_requires_auth_and_issues_a_new_password(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        // A NON-default username: a hardcoded `reset_local_admin(&pool, "admin")`
+        // -- the exact shortcut `rotate` deliberately avoids -- would pass a
+        // test seeded with "admin" identically to the real username-preserving
+        // implementation. Only a non-default seed can tell the two apart.
+        let hash = crate::auth::password::hash_password("original")?;
+        repo::upsert_local_admin(&pool, "breakglass", &hash).await?;
+
+        // No session: must not rotate anything.
+        let res = router(test_state(pool.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/local-admin/rotate")
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+
+        let cookie = auth_cookie(&pool).await?;
+        let res = router(test_state(pool.clone()))
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/local-admin/rotate")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)?;
+        let new_password = v["password"].as_str().expect("password field").to_string();
+        assert_ne!(new_password, "original");
+
+        let row = repo::get_local_admin(&pool)
+            .await?
+            .expect("row still present");
+        assert_eq!(
+            row.username, "breakglass",
+            "rotate must not rename the account"
+        );
+        assert!(crate::auth::password::verify_password(
+            &new_password,
+            &row.password_hash
+        ));
+
+        let audited =
+            sqlx::query!("SELECT result FROM audit_log WHERE action = 'local_admin.rotate'")
+                .fetch_one(&pool)
+                .await?;
+        assert_eq!(audited.result.as_deref(), Some("ok"));
+
         Ok(())
     }
 }

@@ -653,6 +653,57 @@ pub async fn delete_expired_sessions(pool: &PgPool) -> Result<u64> {
     Ok(r.rows_affected())
 }
 
+// The local-admin break-glass credential (design §6). `local_admin_exists` is
+// wired to the boot rule (`main.rs`); `upsert_local_admin` is wired to the CLI
+// (`argus local-admin reset`, via `auth::local::reset_local_admin`);
+// `get_local_admin`/`LocalAdmin`/`touch_local_admin_login` are wired to
+// `POST /auth/local` (`auth::local::login`).
+pub struct LocalAdmin {
+    pub username: String,
+    pub password_hash: String,
+}
+
+pub async fn get_local_admin(pool: &PgPool) -> Result<Option<LocalAdmin>> {
+    let row = sqlx::query!("SELECT username, password_hash FROM local_admin WHERE id = true")
+        .fetch_optional(pool)
+        .await?;
+    Ok(row.map(|r| LocalAdmin {
+        username: r.username,
+        password_hash: r.password_hash,
+    }))
+}
+
+/// Create or rotate. `ON CONFLICT` on the single-row primary key makes this an
+/// in-place rotation rather than an accumulation of credentials.
+pub async fn upsert_local_admin(pool: &PgPool, username: &str, password_hash: &str) -> Result<()> {
+    sqlx::query!(
+        "INSERT INTO local_admin (id, username, password_hash) VALUES (true, $1, $2)
+         ON CONFLICT (id) DO UPDATE SET username = $1, password_hash = $2, updated_at = now()",
+        username,
+        password_hash,
+    )
+    .execute(pool)
+    .await?;
+    Ok(())
+}
+
+/// Used by the boot rule: the control plane may start without OIDC config only
+/// if this returns true.
+pub async fn local_admin_exists(pool: &PgPool) -> Result<bool> {
+    let n = sqlx::query_scalar!("SELECT count(*) FROM local_admin")
+        .fetch_one(pool)
+        .await?
+        .unwrap_or(0);
+    Ok(n > 0)
+}
+
+pub async fn touch_local_admin_login(pool: &PgPool) -> Result<()> {
+    sqlx::query!("UPDATE local_admin SET last_login_at = now() WHERE id = true")
+        .execute(pool)
+        .await?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1595,5 +1646,103 @@ mod tests {
         let m = Uuid::nil();
         assert_eq!(Actor::Agent(m).as_str(), m.to_string());
         assert_eq!(Actor::System.as_str(), "system");
+    }
+
+    #[sqlx::test]
+    async fn local_admin_round_trips_and_rotation_updates_the_hash(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        assert!(!local_admin_exists(&pool).await?, "starts absent");
+        assert!(get_local_admin(&pool).await?.is_none());
+
+        upsert_local_admin(&pool, "admin", "$argon2id$first").await?;
+        assert!(local_admin_exists(&pool).await?);
+        let a = get_local_admin(&pool).await?.expect("row");
+        assert_eq!(a.username, "admin");
+        assert_eq!(a.password_hash, "$argon2id$first");
+
+        let updated_at_after_first = sqlx::query_scalar!("SELECT updated_at FROM local_admin")
+            .fetch_one(&pool)
+            .await?;
+
+        // Rotation replaces the hash in place rather than adding a row, and
+        // design §14 requires `updated_at` to advance along with it -- not
+        // just the hash.
+        upsert_local_admin(&pool, "admin", "$argon2id$second").await?;
+        let b = get_local_admin(&pool).await?.expect("row");
+        assert_eq!(b.password_hash, "$argon2id$second");
+
+        let updated_at_after_second = sqlx::query_scalar!("SELECT updated_at FROM local_admin")
+            .fetch_one(&pool)
+            .await?;
+        assert!(
+            updated_at_after_second > updated_at_after_first,
+            "rotation must bump updated_at, not just the hash"
+        );
+
+        let count = sqlx::query_scalar!("SELECT count(*) FROM local_admin")
+            .fetch_one(&pool)
+            .await?
+            .unwrap_or(0);
+        assert_eq!(count, 1, "rotation must not create a second row");
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn a_second_local_admin_row_is_rejected_by_the_schema(
+        pool: PgPool,
+    ) -> anyhow::Result<()> {
+        upsert_local_admin(&pool, "admin", "$argon2id$x").await?;
+
+        // Bypass the repo helper to prove the SCHEMA enforces single-row, not
+        // just our upsert. Two different constraints are in play, and both
+        // need their own row to be proven:
+
+        // 1. `id = true` collides with the existing row's PRIMARY KEY. This
+        //    alone would be rejected even if `local_admin_single_row` (the
+        //    `check (id)` constraint) did not exist.
+        let same_id = sqlx::query!(
+            "INSERT INTO local_admin (id, username, password_hash) VALUES (true, 'other', 'y')"
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            same_id.is_err(),
+            "a second id = true row must collide on the primary key"
+        );
+
+        // 2. `id = false` is a DISTINCT primary key value, so the PK alone
+        //    permits it -- only `local_admin_single_row`'s `check (id)`
+        //    blocks it. This is the constraint's actual job: without it, a
+        //    row with id = false would sit in the table, invisible to
+        //    `get_local_admin` (which filters `WHERE id = true`), while
+        //    every other test in this file kept passing.
+        let other_id = sqlx::query!(
+            "INSERT INTO local_admin (id, username, password_hash) VALUES (false, 'other', 'y')"
+        )
+        .execute(&pool)
+        .await;
+        assert!(
+            other_id.is_err(),
+            "the check constraint must reject id = false"
+        );
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn touch_login_stamps_last_login_at(pool: PgPool) -> anyhow::Result<()> {
+        upsert_local_admin(&pool, "admin", "$argon2id$x").await?;
+        let before = sqlx::query_scalar!("SELECT last_login_at FROM local_admin")
+            .fetch_one(&pool)
+            .await?;
+        assert!(before.is_none(), "not stamped until a login happens");
+
+        touch_local_admin_login(&pool).await?;
+        let after = sqlx::query_scalar!("SELECT last_login_at FROM local_admin")
+            .fetch_one(&pool)
+            .await?;
+        assert!(after.is_some());
+        Ok(())
     }
 }

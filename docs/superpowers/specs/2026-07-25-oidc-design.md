@@ -100,7 +100,12 @@ providers need an extra scope before they will emit roles at all.
 
 ## 5. Configuration
 
-All of these are **required**; the control plane refuses to start without them.
+**Updated by the local-admin slice** (`2026-07-26-local-admin-design.md` §4):
+OIDC as a whole is now optional — the control plane boots if OIDC is configured
+*or* a local admin row exists. What follows describes the OIDC-specific
+variables themselves, which remain all-or-nothing whenever OIDC is used at
+all: either all four below are set, or none of them are, or the control plane
+refuses to start naming the missing one.
 
 | Variable | Meaning |
 |---|---|
@@ -108,7 +113,20 @@ All of these are **required**; the control plane refuses to start without them.
 | `ARGUS_OIDC_CLIENT_ID` | Client ID of the Argus app registration. |
 | `ARGUS_OIDC_CLIENT_SECRET` | Client secret (confidential client). |
 | `ARGUS_OIDC_REQUIRED_ROLE` | Role required for admission, or the literal `any`. |
-| `ARGUS_PUBLIC_URL` | Externally reachable base URL, e.g. `https://argus.lab.example.com` or `http://localhost:8080`. |
+
+`ARGUS_PUBLIC_URL` is **required unconditionally, independent of OIDC** — it now
+lives on `Config` rather than being one of the OIDC-specific variables above,
+because it also decides the session cookie's `Secure` attribute for *every*
+login method, local admin included (see §5.3 below and local-admin design §4).
+It still feeds into the all-or-nothing check above when OIDC is being
+configured at all: `Config::from_env` treats it as part of a complete OIDC
+config once any of the four OIDC-specific variables is set, so a half-set OIDC
+config (e.g. issuer set, secret forgotten) is still rejected rather than
+silently treated as absent.
+
+| Variable | Meaning |
+|---|---|
+| `ARGUS_PUBLIC_URL` | Externally reachable base URL, e.g. `https://argus.lab.example.com` or `http://localhost:8080`. Required in every deployment, OIDC or local-admin-only. |
 
 Optional:
 
@@ -125,11 +143,18 @@ product rather than a per-deployment knob, and the existing timeouts live there.
 ### 5.1 There is no "auth disabled" mode
 
 No bypass flag, no dev-only skip branch, no unauthenticated fallback. Missing
-configuration produces a server that **will not boot**, never one that silently
-serves a root shell. Local development authenticates against the real provider
-exactly as production does; the only accommodation is registering
-`http://localhost:8080/auth/callback` and `http://localhost:5173/auth/callback`
-as additional redirect URIs.
+*all* authentication configuration produces a server that **will not boot**,
+never one that silently serves a root shell. Local development authenticates
+against the real provider exactly as production does; the only accommodation
+is registering `http://localhost:8080/auth/callback` and
+`http://localhost:5173/auth/callback` as additional redirect URIs.
+
+**Updated by the local-admin slice:** the rule above was written as "OIDC must
+be configured", but what it actually guaranteed was "authentication must be
+configured" — stating it the first way was an overspecification. The
+local-admin design (§4) makes OIDC configuration optional, contingent on a
+local admin row existing instead; with neither present the server still
+refuses to boot, now naming the CLI command that creates one.
 
 ### 5.2 `ARGUS_OIDC_REQUIRED_ROLE=any` is explicit on purpose
 
@@ -150,6 +175,13 @@ deployment is reachable, not a toggle: it can weaken a cookie flag on localhost,
 and can never disable authentication. It also builds the `redirect_uri`, which
 must be exact — deriving it from `Host`/`X-Forwarded-Proto` headers means
 trusting values a client controls.
+
+**Updated by the local-admin slice:** this decision does not belong to `OidcConfig`
+any more, precisely because it is not OIDC-specific — a local admin login sets
+a session cookie in states where no `OidcConfig` exists at all. `ARGUS_PUBLIC_URL`
+now lives on `Config` (§5 above) and is read from there for the `Secure`
+attribute; `OidcConfig` keeps its own copy of the same value only to build
+`redirect_uri`.
 
 ## 6. Architecture
 

@@ -414,14 +414,16 @@ mod tests {
             AppState {
                 pool,
                 hub: hub.clone(),
-                oidc,
+                oidc: Some(oidc),
                 cipher: Arc::new(
                     crate::crypto::FieldCipher::from_b64_key(
                         &base64::engine::general_purpose::STANDARD.encode([9u8; 32]),
                     )
                     .expect("build test field cipher"),
                 ),
-                oidc_client,
+                oidc_client: Some(oidc_client),
+                public_url: "http://localhost:8080".into(),
+                limiter: Arc::new(crate::auth::ratelimit::LoginLimiter::new()),
             },
             hub,
         )
