@@ -109,6 +109,7 @@ ARGUS_JOIN_TOKEN=devtoken
 ARGUS_CA_CERT=/tmp/argus-ca.crt
 ARGUS_DATA_DIR=/tmp/argus-agent
 EOF
+chmod 600 /tmp/argus-agent.env
 
 cargo build -p argus-agent
 sudo -n ./target/debug/argus-agent --config /tmp/argus-agent.env

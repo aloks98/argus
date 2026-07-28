@@ -98,28 +98,11 @@ function toMintBody(values: MintFormValues): MintTokenBody {
 }
 
 export default function EnrollPage() {
-  return (
-    <>
-      <PageHeader
-        title="Enroll"
-        meta="Mint a join token so a new agent can enroll into the fleet."
-      />
-      <div className="flex flex-col gap-4">
-        <MintTokenSection />
-        <TokenTable />
-      </div>
-    </>
-  );
-}
-
-/**
- * Owns both dialogs and the one `useMintToken()` instance shared between
- * them — the mutation has to live above whichever dialog is currently
- * mounted so `mintMutation.data` survives the form dialog closing (its
- * content, `MintTokenForm`, unmounts on close — see the Dialog below) long
- * enough for the result dialog to read it.
- */
-function MintTokenSection() {
+  // Owns the one `useMintToken()` instance and both dialogs' open state at
+  // the page level — the "Mint a token" trigger lives in PageHeader's
+  // `actions` slot (browser-review: "move it into the header, far right"),
+  // a sibling of `MintDialogs` rather than a descendant, so nothing here can
+  // live inside a single subtree the way it used to.
   const mintMutation = useMintToken();
   const [mintOpen, setMintOpen] = useState(false);
   const [resultOpen, setResultOpen] = useState(false);
@@ -134,10 +117,51 @@ function MintTokenSection() {
 
   return (
     <>
-      <div>
-        <Button onClick={openMint}>Mint a token</Button>
+      <PageHeader
+        title="Enroll"
+        meta="Mint a join token so a new agent can enroll into the fleet."
+        actions={<Button onClick={openMint}>Mint a token</Button>}
+      />
+      <div className="flex flex-col gap-4">
+        <MintDialogs
+          mintMutation={mintMutation}
+          mintOpen={mintOpen}
+          setMintOpen={setMintOpen}
+          resultOpen={resultOpen}
+          setResultOpen={setResultOpen}
+        />
+        <TokenTable />
       </div>
+    </>
+  );
+}
 
+/**
+ * The two mint dialogs (form + result) only — the "Mint a token" trigger
+ * that used to open them from here now lives in PageHeader's actions slot.
+ * State (including the shared `useMintToken()` mutation) is owned by
+ * `EnrollPage` and threaded down as props so the header button and these
+ * dialogs — no longer in the same subtree — stay in sync without a portal.
+ * The mutation still has to live above whichever dialog is currently
+ * mounted so `mintMutation.data` survives the form dialog closing (its
+ * content, `MintTokenForm`, unmounts on close — see the Dialog below) long
+ * enough for the result dialog to read it.
+ */
+function MintDialogs({
+  mintMutation,
+  mintOpen,
+  setMintOpen,
+  resultOpen,
+  setResultOpen,
+}: {
+  mintMutation: ReturnType<typeof useMintToken>;
+  mintOpen: boolean;
+  setMintOpen: (open: boolean) => void;
+  resultOpen: boolean;
+  setResultOpen: (open: boolean) => void;
+}) {
+  return (
+    <>
       {/* Dialog 1: the mint form. A normal dismissable dialog (Escape,
           outside-click, and the built-in X all close it) — unlike the result
           dialog below, nothing here is destructive or shown only once.
@@ -207,6 +231,9 @@ function MintTokenSection() {
           {mintMutation.data && <ResultPanel data={mintMutation.data} />}
 
           <AlertDialogFooter>
+            {/* Must stay a plain Button, not AlertDialogCancel — that routes
+                through the `onOpenChange` guard above, which would cancel
+                Done's own close too (dead button). */}
             <Button onClick={() => setResultOpen(false)}>Done</Button>
           </AlertDialogFooter>
         </AlertDialogContent>
@@ -248,8 +275,8 @@ function MintTokenForm({
   };
 
   return (
-    // No Card here — this component is dialog-only (MintTokenSection mounts
-    // it inside DialogContent, which already supplies the frame and the
+    // No Card here — this component is dialog-only (MintDialogs mounts it
+    // inside DialogContent, which already supplies the frame and the
     // visible heading via DialogTitle/DialogDescription). Same reasoning as
     // MachineIdentity.tsx's dialog-only form: a Card wrapper would nest its
     // own border inside the dialog's, rendering as a visible double border.
@@ -457,6 +484,9 @@ function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
     "ARGUS_CA_CERT=/etc/argus/argus-ca.crt",
     "ARGUS_DATA_DIR=/var/lib/argus-agent",
     "EOF",
+    // `tee` writes at the default umask (644) — world-readable, with a real
+    // fleet-enrollment credential inside. Lock it down before anything runs.
+    "sudo chmod 600 /etc/argus/agent.env",
     "",
     "sudo -n ./argus-agent --config /etc/argus/agent.env",
   ].join("\n");
