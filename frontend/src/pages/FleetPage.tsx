@@ -140,6 +140,66 @@ function FleetTable({ rows }: { rows: FleetRow[] }) {
   );
 }
 
+/**
+ * Phone rendering of one fleet row: the whole card is a single tap target
+ * (design "Fleet: card list below md"). Same data, same helpers as the
+ * table — this is a second renderer, not a second data path.
+ *
+ * Kept in its own bordered wrapper, same as `FleetTable`'s, so either
+ * renderer presents the same surface at the call site — the swap below
+ * only ever toggles which one is visible, not the border around it.
+ */
+function FleetCards({ rows }: { rows: FleetRow[] }) {
+  return (
+    <div className="border border-border">
+      <ul className="flex flex-col divide-y divide-border">
+        {rows.map((row) => (
+          <li key={row.id}>
+            <Link to={`/machines/${row.id}`} className="flex flex-col gap-2 p-3">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <AssetTag tone={machineTone(row.status)}>{displayName(row)}</AssetTag>
+                <StatusCell row={row} />
+              </div>
+              {row.display_name !== null && (
+                <span className="font-mono text-[11px] text-muted-foreground">{row.hostname}</span>
+              )}
+              <div className="flex items-center gap-4">
+                <span className="flex items-center gap-2 font-mono text-xs">
+                  CPU {formatPct(row.cpu_pct)} <Sparkline values={row.spark_cpu} />
+                </span>
+                <span className="flex items-center gap-2 font-mono text-xs">
+                  Mem {formatPct(row.mem_pct)} <Sparkline values={row.spark_mem} />
+                </span>
+              </div>
+              <span className="font-mono text-[11px] text-muted-foreground">
+                seen {formatRelative(row.last_seen_at)}
+              </span>
+            </Link>
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
+/**
+ * `FleetCards` below `md`, `FleetTable` at/above it — `md` is THE
+ * breakpoint for this slice (no per-callsite improvisation). Both branches
+ * render so the swap is pure CSS visibility, not a remount on resize.
+ */
+function FleetRows({ rows }: { rows: FleetRow[] }) {
+  return (
+    <>
+      <div className="hidden md:block">
+        <FleetTable rows={rows} />
+      </div>
+      <div className="md:hidden">
+        <FleetCards rows={rows} />
+      </div>
+    </>
+  );
+}
+
 export default function FleetPage() {
   const { data: rows = [], error, isPending } = useFleet();
   const [params, setParams] = useSearchParams();
@@ -302,7 +362,7 @@ export default function FleetPage() {
           />
         </div>
       ) : groupSection === null ? (
-        <FleetTable rows={filtered} />
+        <FleetRows rows={filtered} />
       ) : (
         <div>
           <div className="flex flex-wrap items-baseline gap-2 pb-2">
@@ -319,7 +379,7 @@ export default function FleetPage() {
               />
             </div>
           ) : (
-            <FleetTable rows={groupSection.rows} />
+            <FleetRows rows={groupSection.rows} />
           )}
         </div>
       )}
