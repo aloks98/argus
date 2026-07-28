@@ -101,7 +101,7 @@ pub fn normalize_display_name(raw: &str) -> Result<Option<String>, String> {
     if t.is_empty() {
         return Ok(None);
     }
-    if t.len() > MAX_DISPLAY_NAME_LEN {
+    if t.chars().count() > MAX_DISPLAY_NAME_LEN {
         return Err(format!(
             "display name too long (max {MAX_DISPLAY_NAME_LEN} chars)"
         ));
@@ -111,7 +111,7 @@ pub fn normalize_display_name(raw: &str) -> Result<Option<String>, String> {
 
 #[allow(dead_code)]
 pub fn validate_notes(raw: &str) -> Result<(), String> {
-    if raw.len() > MAX_NOTES_LEN {
+    if raw.chars().count() > MAX_NOTES_LEN {
         return Err(format!("notes too long (max {MAX_NOTES_LEN} chars)"));
     }
     Ok(())
@@ -203,6 +203,24 @@ mod tests {
     fn notes_cap_at_4000() {
         assert!(validate_notes(&"x".repeat(4000)).is_ok());
         assert!(validate_notes(&"x".repeat(4001)).is_err());
+    }
+
+    #[test]
+    fn display_name_counts_characters_not_bytes() {
+        // Multi-byte character "ä" (U+00E4) is 2 bytes but 1 character.
+        // 64 characters of "ä" should be accepted (even though it's 128 bytes).
+        assert!(normalize_display_name(&"ä".repeat(64)).is_ok());
+        // 65 characters of "ä" should be rejected.
+        assert!(normalize_display_name(&"ä".repeat(65)).is_err());
+    }
+
+    #[test]
+    fn notes_counts_characters_not_bytes() {
+        // Multi-byte character "ä" (U+00E4) is 2 bytes but 1 character.
+        // 4000 characters of "ä" should be accepted (even though it's 8000 bytes).
+        assert!(validate_notes(&"ä".repeat(4000)).is_ok());
+        // 4001 characters of "ä" should be rejected.
+        assert!(validate_notes(&"ä".repeat(4001)).is_err());
     }
 
     // === Agent certificate parsing tests (Task 6) ===
