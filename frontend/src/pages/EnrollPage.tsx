@@ -22,6 +22,7 @@ import {
   Badge,
   Button,
   Checkbox,
+  CodeBlock,
   Collapsible,
   CollapsibleContent,
   CollapsibleTrigger,
@@ -220,7 +221,20 @@ function MintDialogs({
           if (!open) eventDetails.cancel();
         }}
       >
-        <AlertDialogContent className="sm:max-w-lg">
+        {/* `AlertDialogContent`'s own width classes are
+            `data-[size=default]:max-w-xs data-[size=sm]:max-w-xs
+            data-[size=default]:sm:max-w-sm` — a compound `data-[size=...]`
+            modifier chain, not the plain `sm:` chain a Dialog's width classes
+            use. A bare `sm:max-w-lg` override (what this used to say) has a
+            *different* modifier chain, so tailwind-merge can't tell it
+            conflicts with the base and won't dedupe it — both classes ship,
+            and which one wins is down to stylesheet emission order, not
+            source order (this is the cascade trap docs/DEV.md's frontend
+            design-system section calls out: "write your override with the
+            same modifier the base uses"). Spelled with the matching
+            `data-[size=default]:` chain here so tailwind-merge actually
+            drops the base and this wins deterministically. */}
+        <AlertDialogContent className="data-[size=default]:max-w-sm data-[size=default]:sm:max-w-2xl">
           <AlertDialogHeader>
             <AlertDialogTitle>Token minted</AlertDialogTitle>
             <AlertDialogDescription>
@@ -495,8 +509,19 @@ function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
     // No Card here, same reasoning as MintTokenForm — this panel only ever
     // renders inside the result AlertDialog, which already supplies the
     // frame and the "Token minted" heading via AlertDialogHeader.
-    <div className="flex flex-col gap-4">
-      <div className="flex items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2">
+    //
+    // `min-w-0` here (and `max-w-full` on the boxes below) so this column
+    // can never force the dialog wider than its own `max-w-*` — a flex/grid
+    // item's default min-width is its content's intrinsic width, which for
+    // an unbroken string (the raw token) or a code block is wide enough to
+    // blow past the panel and overflow it regardless of how the dialog
+    // itself is sized. `CodeBlock` already wraps its code in its own
+    // `overflow-x-auto` div and gives its outer wrapper `overflow-hidden`
+    // (see @e412/rnui-react's code-block.tsx), which is the other standard
+    // fix for this same problem, so the command block below doesn't need a
+    // second scrolling wrapper on top of it.
+    <div className="flex min-w-0 flex-col gap-4">
+      <div className="flex max-w-full items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2">
         <code className="min-w-0 flex-1 select-all break-all font-mono text-sm">
           {data.token}
         </code>
@@ -512,16 +537,8 @@ function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
         Download CA certificate
       </Button>
 
-      <div>
-        <div className="flex items-center justify-between gap-2 rounded-t-lg border border-b-0 border-border bg-muted/40 px-3 py-1.5">
-          <span className="font-mono text-[11px] uppercase tracking-widest text-muted-foreground">
-            Run on the host
-          </span>
-          <CopyButton value={runBlock} />
-        </div>
-        <pre className="overflow-x-auto rounded-b-lg border border-border bg-muted/20 px-3 py-2 font-mono text-xs">
-          {runBlock}
-        </pre>
+      <div className="min-w-0 max-w-full">
+        <CodeBlock code={runBlock} language="bash" showCopy title="Run on the host" />
         <FieldDescription className="mt-1">
           Replace <code>&lt;agent-endpoint&gt;</code> with the address agents reach the
           control plane on — Argus cannot know its externally routable address.
