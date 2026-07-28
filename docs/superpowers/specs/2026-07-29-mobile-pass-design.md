@@ -112,3 +112,12 @@ an installability check (manifest + icons fetch 200 from the embedded
 build, manifest parses), and the real thing — install to your phone's home
 screen from the LAN origin and tap through fleet → machine → restart a
 unit.
+
+## Amendment (2026-07-29, at implementation)
+
+Measured at 390px, "Name / state / Actions" did not fit — Restart's right
+edge landed at x=440. The **Active (Units) and State (Containers) columns
+are also hidden below `md`**: the AssetTag's tone encodes the same state,
+and dropping them brings the full verb group to x=365. Accepted trade,
+noted explicitly: the Containers **health** badge lives in the hidden State
+cell, so container health is not visible on phones (state tone is).

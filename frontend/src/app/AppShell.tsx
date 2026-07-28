@@ -90,10 +90,11 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
 }
 
 /**
- * The collapse control lives out here rather than on the sidebar: at rail width
- * there is no good home for it, and on mobile the sidebar is a sheet that is
- * fully off-canvas when closed — a control inside it would be unreachable. One
- * button in a fixed place beats two that appear conditionally.
+ * The header row: collapse control on the left; fleet summary, the palette
+ * search trigger and the theme toggle on the right. The collapse control
+ * lives out here rather than on the sidebar because at rail width there is
+ * no good home for it, and on mobile the sidebar is an off-canvas sheet — a
+ * control inside it would be unreachable.
  */
 function TopBar({ onOpenPalette }: { onOpenPalette: () => void }) {
   const { data: rows } = useFleet();
@@ -113,9 +114,9 @@ function TopBar({ onOpenPalette }: { onOpenPalette: () => void }) {
       {/* Search + theme controls live in the header (user decision — moved
           out of the sidebar footer, which is a sheet on mobile and a ~3rem
           rail when collapsed: the header is the one place these are always
-          one tap away). `ml-auto` on the summary keeps the whole cluster
-          right-aligned; when the fleet query hasn't resolved the controls
-          take the `ml-auto` themselves via `last:*`-free simple ordering. */}
+          one tap away). `ml-auto` sits on the summary when it
+          renders, else on this cluster, so the group is right-aligned in
+          both states. */}
       <div className={summary === null ? "ml-auto flex items-center gap-2" : "flex items-center gap-2"}>
         <CommandPaletteTrigger onOpen={onOpenPalette} />
         <ThemeToggle showLabel={false} />
@@ -150,13 +151,12 @@ function CommandPaletteTrigger({ onOpen }: { onOpen: () => void }) {
 }
 
 /**
- * Identity + sign-out, beside `ThemeToggle` in the sidebar footer.
+ * Identity + the two account actions (rotate, sign-out), one row in the
+ * sidebar footer. ThemeToggle and the palette trigger moved to the TopBar.
  *
- * At rail width there is no room for both an identity string and two
- * controls, so — matching the nav labels above — the identity disappears
- * entirely rather than being clipped with CSS (which would still size its
- * parent), and the two controls stack vertically instead of sitting side by
- * side: two `size-8` squares plus a gap don't fit the ~3rem rail.
+ * At rail width the identity disappears entirely rather than being clipped
+ * with CSS (which would still size its parent), and the actions stack
+ * vertically: two squares plus a gap don't fit the ~3rem rail.
  */
 function AccountFooter({
   rail,
