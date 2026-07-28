@@ -1,12 +1,13 @@
 import { useState } from "react";
 import { Link, NavLink, matchPath, useLocation } from "react-router-dom";
 import { useQueryClient } from "@tanstack/react-query";
-import { LogOut } from "lucide-react";
+import { LogOut, Search } from "lucide-react";
 import {
   Alert,
   AlertDescription,
   AlertTitle,
   Button,
+  Kbd,
   Sidebar,
   SidebarContent,
   SidebarFooter,
@@ -23,11 +24,18 @@ import {
   SidebarTrigger,
   useSidebar,
 } from "@e412/rnui-react";
+import CommandPalette from "../components/CommandPalette";
 import RotateLocalAdmin from "../components/RotateLocalAdmin";
 import ThemeToggle from "../components/ThemeToggle";
 import { useFleet } from "../lib/queries";
 import { logout, useMe } from "../lib/session";
 import { navSections } from "./routes";
+
+/** `navigator.platform` is deprecated but universally supported, and this is
+ *  a one-shot label choice (not feature detection) — not worth a dependency. */
+function isMacPlatform(): boolean {
+  return typeof navigator !== "undefined" && navigator.platform.includes("Mac");
+}
 
 /** The footer's shared full-width error banner (see `AppShell`'s comment on
  *  why it can't live inline in the ~3rem rail). Sign-out and password
@@ -49,6 +57,10 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
   // state. Shared by sign-out and password rotation, the footer's two
   // account actions.
   const [accountError, setAccountError] = useState<AccountError | null>(null);
+  // Mounted once, here, rather than per-page: the palette's own fleet query
+  // is `enabled` only while `paletteOpen` is true (see `useFleet`'s options),
+  // so this doesn't add a background poll to pages that don't need the fleet.
+  const [paletteOpen, setPaletteOpen] = useState(false);
 
   return (
     <SidebarProvider>
@@ -61,7 +73,8 @@ export default function AppShell({ children }: { children: React.ReactNode }) {
           <AlertDescription>{accountError.message}</AlertDescription>
         </Alert>
       )}
-      <FleetSidebar onAccountError={setAccountError} />
+      <CommandPalette open={paletteOpen} onOpenChange={setPaletteOpen} />
+      <FleetSidebar onAccountError={setAccountError} onOpenPalette={() => setPaletteOpen(true)} />
       {/* min-w-0 + overflow-x-hidden are load-bearing for wide content (the
           units table runs ~130 rows with 90-char unit names): SidebarInset is a
           flex child, and a flex item defaults to `min-width: auto`, so without
@@ -98,6 +111,33 @@ function TopBar() {
         </span>
       )}
     </header>
+  );
+}
+
+/**
+ * The Ctrl/Cmd+K trigger, first control in the footer above the account
+ * controls. Matches `ThemeToggle`'s own rail/full split: an icon-only
+ * `size-8` square in the rail, icon + label + shortcut hint at full width —
+ * there's no room for the label or the `Kbd` hint at rail width either.
+ */
+function CommandPaletteTrigger({ rail, onOpen }: { rail: boolean; onOpen: () => void }) {
+  return (
+    <Button
+      variant="outline"
+      size="sm"
+      aria-label="Search"
+      title="Search"
+      className={rail ? "size-8 justify-center p-0" : "w-full justify-start gap-2"}
+      onClick={onOpen}
+    >
+      <Search className="size-4 shrink-0" />
+      {!rail && (
+        <>
+          <span className="flex-1 text-left">Search</span>
+          <Kbd>{isMacPlatform() ? "⌘K" : "Ctrl K"}</Kbd>
+        </>
+      )}
+    </Button>
   );
 }
 
@@ -209,8 +249,10 @@ function AccountFooter({
  */
 function FleetSidebar({
   onAccountError,
+  onOpenPalette,
 }: {
   onAccountError: (error: AccountError | null) => void;
+  onOpenPalette: () => void;
 }) {
   const location = useLocation();
   const { state, isMobile } = useSidebar();
@@ -297,6 +339,7 @@ function FleetSidebar({
             : "gap-1 border-t border-border px-3 py-2"
         }
       >
+        <CommandPaletteTrigger rail={rail} onOpen={onOpenPalette} />
         <AccountFooter rail={rail} onAccountError={onAccountError} />
       </SidebarFooter>
 

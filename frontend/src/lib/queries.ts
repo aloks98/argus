@@ -42,11 +42,18 @@ export const qk = {
   enrollmentTokens: ["enrollment-tokens"] as const,
 };
 
-export function useFleet() {
+/**
+ * `enabled` defaults to `true` (the fleet page's normal always-on poll); the
+ * command palette (Task 10) passes `enabled: open` so mounting it app-wide
+ * doesn't add a permanent background poll to pages that don't otherwise need
+ * the fleet.
+ */
+export function useFleet(options?: { enabled?: boolean }) {
   return useQuery({
     queryKey: qk.fleet,
     queryFn: getFleet,
     refetchInterval: FLEET_INTERVAL,
+    enabled: options?.enabled ?? true,
   });
 }
 
