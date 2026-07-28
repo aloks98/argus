@@ -188,14 +188,9 @@ struct FleetRow {
     cpu_pct: Option<f32>,
     mem_pct: Option<f64>,
     /// Count of units in the `failed` state in the machine's **last reported**
-    /// Hub snapshot. `0` when nothing has ever been reported.
-    ///
-    /// Snapshots are NOT evicted when an agent disconnects (`Hub::unregister`
-    /// only clears the connection registry), so for an offline machine this is
-    /// the last known value and may be arbitrarily stale — a machine that goes
-    /// offline with 3 failed units keeps reporting 3. The row pairs it with the
-    /// machine's own `status`, so the staleness is visible rather than implied,
-    /// but do not read this as a live count for a machine that isn't `online`.
+    /// Hub snapshot; `0` when nothing has been reported. Snapshots are NOT
+    /// evicted on disconnect, so for an offline machine this may be stale --
+    /// do not read it as a live count unless the machine's `status` is `online`.
     failed_units: usize,
     spark_cpu: Vec<f32>,
     spark_mem: Vec<f64>,
@@ -491,7 +486,7 @@ async fn patch_machine(
     }
 }
 
-// === Enrollment tokens (fleet-identity slice, Task 4) ===
+// === Enrollment tokens (fleet-identity slice) ===
 
 /// One `enrollment_tokens` row for the browser. `token` is `None` -- and
 /// thus omitted via `skip_serializing_if` -- on every path except the mint
@@ -662,9 +657,8 @@ async fn mint_token(
 /// `DELETE /api/enrollment-tokens/{id}` -- revoke a join token. 404 when
 /// `id` doesn't match any token; the only way to learn that before the
 /// UPDATE runs is to fetch the name up front, which conveniently is also
-/// what the audit detail needs (brief's "fetch the name before revoking").
-/// Same share-one-transaction, fail-closed convention as `mint_token` /
-/// `patch_machine`.
+/// what the audit detail needs. Same share-one-transaction, fail-closed
+/// convention as `mint_token` / `patch_machine`.
 async fn revoke_token(
     State(state): State<AppState>,
     crate::auth::AuthUser(identity): crate::auth::AuthUser,
@@ -1379,14 +1373,11 @@ async fn run_verb(
     // keyed by command_id and would otherwise silently no-op against a
     // not-yet-inserted row, freezing it at "dispatched" forever.
     //
-    // NOTE: "dispatched" is NOT a guaranteed-terminal state. The agent runs a
-    // verb in a spawned task holding a clone of the *current* session's sender;
-    // if that session ends before the job finishes -- and a unit verb may now
-    // take up to 90s -- the CommandResult send is dropped and nothing ever
-    // resolves this row. Reconciling stale `dispatched` rows to `unknown` is a
-    // scheduled, survives-restart job, which CLAUDE.md gates behind the
-    // apalis-vs-pgmq validation, so it is deliberately deferred rather than
-    // hand-rolled here. Do not assume a row's result is final.
+    // NOTE: "dispatched" is NOT guaranteed-terminal -- do not assume a row's
+    // result is final. If the session ends before a spawned verb task finishes
+    // (a unit verb may take up to 90s), the CommandResult send is dropped and
+    // nothing resolves this row. Reconciling stale rows is deliberately
+    // deferred to a scheduled job (CLAUDE.md's apalis-vs-pgmq gate).
     let rx = state.hub.register_pending(cid.clone(), id);
     if let Err(e) = repo::audit_command(
         &state.pool,
@@ -1680,13 +1671,11 @@ mod tests {
     }
 
     /// `repo`-level tests already pin the tri-state through `upsert_machine`
-    /// and `machine_detail`; this pins the SAME tri-state through the actual
-    /// `GET /api/machines/{id}` JSON body, which is the exact contract the
-    /// frontend's tab-gating reads (`MachineDetailPage.tsx`'s `caps` /
-    /// `lacks()`). `null` and `[]` are not interchangeable: `null` must gate
-    /// NOTHING (an agent that predates capability reporting) and `[]` must
-    /// gate EVERYTHING (a bare host that reported and has none) -- so the
-    /// distinction has to survive serialization, not just the repo layer.
+    /// and `machine_detail`; this pins the same tri-state through the actual
+    /// `GET /api/machines/{id}` JSON body -- the contract the frontend's
+    /// tab-gating reads (`MachineDetailPage.tsx`'s `caps`/`lacks()`). `null`
+    /// must gate NOTHING (agent predates capability reporting); `[]` must
+    /// gate EVERYTHING (reported, has none) -- must survive serialization.
     #[sqlx::test]
     async fn machine_detail_json_carries_the_capability_tri_state(
         pool: PgPool,
@@ -1752,9 +1741,7 @@ mod tests {
     /// not. Presence is checked with `contains_key`, never bare indexing --
     /// `serde_json::Value`'s `Index` impl returns `Value::Null` for an
     /// ABSENT key too, so `detail["cpu_model"] == Value::Null` alone can't
-    /// distinguish "key missing" from "key present, value null". That trap
-    /// bit the fleet-payload test; the fix here is asserting `contains_key`
-    /// first.
+    /// distinguish "key missing" from "key present, value null".
     #[sqlx::test]
     async fn machine_detail_json_carries_inventory_fields(pool: PgPool) -> anyhow::Result<()> {
         let with_id: Uuid = sqlx::query!(
@@ -1989,8 +1976,7 @@ mod tests {
         assert!(matches!(check, repo::TokenCheck::Invalid));
 
         // This test mints exactly one token (one `enroll_token.create`) and
-        // revokes it (one `enroll_token.revoke`) -- recounted from what this
-        // test actually did, not copied from the plan.
+        // revokes it (one `enroll_token.revoke`).
         let n: i64 = sqlx::query_scalar!(
             r#"SELECT count(*) as "n!" FROM audit_log
                WHERE action IN ('enroll_token.create', 'enroll_token.revoke')"#
@@ -2052,10 +2038,9 @@ mod tests {
     /// a NULL `hours` argument straight through to a NULL result, which is
     /// what lets `mint_enrollment_token` store "never expires" by simply
     /// passing `None` into `make_interval(hours => $6)` with no `CASE`.
-    /// Verified directly against the container this crate's tests run
-    /// against (`docker exec argus-pg psql ...`), and pinned here so a
-    /// future Postgres version that changed this behavior would fail loudly
-    /// in CI instead of silently expiring "unlimited" tokens.
+    /// Pinned here so a future Postgres version that changed this behavior
+    /// would fail loudly in CI instead of silently expiring "unlimited"
+    /// tokens.
     #[sqlx::test]
     async fn make_interval_of_null_hours_is_null(pool: PgPool) -> anyhow::Result<()> {
         let expires_at: Option<OffsetDateTime> = sqlx::query_scalar!(
@@ -2711,12 +2696,8 @@ mod tests {
             "SSE body must carry the chunk: {text}"
         );
 
-        // The leading frame must be a NAMED `meta` event: a browser's
-        // EventSource routes named events to addEventListener and NOT to
-        // onmessage, so an unnamed frame would be parsed as a log line by the
-        // client's NDJSON code. And it must come BEFORE the log chunk, so a
-        // page read never sees a chunk before it knows what cutoff to echo
-        // back.
+        // The `meta` frame must be a NAMED event (see log_stream's comment on
+        // why) and must arrive before the first log chunk.
         let meta_pos = text
             .find("event: meta\n")
             .expect("the SSE body must contain a frame named `meta`");
@@ -3233,14 +3214,12 @@ mod tests {
 
     #[test]
     fn explicit_since_ms_turns_off_a_requested_boot_window() {
-        // window="boot" alone sets current_boot=true (see
-        // resolve_log_filters_boot_sets_current_boot_and_no_since below). An
-        // explicit since_ms must still win and flip it back to false: an
-        // explicit cutoff and a boot window are alternative answers to the
-        // same question and must never combine. This is the true->false
-        // transition; `explicit_since_ms_overrides_the_window` above uses
-        // window="1h", whose current_boot is already false, so it never
-        // exercises this override.
+        // window="boot" sets current_boot=true; an explicit since_ms must
+        // still win and flip it back to false -- an explicit cutoff and a
+        // boot window are alternative answers to the same question and must
+        // never combine. This is the true->false transition;
+        // `explicit_since_ms_overrides_the_window` above (window="1h") never
+        // exercises it since current_boot is already false there.
         let f = resolve_log_filters_with_since(None, Some("boot"), Some(1_600_000_000_000))
             .expect("a boot window plus an explicit since_ms is valid");
         assert_eq!(f.since_ms, 1_600_000_000_000);
@@ -3252,17 +3231,11 @@ mod tests {
 
     #[test]
     fn explicit_since_ms_of_zero_does_not_turn_off_a_requested_boot_window() {
-        // Unlike `explicit_since_ms_turns_off_a_requested_boot_window` above
-        // (window=boot + since_ms=1_600_000_000_000, a pair the client can
-        // never actually produce), this is the pair that IS reachable
-        // end-to-end: `resolve_log_filters(_, Some("boot"))` resolves to
-        // `since_ms = 0`, so the `meta` frame announces `{"since_ms":0}` and
-        // the client echoes `since_ms=0` back on every subsequent page read
-        // of that tail. `since_ms == 0` means "unset" everywhere else in this
-        // codebase (crates/agent/src/logs.rs), so it must NOT be treated as
-        // an authoritative cutoff here either — doing so would flip
-        // `current_boot` to false and silently drop the boot filter on every
-        // page read.
+        // The reachable pair: `window=boot` resolves to `since_ms=0` (unlike
+        // the unreachable pair above), which must NOT be treated as an
+        // explicit cutoff -- see `resolve_log_filters_with_since`'s doc
+        // comment for why `since_ms==0` means "unset" and must not suppress
+        // the boot window.
         let f = resolve_log_filters_with_since(None, Some("boot"), Some(0))
             .expect("boot plus since_ms=0 is valid");
         assert!(
@@ -3286,7 +3259,7 @@ mod tests {
     }
 
     // --- content_type: the PWA manifest must be served with the MIME type
-    // browsers require to treat it as installable (mobile-pass Task 1).
+    // browsers require to treat it as installable.
 
     #[test]
     fn content_type_serves_the_webmanifest_mime() {
@@ -3362,13 +3335,12 @@ mod tests {
         Ok(())
     }
 
-    /// The SSE log stream is a different transport from the plain JSON
-    /// handlers above (`Sse::new(...).into_response()` rather than
-    /// `Json(...)`), and it's exactly the kind of route a future refactor
-    /// could accidentally move outside the `api` sub-router without anyone
-    /// noticing -- nothing about it visually resembles `/api/fleet`. Assert
-    /// the exact status so a regression that turned this into a 200 (started
-    /// streaming) or a 500 wouldn't be mistaken for a pass.
+    /// The SSE log stream is a different transport (`Sse::new(...)` rather
+    /// than `Json(...)`) and nothing about it visually resembles
+    /// `/api/fleet`, so it's exactly the kind of route a refactor could
+    /// accidentally move outside the `api` sub-router. Assert the exact
+    /// status so a regression (200 = started streaming, or 500) isn't
+    /// mistaken for a pass.
     #[sqlx::test]
     async fn logs_stream_route_requires_a_session(pool: PgPool) -> anyhow::Result<()> {
         let app = router(test_state(pool));
@@ -3392,16 +3364,13 @@ mod tests {
         Ok(())
     }
 
-    /// The terminal WebSocket is the other transport that differs from a
-    /// plain JSON handler: a successful upgrade returns `101 Switching
-    /// Protocols`, not `200`. `require_auth` runs as a `Router` layer wrapping
-    /// the whole `api` sub-router, so it must reject the upgrade with `401`
-    /// BEFORE axum ever hands the connection to `WebSocketUpgrade` -- a
-    /// refactor that moved `/api/machines/{id}/terminal` outside that layer
-    /// (or reordered the layer past the WS route) would turn this into a live
-    /// unauthenticated root shell. `oneshot` never actually completes the
-    /// upgrade (there's no live socket on either end), so asserting the
-    /// response status here is sufficient to prove the layer ran first.
+    /// The terminal WebSocket differs from a JSON handler: a successful
+    /// upgrade returns `101 Switching Protocols`, not `200`. `require_auth`
+    /// wraps the whole `api` sub-router as a layer, so it must reject with
+    /// `401` BEFORE axum hands the connection to `WebSocketUpgrade` -- a
+    /// refactor that moved this route outside that layer would turn it into
+    /// a live unauthenticated root shell. `oneshot` never completes the
+    /// upgrade, so asserting the status alone proves the layer ran first.
     #[sqlx::test]
     async fn terminal_websocket_upgrade_requires_a_session(pool: PgPool) -> anyhow::Result<()> {
         let app = router(test_state(pool));
@@ -3700,9 +3669,8 @@ mod tests {
         // Exhaust the burst directly against the limiter -- no admin row is
         // ever created, so if the handler queried the database on this path
         // it would 401 (or 500, absent a row/table setup), never 429. `check`
-        // itself reserves the slot it grants (the concurrency fix), so
-        // calling it alone -- with no separate `record_failure` -- is enough
-        // to spend the whole burst.
+        // itself reserves the slot it grants, so calling it alone -- with no
+        // separate `record_failure` -- is enough to spend the whole burst.
         let now = std::time::Instant::now();
         for _ in 0..(crate::auth::ratelimit::BURST + 1) {
             state.limiter.check(now);
@@ -3726,15 +3694,14 @@ mod tests {
         Ok(())
     }
 
-    /// The concurrency bug this fix round exists for, proven at the real
-    /// router: fire far more than `BURST` requests at `/auth/local`
-    /// SIMULTANEOUSLY (no admin row configured, so every one of them takes
-    /// the real, ~100ms argon2 dummy-hash path -- giving the verifies actual
-    /// overlapping wall-clock time to race in). Under the old
-    /// check-then-record-failure-later design, every one of them would read
-    /// "under budget" before any recorded itself, so all would pass and none
-    /// would ever see a 429. With the reservation folded into `check`, at
-    /// most `BURST` may ever be admitted regardless of how they interleave.
+    /// `check` must reserve the slot it grants, not just report "under
+    /// budget" -- otherwise concurrent requests can all read the same
+    /// pre-reservation count and all pass. Proven here at the real router by
+    /// firing far more than `BURST` requests at `/auth/local` SIMULTANEOUSLY
+    /// (no admin row, so every one takes the real ~100ms argon2 dummy-hash
+    /// path, giving them actual overlapping wall-clock time to race in).
+    /// With the reservation folded into `check`, at most `BURST` may ever be
+    /// admitted regardless of how they interleave.
     #[sqlx::test]
     async fn concurrent_local_logins_cannot_collectively_exceed_the_burst(
         pool: PgPool,
@@ -3845,7 +3812,6 @@ mod tests {
     /// `null` proves the double-`Option` distinguishes "absent" from "clear".
     #[sqlx::test]
     async fn patch_machine_partial_update_and_audit(pool: PgPool) -> anyhow::Result<()> {
-        // Seed a machine directly (raw SQL precondition, per the standing lesson).
         let id: Uuid = sqlx::query_scalar!(
             r#"INSERT INTO machines (machine_id, hostname, tags) VALUES ('m-1', 'host-1', '{old}')
                RETURNING id"#
@@ -3956,22 +3922,18 @@ mod tests {
         Ok(())
     }
 
-    /// Fail-closed proof for the transactional fix (review round 1): forces
-    /// the `machine.update` audit write to fail while the machine row it
-    /// would attach to genuinely exists, then asserts the mutation did not
-    /// survive that failure.
+    /// Fail-closed proof: forces the `machine.update` audit write to fail
+    /// while the machine row it would attach to genuinely exists, then
+    /// asserts the mutation did not survive that failure.
     ///
-    /// This can't reuse `verb_fails_closed_when_the_dispatched_audit_write_fails`'s
-    /// FK-violation trick verbatim (a "ghost" `machine_id` with no `machines`
-    /// row, so the audit insert's FK fails): `patch_machine` uses the SAME
-    /// `id` for both the update and the audit row, and reaching the audit
-    /// write at all requires the update to have matched a real row first --
-    /// so by construction that FK can never be what fails here. Instead, a
-    /// `BEFORE INSERT` trigger scoped to this test's own isolated database
-    /// rejects any `audit_log` insert whose `action = 'machine.update'`,
-    /// which fails the write for a reason orthogonal to whether the
-    /// referenced machine exists -- the same *class* of injected DB-level
-    /// failure, adapted to an ordering where the FK approach doesn't apply.
+    /// Can't reuse `verb_fails_closed_when_the_dispatched_audit_write_fails`'s
+    /// FK-violation trick verbatim: `patch_machine` uses the SAME `id` for
+    /// both the update and the audit row, so reaching the audit write at all
+    /// requires the update to have matched a real row first -- that FK can
+    /// never be what fails here. Instead, a `BEFORE INSERT` trigger scoped to
+    /// this test's own isolated database rejects any `audit_log` insert whose
+    /// `action = 'machine.update'`, the same *class* of injected DB-level
+    /// failure adapted to an ordering where the FK trick doesn't apply.
     #[sqlx::test]
     async fn patch_machine_rolls_back_the_update_when_the_audit_write_fails(
         pool: PgPool,

@@ -3,13 +3,12 @@
 //! Rule (see CLAUDE.md): survives-restart / retried / scheduled -> apalis; trivial
 //! and loss-tolerant -> tokio task.
 //!
-//! apalis is intentionally NOT wired in the skeleton: the V1 "Spine" slice needs no
-//! job queue, and `apalis-sql`'s Postgres backend must first pass a build-time
-//! validation gate (retries + cron on the Postgres backend specifically; sqlx
-//! version alignment) or fall back to `pgmq`. Until then the offline sweeper (this
-//! task) and the future nightly metrics prune run from a tokio interval -- a
-//! missed tick is harmless (the next tick catches up), which is exactly what
-//! "loss-tolerant" means here.
+//! apalis is intentionally NOT wired yet: `apalis-sql`'s Postgres backend must
+//! first pass a build-time validation gate (retries + cron on Postgres; sqlx
+//! version alignment) or fall back to `pgmq`. Until then the offline sweeper
+//! and the metrics prune run from a tokio interval -- a missed tick is
+//! harmless (the next tick catches up), which is exactly what "loss-tolerant"
+//! means here.
 
 use crate::repo;
 use anyhow::Result;

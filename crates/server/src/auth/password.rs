@@ -111,26 +111,20 @@ mod tests {
 
     #[test]
     fn the_dummy_hash_is_valid_and_matches_nothing_usable() {
-        // The no-admin-configured path verifies against this so that response
-        // timing cannot distinguish "no local admin exists" from "wrong
-        // password". If it were malformed, verification would return early and
-        // the timing signal would reappear.
+        // Guards DUMMY_PHC's well-formedness: if it were malformed,
+        // verification would return early and the timing signal would reappear.
         assert!(DUMMY_PHC.starts_with("$argon2id$"));
         assert!(!verify_password("", DUMMY_PHC));
         assert!(!verify_password("admin", DUMMY_PHC));
     }
 
-    /// What actually makes the no-admin path cost the same as a real
-    /// verification: the argon2 PARAMETERS (`m`/`t`/`p`) must match, not
-    /// merely "some argon2id string". `verify_password` only needs a
-    /// well-formed PHC to run -- it would happily "succeed" (return `false`,
-    /// same as today) against a hash with WEAKER parameters, at a fraction of
-    /// the cost, and every existing status/body/cookie assertion in
-    /// `http.rs` would stay green while the timing gap design §11 exists to
-    /// close quietly reopened. This pins the parameters segment of
-    /// `DUMMY_PHC` to always match a freshly generated hash's, so a future
-    /// argon2 version/parameter bump that updates one and not the other
-    /// fails loudly here instead of only in production timing.
+    /// The no-admin path only costs what a real verification costs if the
+    /// argon2 PARAMETERS (`m`/`t`/`p`) match, not just "some argon2id
+    /// string" -- `verify_password` would happily return `false` against a
+    /// weaker, cheaper hash and every existing assertion would stay green.
+    /// This pins `DUMMY_PHC`'s parameters to a freshly generated hash's, so a
+    /// future argon2 bump that updates one and not the other fails loudly
+    /// here instead of only in production timing.
     #[test]
     fn the_dummy_hash_shares_argon2_parameters_with_a_freshly_generated_hash() {
         // PHC layout: "$argon2id$v=19$m=..,t=..,p=..$salt$hash" -- the

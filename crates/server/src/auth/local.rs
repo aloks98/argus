@@ -121,18 +121,16 @@ pub async fn login(State(state): State<AppState>, Json(req): Json<LoginRequest>)
     };
 
     // Exactly one argon2id verification happens below on every path -- real
-    // hash if a row exists, the dummy hash if not -- so the cost (and hence
-    // the timing) is identical regardless of which of the three failure
-    // reasons applies. The username comparison is deliberately ordinary
-    // (not constant-time): it is public information the moment ANY account
-    // exists (the CLI's usage text names the default), unlike the password.
+    // hash if a row exists, the dummy hash if not -- so timing is identical
+    // regardless of failure reason. The username comparison is deliberately
+    // ordinary (not constant-time): it is public information the moment ANY
+    // account exists, unlike the password.
     //
-    // Both arms move an owned `String` copy of the submitted password into
-    // `spawn_blocking` -- never a reference to `req.password` -- so the
-    // verify runs on tokio's blocking pool rather than pinning this request's
-    // async worker for argon2id's ~100ms. Neither arm logs the password or
-    // lets it reach a `Debug`/error path; only the boolean result crosses
-    // back.
+    // Both arms move an owned `String` copy of the password into
+    // `spawn_blocking` -- never a reference to `req.password` -- so argon2id's
+    // ~100ms runs on tokio's blocking pool, not this request's async worker.
+    // Neither arm logs the password or lets it reach a `Debug`/error path;
+    // only the boolean result crosses back.
     let valid = match &admin {
         Some(row) => {
             let password = req.password.clone();
@@ -321,23 +319,18 @@ mod tests {
     }
 
     /// The timing-indistinguishability property (design §11) has no coverage
-    /// anywhere else: deleting `verify_against_dummy` from the `None` arm of
-    /// `login` leaves every status/body/cookie assertion in `http.rs`
-    /// unchanged -- the only observable difference is elapsed time. The real
-    /// gap without the dummy verify is ~1000x (microseconds vs. argon2id's
-    /// ~100ms), so a 2x tolerance is nowhere near tight enough to flake under
-    /// CI jitter but is nowhere near loose enough to hide a skipped verify.
+    /// anywhere else: only elapsed time reveals a skipped dummy verify, since
+    /// every status/body/cookie assertion in `http.rs` stays unchanged. The
+    /// real gap without it is ~1000x (microseconds vs. argon2id's ~100ms), so
+    /// a 2x tolerance won't flake under CI jitter but won't hide a skipped
+    /// verify either.
     ///
     /// Deliberately ONE-SIDED: only "no-admin is much FASTER than
-    /// wrong-password" carries security meaning (that's the leak design §11
-    /// exists to prevent). "No-admin is much slower" carries none, and would
-    /// be a false failure here regardless -- case 1 runs first and pays
-    /// one-time costs case 2 does not (the first `spawn_blocking` thread
+    /// wrong-password" carries security meaning. Case 1 runs first and pays
+    /// one-time costs case 2 doesn't (the first `spawn_blocking` thread
     /// spawn, the first 19 MiB argon2 arena), which biases elapsed time
-    /// toward exactly that direction. A two-sided bound would flake on that
-    /// bias for no security benefit; asserting only the direction that
-    /// matters gets the same sensitivity to the real defect with half the
-    /// flake surface.
+    /// toward "no-admin slower" -- a two-sided bound would flake on that bias
+    /// for no security benefit.
     #[sqlx::test]
     async fn no_admin_path_is_not_much_faster_than_wrong_password(
         pool: PgPool,

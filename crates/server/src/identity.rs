@@ -1,5 +1,5 @@
 //! Identity-field validation (fleet-identity slice, design "Validation rules")
-//! and agent-cert parsing (Task 6).
+//! and agent-cert parsing.
 //!
 //! The validation module (`normalize_tags`, `normalize_display_name`,
 //! `validate_notes`) provides ONE implementation shared by every write path — the
@@ -7,42 +7,14 @@
 //! here so the rules cannot drift apart. No regex crate: the character class is
 //! trivial and the server has no regex dependency to justify.
 //!
-//! ## tonic 0.14 optional-client-auth API spike (Task 6)
+//! `ServerTlsConfig::client_ca_root` + `client_auth_optional` (see
+//! `grpc::serve`) make presenting a client cert optional-but-verified
+//! directly -- no manual `tokio_rustls::TlsAcceptor` / `WebPkiClientVerifier`
+//! fallback is needed. `Request::peer_certs()` returns `None` when no client
+//! cert was presented (the `Enroll` caller) and `Some` otherwise.
 //!
-//! Confirmed by reading the vendored `tonic-0.14.6` source
-//! (`~/.cargo/registry/src/*/tonic-0.14.6/src/transport/server/tls.rs` and
-//! `src/request.rs`), since the exact call names are the highest-risk part of
-//! this task:
-//!
-//! - `ServerTlsConfig` already supports OPTIONAL client auth directly -- the
-//!   `tokio-rustls`-manual-acceptor fallback described in the task brief is
-//!   NOT needed. `ServerTlsConfig::client_ca_root(cert: Certificate) -> Self`
-//!   sets the trust anchor used to validate a client cert if one is
-//!   presented, and `ServerTlsConfig::client_auth_optional(optional: bool) ->
-//!   Self` (default `false`) is documented as "This option has effect only if
-//!   CA certificate is set" -- i.e. setting both makes presenting a client
-//!   cert optional-but-verified rather than mandatory.
-//! - `Request::peer_certs(&self) -> Option<Arc<Vec<CertificateDer<'static>>>>`
-//!   (`tonic-0.14.6/src/request.rs`) returns `Some` only on the server side of
-//!   a TLS-enabled `transport::Server` connection when the peer presented a
-//!   cert; `None` when no client cert was presented (the `Enroll` caller,
-//!   once client auth is optional) or the connection isn't TLS.
-//! - `CertificateDer` is `tokio_rustls::rustls::pki_types::CertificateDer`,
-//!   which tonic re-exports as `tonic::transport::CertificateDer`
-//!   (`tonic-0.14.6/src/transport/mod.rs`: `pub use
-//!   tokio_rustls::rustls::pki_types::CertificateDer;`). This crate already
-//!   depends on `rustls` 0.23 directly, and `cargo tree -p argus-server -i
-//!   rustls` / `-i tokio-rustls` confirm the whole workspace unifies on a
-//!   single `rustls v0.23.41` / `tokio-rustls v0.26.4` -- so
-//!   `rustls::pki_types::CertificateDer` used below is the exact same type
-//!   `Request::peer_certs()` yields; no re-export juggling required.
-//!
-//! **Path taken:** the simple `ServerTlsConfig` path (see `grpc::serve`). The
-//! manual `tokio_rustls::TlsAcceptor` + `WebPkiClientVerifier` fallback was
-//! not needed.
-//!
-//! `agent_id_from_peer` is called from `grpc::session` (Task 7), which requires
-//! a client cert and cross-checks its CN-derived `agent_id` against
+//! `agent_id_from_peer` is called from `grpc::session`, which requires a
+//! client cert and cross-checks its CN-derived `agent_id` against
 //! `repo::cert_is_active`'s fingerprint lookup before starting the bidi loop.
 
 use anyhow::{anyhow, Context, Result};
@@ -50,7 +22,7 @@ use rustls::pki_types::CertificateDer;
 use uuid::Uuid;
 use x509_parser::prelude::{FromDer, X509Certificate};
 
-// === Validation constants and functions (Task 2) ===
+// === Validation constants and functions ===
 
 pub const MAX_TAGS: usize = 16;
 const MAX_TAG_LEN: usize = 32;
@@ -111,7 +83,7 @@ pub fn validate_notes(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-// === Agent certificate parsing (Task 6) ===
+// === Agent certificate parsing ===
 
 /// Extract the `agent_id` from the leaf of a peer certificate chain. The
 /// internal CA signs agent client certs with the `agent_id` UUID as the CN
@@ -149,7 +121,7 @@ mod tests {
     use super::*;
     use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 
-    // === Validation tests (Task 2) ===
+    // === Validation tests ===
 
     #[test]
     fn tags_are_trimmed_lowercased_and_deduped_in_order() {
@@ -201,23 +173,19 @@ mod tests {
 
     #[test]
     fn display_name_counts_characters_not_bytes() {
-        // Multi-byte character "ä" (U+00E4) is 2 bytes but 1 character.
-        // 64 characters of "ä" should be accepted (even though it's 128 bytes).
+        // "ä" (U+00E4) is 2 bytes but 1 character; the cap counts characters.
         assert!(normalize_display_name(&"ä".repeat(64)).is_ok());
-        // 65 characters of "ä" should be rejected.
         assert!(normalize_display_name(&"ä".repeat(65)).is_err());
     }
 
     #[test]
     fn notes_counts_characters_not_bytes() {
-        // Multi-byte character "ä" (U+00E4) is 2 bytes but 1 character.
-        // 4000 characters of "ä" should be accepted (even though it's 8000 bytes).
+        // "ä" (U+00E4) is 2 bytes but 1 character; the cap counts characters.
         assert!(validate_notes(&"ä".repeat(4000)).is_ok());
-        // 4001 characters of "ä" should be rejected.
         assert!(validate_notes(&"ä".repeat(4001)).is_err());
     }
 
-    // === Agent certificate parsing tests (Task 6) ===
+    // === Agent certificate parsing tests ===
 
     #[test]
     fn agent_id_from_peer_reads_the_uuid_from_the_leaf_cns_cn() {

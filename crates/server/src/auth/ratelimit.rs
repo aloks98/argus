@@ -32,20 +32,13 @@
 //! sleeping.
 //!
 //! **`check` RESERVES the slot it grants, atomically, before the caller ever
-//! runs the (slow) argon2 verify.** An earlier version of this module had
-//! `check` merely *read* `consecutive_failures` and left recording a failure
-//! to a separate `record_failure` call made after the verify completed. That
-//! left a real gap: N requests arriving concurrently all read
-//! `consecutive_failures` before any of them finished verifying (~100ms
-//! away), so all N observed "under budget" and all N proceeded -- the
-//! effective limit was "N concurrent", not "`BURST` total", for any N. Folding
-//! the reservation into `check` itself closes that: incrementing happens
-//! under the same lock acquisition as the read, so only `BURST` callers can
-//! ever observe `None` before the bucket's own count reflects it for the
-//! next caller, no matter how long each one then takes to actually verify.
-//! `record_success` still unwinds a reservation the moment a real success is
-//! confirmed, so a legitimate login is never left paying for its own
-//! reservation.
+//! runs the (slow) argon2 verify.** Reading the count and recording the
+//! failure as two separate steps would let N concurrent callers all observe
+//! "under budget" before any of their ~100ms verifies finish, making the
+//! real limit "N concurrent" instead of `BURST` total. Incrementing under
+//! the same lock as the read closes that gap; `record_success` unwinds the
+//! reservation the moment a real success is confirmed, so a legitimate login
+//! is never left paying for its own reservation.
 
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -82,15 +75,13 @@ impl LoginLimiter {
         Self::default()
     }
 
-    /// `None` means the caller may proceed immediately -- and, critically,
-    /// this call has ALREADY counted that as a (pessimistic) failure: it
-    /// increments `consecutive_failures` and stamps `last_attempt` before
-    /// returning, under the same lock acquisition that read them, so no
-    /// concurrent caller can observe the pre-increment count. `record_success`
-    /// below is what unwinds that the moment a real success is confirmed --
-    /// a caller that never calls back in (because it crashed, or the
-    /// database lookup failed) simply leaves one reservation spent, which is
-    /// the conservative direction to fail in.
+    /// `None` means the caller may proceed immediately -- and this call has
+    /// ALREADY counted that as a pessimistic failure, incrementing
+    /// `consecutive_failures` and stamping `last_attempt` under the same lock
+    /// acquisition that read them, so no concurrent caller can observe the
+    /// pre-increment count. `record_success` unwinds that the moment a real
+    /// success is confirmed; a caller that never calls back in simply leaves
+    /// one reservation spent, the conservative direction to fail in.
     ///
     /// `Some(d)` means wait `d` longer, and makes NO state change at all --
     /// hammering while already delayed must not itself escalate the delay
@@ -107,22 +98,14 @@ impl LoginLimiter {
             return None;
         }
         if bucket.consecutive_failures == BURST {
-            // The one place a sustained brute force becomes visible in the
-            // logs at all: the throttled path below writes no audit row (by
-            // design -- consulting the limiter first is what keeps a
-            // hammering caller from costing the database anything), so
-            // without this, five `auth.denied` rows are followed by complete
-            // silence no matter how long the attack continues.
-            //
-            // Logged exactly once per streak, not once per throttled
-            // request: `consecutive_failures` equals `BURST` only on the
-            // very first call that lands in this branch. Every later
-            // admission (once the delay elapses) pushes the count past
-            // `BURST`, and a call that arrives while still delayed (the
-            // `else` arm below) leaves the count untouched entirely -- so
-            // this can't re-fire on every poll of a caller hammering the
-            // endpoint, only when throttling actually begins for a fresh
-            // streak (i.e. after a `record_success` reset it to zero).
+            // Logged once per streak so a sustained brute force stays visible
+            // even though the throttled path below skips the audit log
+            // (consulting the limiter first is what keeps a hammering caller
+            // from costing the database). Fires only when `consecutive_failures`
+            // first equals `BURST` -- later admissions push it past `BURST`,
+            // and calls that arrive while still delayed (the `else` arm) leave
+            // it untouched -- so this can't re-fire on every poll, only once
+            // per fresh streak.
             tracing::warn!("local admin login rate limiter: burst exhausted, now throttling");
         }
         let delay = Self::delay_for(bucket.consecutive_failures);

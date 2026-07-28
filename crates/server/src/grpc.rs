@@ -1,14 +1,13 @@
 //! Agent-facing gRPC surface (PRD §4, §5).
 //!
 //! Served on the MetalLB LoadBalancer address with mTLS terminated here -- never
-//! via Traefik (PRD §2.4). The rustls listener accepts OPTIONAL client auth
-//! (Task 6): a client MAY present a cert, validated against the internal CA via
+//! via Traefik (PRD §2.4). The rustls listener accepts OPTIONAL client auth: a
+//! client MAY present a cert, validated against the internal CA via
 //! `client_ca_root`, but is not REQUIRED to, so `Enroll` (no client cert) keeps
-//! working. `Session` (this task, Task 7) is the opposite: it REQUIRES a
-//! presented, active agent cert and rejects the call otherwise --
-//! `identity::agent_id_from_peer` turns the cert's CN into an `agent_id`, which
-//! is cross-checked against `repo::cert_is_active`'s fingerprint lookup before
-//! the bidi loop starts.
+//! working. `Session` is the opposite: it REQUIRES a presented, active agent
+//! cert and rejects the call otherwise -- `identity::agent_id_from_peer` turns
+//! the cert's CN into an `agent_id`, which is cross-checked against
+//! `repo::cert_is_active`'s fingerprint lookup before the bidi loop starts.
 
 use crate::ca::CertAuthority;
 use crate::config::Config;
@@ -33,7 +32,7 @@ use uuid::Uuid;
 
 /// The agent-facing gRPC service. `Enroll` signs CSRs against the internal CA;
 /// `Session` runs the multiplexed bidi loop over an already-authenticated
-/// client cert -> agent_id lookup (Task 6's `identity::agent_id_from_peer`).
+/// client cert -> agent_id lookup (`identity::agent_id_from_peer`).
 pub struct AgentSvc {
     pub ca: Arc<CertAuthority>,
     pub pool: PgPool,
@@ -58,31 +57,23 @@ impl AgentService for AgentSvc {
         // one transaction: if anything past the token check fails, the
         // rollback un-burns the (possibly single-use) token and removes any
         // partial machine/cert writes, so a retry sees a clean slate. Audit
-        // rows for failures are written to the POOL (outside the tx) so they
-        // survive the rollback -- every code path is audited, per CLAUDE.md.
+        // rows for failures are written to the POOL (outside the tx), so they
+        // survive the rollback and every code path stays audited.
         let mut tx = self
             .pool
             .begin()
             .await
             .map_err(|e| internal_error("beginning enroll transaction", &e.into()))?;
 
-        // The token's `name` no longer has anywhere to go AS THE ACTOR: with
-        // `actor` now a closed `Actor` enum, there is no principal to
-        // attribute an unauthenticated `Enroll` call to but `Actor::System`
-        // -- true of the denied/error paths below (invalid token, missing
-        // info.machine_id, a failed write), since at that point a client
-        // cert (the only other thing that could mint an `Actor::Agent`)
-        // doesn't exist yet and no machine has been committed either. It is
-        // NOT true of the success path further down: once `agent_id` is
-        // committed inside this still-open transaction, that row mints
-        // `Actor::Agent(agent_id)` instead (see the comment there). Either
-        // way, `Actor::System` (denied/error) is still the only
-        // server-verified fact those calls have this early, so every
-        // `agent.enroll` row from here on carries the token name in `detail`
-        // too (`audit_with_detail`) -- without that, "which join token was
-        // used" becomes permanently unanswerable the moment the row is
-        // written: `enrollment_tokens` keeps no per-use history, only a bare
-        // `uses` counter.
+        // `Actor` is a closed enum with no variant for an unauthenticated caller,
+        // so the denied/error paths below use `Actor::System` -- at that point no
+        // client cert exists yet (no `Actor::Agent`) and no machine is committed.
+        // The success path further down instead uses `Actor::Agent(agent_id)` once
+        // the machine is committed (see the comment there). Since `Actor::System`
+        // carries no identifying detail, every `agent.enroll` row here also
+        // records the token name in `detail` (`audit_with_detail`) -- otherwise
+        // "which join token was used" is unanswerable, since `enrollment_tokens`
+        // keeps no per-use history, only a bare `uses` counter.
         let (token_name, token_display_name, token_tags) =
             match repo::consume_enrollment_token(&mut *tx, &req.join_token)
                 .await
@@ -280,14 +271,10 @@ impl AgentService for AgentSvc {
                             None => break,
                         }
                     }
-                    // Fired by `Hub::register` when a later Session for this
-                    // same machine replaces this one: this connection can no
-                    // longer be routed to (the hub's `conns` entry is already
-                    // the new session's), so continuing to read `inbound`
-                    // here would just keep pumping heartbeats for a session
-                    // the hub can't dispatch verbs/logs/terminal to anymore.
-                    // Exit through the SAME teardown path a normal disconnect
-                    // takes, below.
+                    // Fired when a later Session for this machine supersedes this
+                    // one (see `ConnHandle`'s doc comment in hub.rs) -- exit
+                    // through the same teardown path a normal disconnect takes,
+                    // below.
                     _ = shutdown.notified() => {
                         tracing::info!(%machine_id, "session: superseded by a new connection for this machine");
                         break;
@@ -295,15 +282,12 @@ impl AgentService for AgentSvc {
                 }
             }
             hub.unregister(machine_id, epoch);
-            // The agent-side tails are already aborted on teardown; without
-            // this, any server-side tail sinks for this machine would hang
-            // their SSE streams open forever with no eof (a frozen "live"
-            // view in the browser).
+            // Closes server-side sinks so they don't hang open forever; see
+            // `Hub::close_tails_for`'s doc comment.
             hub.close_tails_for(machine_id);
-            // Same reasoning for open terminals: dropping the ptys registry
-            // entries drops their byte-sink `Sender`s, which is what makes
-            // the WS handler's `rx.recv()` observe closure and end the
-            // browser session instead of hanging silently forever.
+            // Dropping the ptys registry entries drops their byte-sink `Sender`s,
+            // which is what makes the WS handler's `rx.recv()` observe closure and
+            // end the browser session instead of hanging silently forever.
             hub.close_ptys_for(machine_id);
             tracing::info!(%machine_id, "session: agent disconnected");
         });
@@ -418,12 +402,9 @@ async fn handle_agent_frame(
             hub.complete(&command_id, machine_id, cr);
         }
         _ => {
-            // No payload, or `Ack` -- a low-level stream-control
-            // acknowledgement the server doesn't currently act on. Every
-            // other `agent_frame::Payload` variant is matched above; note
-            // PtyOpen/PtyInput/PtyResize/PtyClose are `server_frame::Payload`
-            // variants (server -> agent) and cannot appear in this match at
-            // all.
+            // No payload, or `Ack` (a low-level ack the server doesn't act
+            // on). PtyOpen/PtyInput/PtyResize/PtyClose are
+            // `server_frame::Payload` (server -> agent) and cannot appear here.
         }
     }
 
@@ -499,13 +480,12 @@ fn internal_error(context: &str, err: &anyhow::Error) -> Status {
 }
 
 /// Serve the agent-facing gRPC surface with mTLS: server-authenticated always,
-/// client-authenticated OPTIONALLY (PRD §5.4). `server_identity` is
-/// `(cert_pem, key_pem)` for the control plane's own leaf, issued by the
-/// internal CA at startup. A presented client cert is validated against the
-/// internal CA (`client_ca_root`), but `client_auth_optional(true)` means one
-/// is not required at the transport level -- `Enroll` (no client cert) keeps
-/// working, while `session` (above) enforces the requirement itself and
-/// rejects calls with no presented cert.
+/// client-authenticated OPTIONALLY (PRD §5.4). `server_identity` is the
+/// control plane's own `(cert_pem, key_pem)` leaf, issued by the internal CA
+/// at startup. `client_auth_optional(true)` validates a presented client cert
+/// against the internal CA (`client_ca_root`) but doesn't require one at the
+/// transport level -- `Enroll` keeps working without one; `session` (above)
+/// enforces its own requirement.
 pub async fn serve(cfg: &Config, svc: AgentSvc, server_identity: (String, String)) -> Result<()> {
     let (cert_pem, key_pem) = server_identity;
     // `svc.ca` is moved into `AgentServiceServer::new(svc)` below, so the CA
@@ -704,12 +684,11 @@ mod tests {
         Ok(())
     }
 
-    /// The OTHER `agent.enroll`/`denied` path: unlike a bad token (above),
-    /// the token here IS valid and consumed -- the request itself is what's
-    /// rejected (no usable `info.machine_id`). Regression coverage for the
-    /// audit-detail fix: this row previously carried zero identifying
-    /// information (actor `system`, every other column `NULL`), making
-    /// "which join token was presented" permanently unanswerable.
+    /// The OTHER `agent.enroll`/`denied` path: unlike a bad token (above), the
+    /// token here IS valid and consumed -- the request itself is what's
+    /// rejected (no usable `info.machine_id`). The token name must still
+    /// survive in `detail`, or "which join token was presented" becomes
+    /// unanswerable.
     #[sqlx::test]
     async fn enroll_with_missing_machine_id_is_denied_and_audited(
         pool: PgPool,
@@ -828,8 +807,7 @@ mod tests {
     async fn handle_agent_frame_hello_then_heartbeat(pool: PgPool) -> anyhow::Result<()> {
         // Seed a machine directly (pre-`Hello`, `status = 'pending'` per the
         // schema default) rather than going through `enroll` -- `Session`'s
-        // authn is out of scope for this seam test (Task 11 covers it
-        // end-to-end over real mTLS).
+        // authn (over real mTLS) is out of scope for this seam test.
         let machine_id = repo::upsert_machine(
             &pool,
             &AgentInfoRow {
@@ -1268,9 +1246,9 @@ mod tests {
     }
 
     /// A LogChunk must reach the tail's sink, keyed by the authenticated
-    /// machine_id, and must NOT refresh last_seen_at — a streaming log is not
-    /// evidence that the agent's heartbeat path is alive, and treating it as
-    /// such would let a busy log mask a wedged agent.
+    /// machine_id, and must NOT refresh last_seen_at (same trap as
+    /// `handle_agent_frame`'s `LogChunk` arm -- see its "Deliberately no
+    /// `mark_online`" comment).
     #[sqlx::test]
     async fn handle_agent_frame_log_chunk_reaches_the_tail(pool: PgPool) -> anyhow::Result<()> {
         let machine_id = repo::upsert_machine(

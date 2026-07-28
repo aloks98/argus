@@ -22,17 +22,13 @@ use uuid::Uuid;
 /// (which fills the buffer) and the WS output task (which drains it).
 ///
 /// `buffered` and `paused` are guarded as ONE unit (a single `Mutex`, not two
-/// independent atomics) so a fill (`deliver_pty_output`) racing a drain
-/// (`on_pty_drained`) can never compute "should we flip the edge" from a torn
-/// combination of the two — e.g. reading a byte count one task just updated
-/// but a `paused` flag the other hasn't caught up to yet. Review fix: the
-/// original independent-atomics version let a dropped `PtyFlow` send (the
-/// agent's shared outbound channel is only 16 deep and carries everything)
-/// leave this pair permanently out of sync with what the agent actually
-/// knows — either latching `paused` true forever with the frame never sent
-/// (suppressing every future pause attempt), or, worse, recording locally
-/// "resumed" while the agent is still genuinely parked, wedging the terminal
-/// with no error, no eof, and no close until the 30-minute idle timer.
+/// independent atomics), so a fill racing a drain can never compute the
+/// pause/resume edge from a torn combination of the two. Independent
+/// atomics let a dropped `PtyFlow` send (the agent's outbound channel is
+/// only 16 deep) leave this pair out of sync with the agent -- either
+/// `paused` latches true forever with the frame never sent, or we record
+/// "resumed" while the agent is still parked, wedging the terminal with no
+/// error, eof, or close until the 30-minute idle timer.
 pub struct PtyFlowState {
     inner: Mutex<PtyFlowInner>,
 }
@@ -47,16 +43,13 @@ struct PtyFlowInner {
 /// `epoch` distinguishes successive connections of the same machine so a
 /// lingering old session's teardown can't evict a freshly-reconnected one.
 ///
-/// `shutdown` is the other half of that story: the epoch guard stops a STALE
-/// disconnect from evicting a NEWER registration, but by itself does nothing
-/// to stop the STALE session's server-side loop from continuing to run --
-/// left alone, it would keep pumping heartbeats (marking the machine online)
-/// while no longer reachable via `conns` for verb/log/terminal dispatch. Each
-/// `register` hands the caller a clone of ITS OWN handle's `shutdown`, for the
-/// session loop to select on; when a later `register` for the same machine
-/// replaces this handle, it fires `shutdown` so that loop notices promptly
-/// and exits through the normal teardown path instead of lingering
-/// alive-but-unroutable.
+/// `shutdown` covers the other failure mode: the epoch guard alone doesn't
+/// stop the STALE session's server-side loop from continuing to run --
+/// unrouted via `conns`, but still pumping heartbeats and marking the
+/// machine online. Each `register` hands the caller its own handle's
+/// `shutdown` to select on; a later `register` for the same machine fires
+/// it, so the superseded loop notices and exits through the normal
+/// teardown path instead of lingering alive-but-unroutable.
 struct ConnHandle {
     tx: mpsc::Sender<Result<ServerFrame, Status>>,
     next_stream_id: AtomicU64,
@@ -108,12 +101,8 @@ impl Hub {
 
     /// Register a live connection, returning its epoch and a shutdown signal
     /// for the CALLER's own session loop to select on. A re-register for the
-    /// same machine replaces the old handle (last writer wins) -- and, unlike
-    /// before, fires the OLD handle's shutdown signal on the way out, so that
-    /// superseded session's loop wakes promptly and exits through the normal
-    /// teardown path (rather than lingering alive-but-unroutable: still
-    /// pumping heartbeats server-side with no way for the hub to route verbs/
-    /// logs/terminal to it anymore).
+    /// same machine replaces the old handle and fires its shutdown signal
+    /// (see `ConnHandle`'s doc comment for why).
     pub fn register(
         &self,
         machine_id: Uuid,
@@ -145,15 +134,14 @@ impl Hub {
         }
     }
 
-    /// Whether a machine currently has a live registered Session. Used by
-    /// the terminal WS handler to tell apart two failure modes that look
-    /// identical from the receiving end (a PTY's output channel just closes
-    /// with no `eof` marker): the whole agent connection ending
-    /// (`close_ptys_for`, called from `grpc.rs` strictly AFTER `unregister`)
-    /// versus `deliver_pty_output`'s single-session overrun backstop
-    /// (`close_pty`, which never touches `conns`). By the time a caller
-    /// observes the channel closed, `unregister` for a real disconnect has
-    /// already run, so this is a reliable way to distinguish the two.
+    /// Whether a machine currently has a live registered Session. Used by the
+    /// terminal WS handler to tell apart two failure modes that look identical
+    /// from the receiving end (a PTY output channel just closes with no
+    /// `eof`): the whole connection ending (`close_ptys_for`, called strictly
+    /// AFTER `unregister`) versus `deliver_pty_output`'s single-session
+    /// overrun backstop (`close_pty`, which never touches `conns`). By the
+    /// time a caller sees the channel closed, a real disconnect's
+    /// `unregister` has already run, making this reliable.
     pub fn is_connected(&self, machine_id: Uuid) -> bool {
         self.conns.lock().unwrap().contains_key(&machine_id)
     }
@@ -296,7 +284,6 @@ impl Hub {
     /// Called by the gRPC frame handler as `LogChunk` frames arrive on the
     /// agent's Session stream.
     pub fn deliver_chunk(&self, request_id: &str, machine_id: Uuid, chunk: LogChunk) {
-        // Extract the sender under the lock, then send after dropping the guard.
         let sender = {
             let tails = self.tails.lock().unwrap();
             match tails.get(request_id) {
@@ -399,14 +386,12 @@ impl Hub {
     /// `PtyFlow{paused:true}` so the agent throttles. A full channel is the
     /// unreachable-by-sizing defensive teardown (never a dropped byte).
     ///
-    /// Channel contract (this is what the WS handler must consume): the
-    /// channel carries `Vec<u8>` items, and an EMPTY item is *exclusively* the
-    /// eof marker -- a real chunk is never forwarded empty. That is enforced
-    /// structurally right here, not by convention on the agent side: a
-    /// `PtyOutput{data: [], eof: false}` (genuinely nothing to deliver, not
-    /// eof) is dropped before it would ever reach the channel, so it can never
-    /// be confused with the marker below. The only way an empty `Vec` reaches
-    /// the receiver is the explicit eof push.
+    /// Channel contract (what the WS handler must rely on): an EMPTY `Vec<u8>`
+    /// item is *exclusively* the eof marker -- a real chunk is never forwarded
+    /// empty, and this is enforced structurally here (not by agent-side
+    /// convention): a genuinely-empty, non-eof `PtyOutput` is dropped before
+    /// it would ever reach the channel, so it can never be confused with the
+    /// eof marker.
     pub fn deliver_pty_output(&self, session_id: &str, machine_id: Uuid, data: Vec<u8>, eof: bool) {
         let (sender, state) = {
             let ptys = self.ptys.lock().unwrap();
@@ -415,9 +400,7 @@ impl Hub {
                 _ => return,
             }
         };
-        // Nothing to deliver and not eof: dropping this is free (zero bytes
-        // change nothing on screen) and is what keeps the invariant above
-        // true -- forwarding it would be indistinguishable from eof.
+        // Dropping this is free and matches the eof-marker invariant above.
         if data.is_empty() && !eof {
             return;
         }
@@ -461,17 +444,13 @@ impl Hub {
                 .try_send_pty_flow(machine_id, session_id, true)
                 .is_err()
         {
-            // The frame never reached the agent (its shared 16-slot outbound
-            // channel is fullest exactly under load, i.e. exactly when this
-            // fires). Roll the local flag back to false rather than leaving
-            // it latched true with nobody told: the agent keeps flooding
-            // regardless (it was never actually paused), so the very next
-            // byte that crosses high-water will retry this send -- `deliver_
-            // pty_output` MUST stay non-blocking/non-awaiting here (it runs
-            // on the never-stall gRPC inbound drain), so this is a best-
-            // effort retry-on-next-edge rather than a guaranteed delivery
-            // (contrast `on_pty_drained`'s resume path below, which CAN
-            // afford to await and so gets a stronger guarantee).
+            // The frame never reached the agent (its outbound channel is fullest
+            // exactly under load, i.e. exactly when this fires). Roll `paused`
+            // back to false rather than leaving it latched true with the agent
+            // never actually told -- the next byte crossing high-water retries.
+            // This must stay non-blocking (no await, per the gRPC inbound
+            // drain's never-stall rule), so it's best-effort, unlike
+            // `on_pty_drained`'s guaranteed resume below.
             let mut inner = state.inner.lock().unwrap();
             inner.paused = false;
         }
@@ -481,18 +460,13 @@ impl Hub {
     /// the byte counter reflects what is still buffered. On dropping below the
     /// low-water mark, emits `PtyFlow{paused:false}`.
     ///
-    /// Async (unlike `deliver_pty_output`): the caller is the WS outbound
-    /// task, which already awaits the socket send, so this can afford to
-    /// await room on the agent's outbound channel too -- a GUARANTEED
-    /// delivery rather than a best-effort `try_send`. That matters
-    /// specifically for the resume edge: a dropped resume is what wedges a
-    /// terminal forever (the agent stays parked, so no more output ever
-    /// arrives to give a pause edge -- and thus no more `deliver_pty_output`
-    /// calls -- a chance to retry), whereas a dropped pause naturally gets
-    /// retried by the next byte the still-flooding agent produces. Making
-    /// resume undroppable (as long as the agent is still connected at all)
-    /// closes that gap at the source instead of hoping for a retry that may
-    /// never come.
+    /// Async (unlike `deliver_pty_output`): the WS outbound task already awaits
+    /// the socket send, so this can afford to await room on the agent's
+    /// channel too -- a GUARANTEED delivery, unlike the pause edge's
+    /// best-effort `try_send`. A dropped resume wedges the terminal forever
+    /// (the parked agent produces no more output to retry the edge), whereas a
+    /// dropped pause naturally gets retried by the next byte the still-flooding
+    /// agent sends.
     pub async fn on_pty_drained(&self, session_id: &str, len: usize) {
         let (machine_id, state) = {
             let ptys = self.ptys.lock().unwrap();
@@ -783,10 +757,9 @@ mod tests {
 
     #[tokio::test]
     async fn register_replacing_a_live_handle_fires_the_old_handles_shutdown_signal() {
-        // The exact inversion of the bug: A connects, then B connects for the
-        // same machine (replacing A). A's shutdown signal must fire so its
-        // session loop can exit, and the hub must still route to B -- its tx
-        // works and the registry is non-empty.
+        // A connects, then B connects for the same machine (replacing A). A's
+        // shutdown signal must fire so its session loop can exit, and the hub
+        // must still route to B -- its tx works and the registry is non-empty.
         let hub = Hub::new();
         let m = Uuid::new_v4();
         let (tx_a, _rx_a) = mpsc::channel(1);
@@ -1104,20 +1077,12 @@ mod tests {
         }
     }
 
-    /// The measured shape of the review's live-firehose reproduction (`seq 1
-    /// 200000` in a real terminal: 1,488,985 bytes across 10,818 `PtyOutput`
-    /// frames, ~138 bytes/chunk) -- NOT the 64 KiB the original sizing
-    /// assumed. Feeds many ~138-byte chunks, without draining the receiver
-    /// (mirrors a browser renderer that can't keep up), and asserts the BYTE
-    /// watermark binds before the message-count channel cap does: a
-    /// `PtyFlow{paused:true}` must come out, and the session must still be
-    /// alive afterward -- not torn down by the full-channel backstop.
-    ///
-    /// This must fail against the old `PTY_CHANNEL_CAP = 2048`: at 138
-    /// bytes/chunk the channel fills (2048 messages) at ~283 KiB, well below
-    /// `PTY_HIGH_WATER` (1 MiB — reached only after ~7,600 chunks), so the
-    /// full-channel teardown fires FIRST and this test's `PtyClose` branch
-    /// panics instead of ever seeing a `PtyFlow`.
+    /// Realistic PTY output arrives as many small chunks (~138 bytes each), not
+    /// one 64 KiB block. Feeds many such chunks without draining the receiver
+    /// (mirrors a slow browser renderer), and asserts the BYTE watermark binds
+    /// before the message-count channel cap does: a `PtyFlow{paused:true}` must
+    /// come out, and the session must still be alive afterward -- not torn down
+    /// by the full-channel backstop.
     #[tokio::test]
     async fn many_small_chunks_trip_the_byte_watermark_before_the_channel_fills() {
         let hub = Hub::new();
@@ -1265,19 +1230,13 @@ mod tests {
         );
     }
 
-    /// Finding 2: a dropped `PtyFlow{paused:true}` send (the agent's shared
-    /// 16-slot outbound channel is fullest exactly under load, i.e. exactly
-    /// when a pause would fire) must NOT leave the local `paused` flag
-    /// latched true with the frame never having gone out -- that would
-    /// suppress every future pause attempt (the CAS-style edge check only
-    /// fires when the old value was false) while the agent, never actually
-    /// told to pause, keeps flooding regardless. The fix rolls `paused` back
-    /// to false on send failure so the very next byte crossing high-water
-    /// retries.
-    ///
-    /// This must fail against the old fire-and-forget code, which did
-    /// `state.paused.swap(true, ..)` unconditionally BEFORE attempting the
-    /// send and never rolled back on failure.
+    /// A dropped `PtyFlow{paused:true}` send (the agent's shared 16-slot
+    /// outbound channel is fullest exactly under load, i.e. exactly when a
+    /// pause would fire) must NOT leave the local `paused` flag latched true
+    /// with the frame never having gone out -- that would suppress every
+    /// future pause attempt while the agent, never actually told to pause,
+    /// keeps flooding regardless. Rolls `paused` back to false on send
+    /// failure so the next byte crossing high-water retries.
     #[tokio::test]
     async fn a_dropped_pause_frame_does_not_latch_paused_with_no_recovery() {
         let hub = Hub::new();
@@ -1330,8 +1289,7 @@ mod tests {
         let machine_id = Uuid::new_v4();
         let (session_id, mut rx, _state) = hub.open_pty(machine_id);
 
-        // A genuinely empty, non-eof chunk must be dropped, not forwarded --
-        // forwarding it would be indistinguishable from the eof marker below.
+        // Must be dropped, not forwarded -- see the doc comment above for why.
         hub.deliver_pty_output(&session_id, machine_id, Vec::new(), false);
         assert!(
             rx.try_recv().is_err(),
@@ -1356,8 +1314,7 @@ mod tests {
 
     /// Eof with no trailing data (the shell exits with nothing left to flush)
     /// must still produce exactly the marker -- no phantom empty chunk before
-    /// it, since that would already have been the (indistinguishable) case
-    /// this task's fix rules out.
+    /// it, which would be indistinguishable from a real empty non-eof chunk.
     #[tokio::test]
     async fn deliver_pty_output_eof_with_no_trailing_data_sends_only_the_marker() {
         let hub = Hub::new();

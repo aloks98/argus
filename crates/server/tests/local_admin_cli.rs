@@ -9,9 +9,8 @@
 //! first thing in `main()`. Nothing else in the suite would catch a future
 //! contributor inserting a line above it (an early metrics hook, a log line,
 //! a feature-flag read); this test runs the actual COMPILED BINARY as a
-//! subprocess with the WHOLE environment cleared except `ARGUS_DATABASE_URL`
-//! -- the strongest manual proof performed during implementation and review,
-//! automated so a regression fails in CI instead of during a real outage.
+//! subprocess with the WHOLE environment cleared except `ARGUS_DATABASE_URL`,
+//! so a regression fails in CI instead of during a real outage.
 //!
 //! Needs a real, already-migrated Postgres reachable via `ARGUS_DATABASE_URL`
 //! (or bare `DATABASE_URL`, which is all `.forgejo/workflows/ci.yml` sets --
@@ -20,15 +19,12 @@
 //! NOT `#[ignore]`d: it runs in the ordinary `cargo test --workspace` step,
 //! same as every other DB-backed test in this crate.
 //!
-//! CAUTION: `local_admin` is a single, upsert-only row (the break-glass
-//! credential, not a user table) -- rotating it in place is the exact
-//! property under test, so this necessarily overwrites whatever is there
-//! while it runs. In CI that's harmless (the Postgres container is discarded
-//! at the end of the job); to avoid surprising a developer running this
-//! locally against a real dev database, the test captures whatever row
-//! exists beforehand and restores it (or removes the row if none existed)
+//! CAUTION: `local_admin` is a single, upsert-only row, so this test
+//! necessarily overwrites it while running. Harmless in CI (the Postgres
+//! container is discarded afterward); locally, the test captures whatever
+//! row exists beforehand and restores it (or deletes it if none existed)
 //! before making any assertion, so a real local-admin credential a developer
-//! is relying on survives this test either way.
+//! is relying on survives either way.
 //!
 //! Also covers the CLI's audit write (`Actor::System`, action
 //! `local_admin.reset`): unlike `local_admin`, `audit_log` is an
