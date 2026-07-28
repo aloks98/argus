@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        UPDATE machines SET\n            hostname      = $2,\n            os            = $3,\n            kernel        = $4,\n            arch          = $5,\n            primary_ip    = $6::text::inet,\n            agent_version = $7,\n            capabilities  = coalesce($8, machines.capabilities),\n            cpu_model     = coalesce($9, machines.cpu_model),\n            cpu_cores     = coalesce($10, machines.cpu_cores),\n            boot_time     = coalesce($11, machines.boot_time),\n            virt          = coalesce($12, machines.virt),\n            updated_at    = now()\n        WHERE id = $1\n        ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "TextArray",
+        "Text",
+        "Int4",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "30a39e767a4d837f9459549ad964c77428ce9ec22d6da1fd118041009f85210a"
+}

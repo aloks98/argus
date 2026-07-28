@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT cpu_model, cpu_cores, virt, boot_time FROM machines WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "cpu_model",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "cpu_model"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "cpu_cores",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "cpu_cores"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "virt",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "virt"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "boot_time",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "boot_time"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true,
+      true,
+      true
+    ]
+  },
+  "hash": "4ca3a275e84daee2563a3422f16027b56d5f2650b1d1814534dc4fbb985662b5"
+}

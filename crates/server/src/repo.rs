@@ -45,6 +45,14 @@ pub struct AgentInfoRow {
     /// `None` = the agent never reported (stored as NULL, gates nothing).
     /// `Some(vec![])` = reported and this host has none (gates everything).
     pub capabilities: Option<Vec<String>>,
+    /// Hardware/inventory fields added for the inventory slice. Same tri-state
+    /// discipline as `capabilities`: `None` = not reported (write paths
+    /// `coalesce` so an old agent's Hello never erases a previously-stored
+    /// value).
+    pub cpu_model: Option<String>,
+    pub cpu_cores: Option<i32>,
+    pub boot_time: Option<OffsetDateTime>,
+    pub virt: Option<String>,
 }
 
 /// Hash `token_plain` with sha256 and atomically check-and-consume the
@@ -215,8 +223,8 @@ pub async fn upsert_machine(
     // pulling in the `ipnetwork` sqlx feature just for this one column.
     let row = sqlx::query!(
         r#"
-        INSERT INTO machines (machine_id, hostname, os, kernel, arch, primary_ip, agent_version, capabilities)
-        VALUES ($1, $2, $3, $4, $5, $6::text::inet, $7, $8)
+        INSERT INTO machines (machine_id, hostname, os, kernel, arch, primary_ip, agent_version, capabilities, cpu_model, cpu_cores, boot_time, virt)
+        VALUES ($1, $2, $3, $4, $5, $6::text::inet, $7, $8, $9, $10, $11, $12)
         ON CONFLICT (machine_id) DO UPDATE SET
             hostname      = EXCLUDED.hostname,
             os            = EXCLUDED.os,
@@ -225,6 +233,10 @@ pub async fn upsert_machine(
             primary_ip    = EXCLUDED.primary_ip,
             agent_version = EXCLUDED.agent_version,
             capabilities  = coalesce(EXCLUDED.capabilities, machines.capabilities),
+            cpu_model     = coalesce(EXCLUDED.cpu_model, machines.cpu_model),
+            cpu_cores     = coalesce(EXCLUDED.cpu_cores, machines.cpu_cores),
+            boot_time     = coalesce(EXCLUDED.boot_time, machines.boot_time),
+            virt          = coalesce(EXCLUDED.virt, machines.virt),
             updated_at    = now()
         RETURNING id
         "#,
@@ -236,6 +248,10 @@ pub async fn upsert_machine(
         info.primary_ip,
         info.agent_version,
         info.capabilities.as_deref(),
+        info.cpu_model,
+        info.cpu_cores,
+        info.boot_time,
+        info.virt,
     )
     .fetch_one(executor)
     .await?;
@@ -271,6 +287,10 @@ pub async fn update_machine_inventory(
             primary_ip    = $6::text::inet,
             agent_version = $7,
             capabilities  = coalesce($8, machines.capabilities),
+            cpu_model     = coalesce($9, machines.cpu_model),
+            cpu_cores     = coalesce($10, machines.cpu_cores),
+            boot_time     = coalesce($11, machines.boot_time),
+            virt          = coalesce($12, machines.virt),
             updated_at    = now()
         WHERE id = $1
         "#,
@@ -282,6 +302,10 @@ pub async fn update_machine_inventory(
         info.primary_ip,
         info.agent_version,
         info.capabilities.as_deref(),
+        info.cpu_model,
+        info.cpu_cores,
+        info.boot_time,
+        info.virt,
     )
     .execute(executor)
     .await?;
@@ -1020,6 +1044,10 @@ mod tests {
             primary_ip: None,
             agent_version: None,
             capabilities: None,
+            cpu_model: None,
+            cpu_cores: None,
+            boot_time: None,
+            virt: None,
         }
     }
 
@@ -1095,6 +1123,10 @@ mod tests {
             primary_ip: Some("10.0.0.5".into()),
             agent_version: Some("0.1.0".into()),
             capabilities: None,
+            cpu_model: None,
+            cpu_cores: None,
+            boot_time: None,
+            virt: None,
         };
         let id1 = upsert_machine(&pool, &info_v1).await.expect("first upsert");
 
@@ -1139,6 +1171,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: None,
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await
@@ -1199,6 +1235,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: None,
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await
@@ -1557,6 +1597,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: Some(vec!["systemd".into(), "journal".into()]),
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1582,6 +1626,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: Some(vec![]),
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1607,6 +1655,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: None,
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1641,6 +1693,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: Some(vec!["systemd".into()]),
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1658,6 +1714,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: None,
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1695,6 +1755,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: Some(vec!["systemd".into()]),
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1710,6 +1774,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: Some(vec![]),
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1747,6 +1815,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: Some(vec!["systemd".into()]),
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1764,6 +1836,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: None,
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1791,6 +1867,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: Some(vec!["systemd".into(), "docker".into()]),
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1804,6 +1884,47 @@ mod tests {
             Some(vec!["systemd".to_string(), "docker".to_string()]),
             "update_machine_inventory must apply an explicit new report"
         );
+        Ok(())
+    }
+
+    /// The load-bearing invariant of the inventory slice: the four hardware
+    /// columns (`cpu_model`/`cpu_cores`/`boot_time`/`virt`) added alongside
+    /// `capabilities` must obey the SAME tri-state discipline -- a `None`
+    /// report never erases a previously-stored value.
+    ///
+    /// The seed write uses `upsert_machine` with a FULL inventory, which is
+    /// acceptable even though `upsert_machine` is one of the two functions
+    /// under test: that first call isn't what's being asserted on. The
+    /// assertions below all target the SECOND write (an old, all-None
+    /// agent's report) -- exercised through both `update_machine_inventory`
+    /// (the Hello-path refresh) and `upsert_machine` again (the enroll path),
+    /// per the brief's "both paths, same invariant".
+    #[sqlx::test]
+    async fn old_agent_hello_does_not_erase_inventory(pool: PgPool) -> anyhow::Result<()> {
+        // Full inventory arrives once (new agent)...
+        let mut info = test_agent_info("m-inv");
+        info.cpu_model = Some("AMD Ryzen 7 5800X".into());
+        info.cpu_cores = Some(8);
+        info.boot_time = Some(OffsetDateTime::from_unix_timestamp(1_700_000_000)?);
+        info.virt = Some("kvm".into());
+        let id = upsert_machine(&pool, &info).await?;
+
+        // ...then an OLD agent's Hello: the same machine, all four fields None
+        // (that's exactly what ""/0 on the wire map to). Nothing may be erased.
+        let old = test_agent_info("m-inv");
+        update_machine_inventory(&pool, id, &old).await?;
+        upsert_machine(&pool, &old).await?; // both paths, same invariant
+
+        let row = sqlx::query!(
+            "SELECT cpu_model, cpu_cores, virt, boot_time FROM machines WHERE id = $1",
+            id
+        )
+        .fetch_one(&pool)
+        .await?;
+        assert_eq!(row.cpu_model.as_deref(), Some("AMD Ryzen 7 5800X"));
+        assert_eq!(row.cpu_cores, Some(8));
+        assert_eq!(row.virt.as_deref(), Some("kvm"));
+        assert!(row.boot_time.is_some());
         Ok(())
     }
 

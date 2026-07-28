@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgPool;
 use std::pin::Pin;
 use std::sync::Arc;
+use time::OffsetDateTime;
 use tokio::sync::mpsc;
 use tokio_stream::{Stream, StreamExt};
 use tonic::transport::{Certificate, Identity, Server, ServerTlsConfig};
@@ -471,6 +472,15 @@ fn agent_info_row(info: &argus_proto::v1::AgentInfo) -> AgentInfoRow {
         capabilities: info
             .capabilities_reported
             .then(|| info.capabilities.clone()),
+        cpu_model: non_empty(&info.cpu_model),
+        cpu_cores: (info.cpu_cores > 0).then_some(info.cpu_cores as i32),
+        // An absurd value from a bad clock fails `from_unix_timestamp` --
+        // degrade to None (not-reported) rather than erroring the whole
+        // session over one clock-skewed field.
+        boot_time: (info.boot_time > 0)
+            .then(|| OffsetDateTime::from_unix_timestamp(info.boot_time).ok())
+            .flatten(),
+        virt: non_empty(&info.virt),
     }
 }
 
@@ -831,6 +841,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: None,
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -945,6 +959,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: None,
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -960,6 +978,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: None,
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1048,6 +1070,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: None,
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1123,6 +1149,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: None,
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1176,6 +1206,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: None,
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1250,6 +1284,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: None,
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1314,6 +1352,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: None,
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1383,6 +1425,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: None,
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
@@ -1397,6 +1443,10 @@ mod tests {
                 primary_ip: None,
                 agent_version: None,
                 capabilities: None,
+                cpu_model: None,
+                cpu_cores: None,
+                boot_time: None,
+                virt: None,
             },
         )
         .await?;
