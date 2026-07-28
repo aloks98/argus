@@ -43,6 +43,7 @@ import MachineIdentity from "../components/MachineIdentity";
 import SpecStrip from "../components/SpecStrip";
 import type { SpecItem } from "../components/SpecStrip";
 import StatusBadge from "../components/StatusBadge";
+import SystemCard from "../components/SystemCard";
 import TerminalView from "../components/TerminalView";
 import TimeSeriesChart from "../components/TimeSeriesChart";
 import type { ChartSeries } from "../components/TimeSeriesChart";
@@ -51,12 +52,13 @@ import { BOOT_LOGS, CAP_DOCKER, CAP_JOURNAL, CAP_SYSTEMD, SYSTEM_JOURNAL } from 
 import { cn } from "../lib/cn";
 import { displayName } from "../lib/fleet";
 import { useLogFilters } from "../lib/logFilters";
-import { formatBytes, formatBytesPerSec, formatRelative } from "../lib/format";
+import { formatBytes, formatBytesPerSec, formatRelative, formatUptime } from "../lib/format";
 import {
   buildCpuSeries,
   buildLoadSeries,
   buildMemUsedSeries,
   latestMem,
+  latestResources,
   buildNetRateSeries,
 } from "../lib/metrics";
 import { useDocker, useMachine, useMetrics, useSystemd } from "../lib/queries";
@@ -160,6 +162,10 @@ export default function MachineDetailPage() {
   const lacks = (cap: string) => caps !== null && !caps.includes(cap);
   const TABS: { key: string; label: string; disabled?: boolean; reason?: string }[] = [
     { key: "overview", label: "Overview" },
+    // Not capability-gated: every machine has system facts (or the omission
+    // rule renders an empty-ish card), unlike Containers/Units/Logs which
+    // depend on the agent's reported capabilities.
+    { key: "system", label: "System" },
     {
       key: "containers",
       label: "Containers",
@@ -249,11 +255,23 @@ export default function MachineDetailPage() {
   const cpuPoints = buildCpuSeries(metrics);
   const memPoints = buildMemUsedSeries(metrics);
   const memNow = latestMem(metrics);
+  const resources = latestResources(metrics);
   const loadPoints = buildLoadSeries(metrics);
   const netPoints = buildNetRateSeries(metrics);
   const latestNet =
     netPoints.length > 0 ? netPoints[netPoints.length - 1] : null;
 
+  // `!= null` (not `!==`): boot_time is an additive proto column, so a
+  // frontend newer than the server it's talking to sees `undefined` here,
+  // not `null` — strict equality would let that slip through to
+  // formatUptime and render "up NaNm". Same reasoning applies wherever this
+  // page and SystemCard read the inventory/resource fields added this slice.
+  const uptime = machine.boot_time != null ? formatUptime(machine.boot_time) : "";
+
+  // Slimmed to five items (live review: the nine-item version was too
+  // crowded) — Kernel/Arch/Agent/Processor/Virtualization/Disk/Memory/Swap
+  // moved to the System tab (SystemCard). Uptime stays: tiny and ops-useful
+  // at a glance.
   const specItems: SpecItem[] = [
     {
       label: "Status",
@@ -261,9 +279,7 @@ export default function MachineDetailPage() {
     },
     ...(machine.os !== null ? [{ label: "OS", value: machine.os }] : []),
     ...(machine.primary_ip !== null ? [{ label: "Address", value: machine.primary_ip }] : []),
-    ...(machine.kernel !== null ? [{ label: "Kernel", value: machine.kernel }] : []),
-    ...(machine.arch !== null ? [{ label: "Arch", value: machine.arch }] : []),
-    ...(machine.agent_version !== null ? [{ label: "Agent", value: machine.agent_version }] : []),
+    ...(uptime !== "" ? [{ label: "Uptime", value: uptime }] : []),
     { label: "Last seen", value: formatRelative(machine.last_seen_at) },
   ];
 
@@ -505,6 +521,10 @@ export default function MachineDetailPage() {
               format={formatBytesPerSec}
             />
           </div>
+        </TabsContent>
+
+        <TabsContent value="system" className="mt-4">
+          <SystemCard machine={machine} resources={resources} memNow={memNow} />
         </TabsContent>
 
         <TabsContent value="containers" className="mt-4">

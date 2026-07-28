@@ -1,0 +1,39 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "\n        INSERT INTO machines (machine_id, hostname, os, kernel, arch, primary_ip, agent_version, capabilities, cpu_model, cpu_cores, boot_time, virt)\n        VALUES ($1, $2, $3, $4, $5, $6::text::inet, $7, $8, $9, $10, $11, $12)\n        ON CONFLICT (machine_id) DO UPDATE SET\n            hostname      = EXCLUDED.hostname,\n            os            = EXCLUDED.os,\n            kernel        = EXCLUDED.kernel,\n            arch          = EXCLUDED.arch,\n            primary_ip    = EXCLUDED.primary_ip,\n            agent_version = EXCLUDED.agent_version,\n            capabilities  = coalesce(EXCLUDED.capabilities, machines.capabilities),\n            cpu_model     = coalesce(EXCLUDED.cpu_model, machines.cpu_model),\n            cpu_cores     = coalesce(EXCLUDED.cpu_cores, machines.cpu_cores),\n            boot_time     = coalesce(EXCLUDED.boot_time, machines.boot_time),\n            virt          = coalesce(EXCLUDED.virt, machines.virt),\n            updated_at    = now()\n        RETURNING id\n        ",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "Text",
+        "TextArray",
+        "Text",
+        "Int4",
+        "Timestamptz",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d793bb83ef4f24c95b57d9e6713cd073fe4562d3b093affa966ad7e3eaac6673"
+}

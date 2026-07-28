@@ -104,6 +104,8 @@ export async function getFleet(): Promise<FleetRow[]> {
 
 export type MachineDetail = {
   id: string;
+  /** `/etc/machine-id` — distinct from `id` (the control plane's own row id). */
+  machine_id: string;
   hostname: string;
   display_name: string | null;
   os: string | null;
@@ -118,6 +120,12 @@ export type MachineDetail = {
   notes: string | null;
   /** `null` = the agent never reported; gate nothing. */
   capabilities: string[] | null;
+  cpu_model: string | null;
+  cpu_cores: number | null;
+  /** RFC3339. `null` = unreported; render nothing (never a stale/zero uptime). */
+  boot_time: string | null;
+  /** `"none"` is a real answer (bare metal), not an absent one. */
+  virt: string | null;
 };
 
 // Capability strings the agent may report in `MachineDetail.capabilities`.

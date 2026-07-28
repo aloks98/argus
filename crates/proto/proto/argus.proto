@@ -43,6 +43,14 @@ message AgentInfo {
   // capability-aware agent on a bare host (gate everything) must produce
   // opposite UI behaviour -- so the distinction is carried explicitly.
   bool capabilities_reported = 9;
+
+  // Hardware/runtime inventory (additive, best-effort). Empty string / zero
+  // means "not reported" -- the server maps those to NULL and coalesces, so
+  // an agent predating these fields cannot erase stored values.
+  string cpu_model = 10;   // e.g. "AMD Ryzen 7 5800X 8-Core Processor"
+  uint32 cpu_cores = 11;   // logical cores; 0 = not reported
+  int64 boot_time = 12;    // epoch seconds; 0 = not reported
+  string virt = 13;        // systemd-detect-virt stdout ("kvm", "lxc", "none")
 }
 
 // ---- Session multiplexing --------------------------------------------------
