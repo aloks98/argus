@@ -347,3 +347,66 @@ export async function fetchLogPage(
   if (!r.ok) throw new Error(`log page ${r.status}`);
   return (await r.json()) as LogPage;
 }
+
+export type MachinePatchBody = {
+  display_name?: string | null;
+  notes?: string | null;
+  tags?: string[];
+};
+
+export async function patchMachine(id: string, patch: MachinePatchBody): Promise<MachineDetail> {
+  const r = unauthenticatedOr(
+    await fetch(`/api/machines/${id}`, {
+      method: "PATCH",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(patch),
+    }),
+  );
+  if (!r.ok) throw new Error(await r.text().catch(() => `update failed: ${r.status}`));
+  return r.json();
+}
+
+export type EnrollmentToken = {
+  id: string;
+  name: string;
+  display_name: string | null;
+  tags: string[];
+  max_uses: number | null;
+  uses: number;
+  expires_at: string | null;
+  revoked: boolean;
+  created_by: string | null;
+  created_at: string;
+};
+
+export type MintTokenBody = {
+  name: string;
+  display_name?: string;
+  tags?: string[];
+  max_uses?: number | null;
+  expires_in_hours?: number | null;
+};
+
+export async function listTokens(): Promise<EnrollmentToken[]> {
+  const r = unauthenticatedOr(await fetch("/api/enrollment-tokens"));
+  if (!r.ok) throw new Error(`tokens ${r.status}`);
+  return r.json();
+}
+
+/** The `token` field is the raw secret, present ONLY in this response. */
+export async function mintToken(body: MintTokenBody): Promise<EnrollmentToken & { token: string }> {
+  const r = unauthenticatedOr(
+    await fetch("/api/enrollment-tokens", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify(body),
+    }),
+  );
+  if (!r.ok) throw new Error(await r.text().catch(() => `mint failed: ${r.status}`));
+  return r.json();
+}
+
+export async function revokeToken(id: string): Promise<void> {
+  const r = unauthenticatedOr(await fetch(`/api/enrollment-tokens/${id}`, { method: "DELETE" }));
+  if (!r.ok) throw new Error(`revoke failed: ${r.status}`);
+}
