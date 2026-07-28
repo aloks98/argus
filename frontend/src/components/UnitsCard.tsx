@@ -66,9 +66,7 @@ export default function UnitsCard({
   return (
     <>
       <div className="flex flex-wrap items-baseline gap-2 pb-2">
-        <h2 className="font-display text-sm uppercase tracking-widest">
-          Units
-        </h2>
+        <h2 className="font-display text-sm uppercase tracking-widest">Units</h2>
         <span className="font-mono text-[11px] text-muted-foreground normal-case tracking-normal">
           {units.length} unit{units.length === 1 ? "" : "s"}
           {failed > 0 && ` · ${failed} failed`}
@@ -114,8 +112,8 @@ export default function UnitsCard({
           </AlertTitle>
           <AlertDescription>
             <span className="font-mono">{action.variables?.unit}</span> —
-            systemd reported the job completed. The row below updates on the
-            next snapshot.
+            systemd reported the job completed. The row below updates on the next
+            snapshot.
           </AlertDescription>
         </Alert>
       )}
@@ -258,11 +256,7 @@ export default function UnitsCard({
                             <Button
                               size="sm"
                               variant="outline"
-                              render={
-                                <Link
-                                  to={`?tab=units&logs=${encodeURIComponent(`journal:${u.name}`)}`}
-                                />
-                              }
+                              render={<Link to={`?tab=units&logs=${encodeURIComponent(`journal:${u.name}`)}`} />}
                               nativeButton={false}
                             >
                               Logs

@@ -50,9 +50,7 @@ export default function ContainersCard({
   return (
     <>
       <div className="flex flex-wrap items-baseline gap-2 pb-2">
-        <h2 className="font-display text-sm uppercase tracking-widest">
-          Containers
-        </h2>
+        <h2 className="font-display text-sm uppercase tracking-widest">Containers</h2>
         <span className="font-mono text-[11px] text-muted-foreground normal-case tracking-normal">
           {containers.length} container{containers.length === 1 ? "" : "s"}
         </span>
@@ -124,18 +122,13 @@ export default function ContainersCard({
                 return (
                   <TableRow key={c.id}>
                     <TableCell className="font-medium">
-                      <AssetTag tone={containerTone(c.state)}>
-                        {c.name}
-                      </AssetTag>
+                      <AssetTag tone={containerTone(c.state)}>{c.name}</AssetTag>
                     </TableCell>
                     <TableCell className="font-mono text-muted-foreground">
                       {c.image}
                     </TableCell>
                     <TableCell>
-                      <StatusBadge
-                        tone={containerTone(c.state)}
-                        label={c.state}
-                      />
+                      <StatusBadge tone={containerTone(c.state)} label={c.state} />
                       {c.health !== "" && (
                         <Badge variant="outline" className="ml-1 font-mono">
                           {c.health}
@@ -167,11 +160,7 @@ export default function ContainersCard({
                           <Button
                             size="sm"
                             variant="outline"
-                            render={
-                              <Link
-                                to={`?tab=containers&logs=${encodeURIComponent(`docker:${c.id}`)}`}
-                              />
-                            }
+                            render={<Link to={`?tab=containers&logs=${encodeURIComponent(`docker:${c.id}`)}`} />}
                             nativeButton={false}
                           >
                             Logs
@@ -182,10 +171,7 @@ export default function ContainersCard({
                             disabled={running}
                             title={running ? "Already running" : undefined}
                             onClick={() =>
-                              action.mutate({
-                                container: c.id,
-                                action: "start",
-                              })
+                              action.mutate({ container: c.id, action: "start" })
                             }
                           >
                             Start
@@ -205,10 +191,7 @@ export default function ContainersCard({
                             size="sm"
                             variant="outline"
                             onClick={() =>
-                              action.mutate({
-                                container: c.id,
-                                action: "restart",
-                              })
+                              action.mutate({ container: c.id, action: "restart" })
                             }
                           >
                             Restart
