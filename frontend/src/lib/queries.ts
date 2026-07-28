@@ -13,10 +13,18 @@ import {
   getMachine,
   getMetrics,
   getSystemd,
+  listTokens,
+  mintToken,
   patchMachine,
+  revokeToken,
   unitAction,
 } from "../api";
-import type { ContainerAction, MachinePatchBody, UnitAction } from "../api";
+import type {
+  ContainerAction,
+  MachinePatchBody,
+  MintTokenBody,
+  UnitAction,
+} from "../api";
 
 /** Polling cadences (ms). Fleet is the scan view, so it refreshes faster. */
 const FLEET_INTERVAL = 5_000;
@@ -31,6 +39,7 @@ export const qk = {
   metrics: (id: string, range: Range) => ["metrics", id, range] as const,
   docker: (id: string) => ["docker", id] as const,
   systemd: (id: string) => ["systemd", id] as const,
+  enrollmentTokens: ["enrollment-tokens"] as const,
 };
 
 export function useFleet() {
@@ -128,6 +137,43 @@ export function useUnitAction(id: string) {
       unitAction(id, vars.unit, vars.action),
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: qk.systemd(id) });
+    },
+  });
+}
+
+/**
+ * Enrollment tokens (Task 9's `/enroll` page). No `refetchInterval` — unlike
+ * the fleet/machine polls, this list only changes in response to this same
+ * page's own mint/revoke mutations, which already invalidate it below.
+ */
+export function useEnrollmentTokens() {
+  return useQuery({
+    queryKey: qk.enrollmentTokens,
+    queryFn: listTokens,
+  });
+}
+
+/**
+ * The raw token in the response is deliberately NOT written anywhere here —
+ * only the caller's local component state holds it (see `EnrollPage`'s
+ * result panel), matching "shown once" (design "Enroll page").
+ */
+export function useMintToken() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (body: MintTokenBody) => mintToken(body),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: qk.enrollmentTokens });
+    },
+  });
+}
+
+export function useRevokeToken() {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: (id: string) => revokeToken(id),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: qk.enrollmentTokens });
     },
   });
 }

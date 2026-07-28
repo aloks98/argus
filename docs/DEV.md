@@ -69,6 +69,8 @@ manual real-host gate instead.
 > container and fail.
 
 ## Enroll an agent
+The `/enroll` page in the UI is the normal way to mint a token; the `psql` steps
+below are the no-UI fallback.
 ```bash
 # 1. Grab the CA cert the agent needs to verify the server:
 docker exec argus-pg psql -U postgres -d argus -tAc \

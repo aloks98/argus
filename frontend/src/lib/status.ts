@@ -52,6 +52,39 @@ export function unitTone(activeState: string): Tone {
   }
 }
 
+/**
+ * Enrollment-token lifecycle, derived client-side from its four contributing
+ * fields (there is no `state` column on the wire). Order matters: a revoked
+ * token reads "revoked" even if it's also past its expiry or used up, and a
+ * used-up token reads that way even if it also happens to be expired.
+ */
+export type TokenState = "revoked" | "used up" | "expired" | "active";
+
+export function tokenState(t: {
+  revoked: boolean;
+  max_uses: number | null;
+  uses: number;
+  expires_at: string | null;
+}): TokenState {
+  if (t.revoked) return "revoked";
+  if (t.max_uses !== null && t.uses >= t.max_uses) return "used up";
+  if (t.expires_at !== null && Date.parse(t.expires_at) < Date.now()) return "expired";
+  return "active";
+}
+
+/** fail/warn/warn/ok, per the design. */
+export function tokenTone(state: TokenState): Tone {
+  switch (state) {
+    case "revoked":
+      return "fail";
+    case "used up":
+    case "expired":
+      return "warn";
+    case "active":
+      return "ok";
+  }
+}
+
 /** Text-only status, using the theme-aware *-text variants (readable on white). */
 export const statusTextVariants = cva("font-mono text-xs uppercase tracking-wider", {
   variants: {
