@@ -1141,8 +1141,16 @@ mod tests {
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0]["hostname"], "a-online-host");
         assert_eq!(rows[0]["status"], "online");
-        assert_eq!(rows[0]["display_name"], serde_json::Value::Null);
-        assert!(rows[0].as_object().unwrap().contains_key("capabilities"));
+        // `contains_key` first: indexing a Value returns Null for an ABSENT
+        // key too, so the `assert_eq!` alone would keep passing if the field
+        // were dropped from FleetRow entirely.
+        let row_obj = rows[0].as_object().unwrap();
+        assert!(
+            row_obj.contains_key("display_name"),
+            "display_name must be in the fleet payload"
+        );
+        assert_eq!(row_obj["display_name"], serde_json::Value::Null);
+        assert!(row_obj.contains_key("capabilities"));
         assert_eq!(rows[1]["hostname"], "z-offline-host");
         assert_eq!(rows[1]["status"], "offline");
 
