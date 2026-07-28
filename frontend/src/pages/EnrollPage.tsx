@@ -52,7 +52,11 @@ import type { EnrollmentToken, MintTokenBody } from "../api";
 import PageHeader from "../components/PageHeader";
 import StatusBadge from "../components/StatusBadge";
 import { formatRelative } from "../lib/format";
-import { useEnrollmentTokens, useMintToken, useRevokeToken } from "../lib/queries";
+import {
+  useEnrollmentTokens,
+  useMintToken,
+  useRevokeToken,
+} from "../lib/queries";
 import { tokenState, tokenTone } from "../lib/status";
 
 /** Given verbatim by the brief. */
@@ -94,7 +98,9 @@ function toMintBody(values: MintFormValues): MintTokenBody {
     // this is only observable in the unlimited/never-expires branch, where
     // the explicit `null` is what actually means unlimited/never.
     max_uses: values.unlimited_uses ? null : (values.max_uses ?? 1),
-    expires_in_hours: values.never_expires ? null : (values.expires_in_hours ?? 24),
+    expires_in_hours: values.never_expires
+      ? null
+      : (values.expires_in_hours ?? 24),
   };
 }
 
@@ -324,9 +330,12 @@ function MintTokenForm({
                   aria-invalid={fieldState.invalid}
                 />
                 <FieldDescription>
-                  Identifies this token in the table below — not shown to the agent.
+                  Identifies this token in the table below — not shown to the
+                  agent.
                 </FieldDescription>
-                {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                {fieldState.invalid && (
+                  <FieldError errors={[fieldState.error]} />
+                )}
               </Field>
             )}
           />
@@ -336,14 +345,18 @@ function MintTokenForm({
             control={form.control}
             render={({ field, fieldState }) => (
               <Field data-invalid={fieldState.invalid}>
-                <FieldLabel htmlFor="mint-display-name">Display name</FieldLabel>
+                <FieldLabel htmlFor="mint-display-name">
+                  Display name
+                </FieldLabel>
                 <Input
                   {...field}
                   id="mint-display-name"
                   placeholder="Optional — applied to the enrolled machine"
                   aria-invalid={fieldState.invalid}
                 />
-                {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                {fieldState.invalid && (
+                  <FieldError errors={[fieldState.error]} />
+                )}
               </Field>
             )}
           />
@@ -363,7 +376,9 @@ function MintTokenForm({
                 <FieldDescription>
                   Comma-separated. Applied to the enrolled machine.
                 </FieldDescription>
-                {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                {fieldState.invalid && (
+                  <FieldError errors={[fieldState.error]} />
+                )}
               </Field>
             )}
           />
@@ -413,7 +428,9 @@ function MintTokenForm({
                       />
                     </div>
                     <FieldDescription>Default: single use.</FieldDescription>
-                    {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                    {fieldState.invalid && (
+                      <FieldError errors={[fieldState.error]} />
+                    )}
                   </Field>
                 )}
               />
@@ -458,7 +475,9 @@ function MintTokenForm({
                       />
                     </div>
                     <FieldDescription>Default: 24 hours.</FieldDescription>
-                    {fieldState.invalid && <FieldError errors={[fieldState.error]} />}
+                    {fieldState.invalid && (
+                      <FieldError errors={[fieldState.error]} />
+                    )}
                   </Field>
                 )}
               />
@@ -533,6 +552,7 @@ function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
         size="sm"
         className="w-fit"
         render={<a href="/api/ca.pem" download="argus-ca.crt" />}
+        nativeButton={false}
       >
         Download CA certificate
       </Button>
@@ -551,8 +571,9 @@ function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
           themes={{ light: "min-light", dark: "vesper" }}
         />
         <FieldDescription className="mt-1">
-          Replace <code>&lt;agent-endpoint&gt;</code> with the address agents reach the
-          control plane on — Argus cannot know its externally routable address.
+          Replace <code>&lt;agent-endpoint&gt;</code> with the address agents
+          reach the control plane on — Argus cannot know its externally routable
+          address.
         </FieldDescription>
       </div>
     </div>
@@ -568,7 +589,9 @@ function TokenTable() {
   // closed. Controlled (not an AlertDialogTrigger per row) so the dialog's
   // content can depend on which row was clicked, same shape as
   // MachineDetailPage's edit Dialog.
-  const [revokeTarget, setRevokeTarget] = useState<EnrollmentToken | null>(null);
+  const [revokeTarget, setRevokeTarget] = useState<EnrollmentToken | null>(
+    null,
+  );
 
   function openRevoke(t: EnrollmentToken) {
     revokeMutation.reset();
@@ -583,7 +606,9 @@ function TokenTable() {
   return (
     <>
       <div className="flex flex-wrap items-baseline gap-2 pb-2 pt-2">
-        <h2 className="font-display text-sm uppercase tracking-widest">Tokens</h2>
+        <h2 className="font-display text-sm uppercase tracking-widest">
+          Tokens
+        </h2>
         <span className="font-mono text-[11px] normal-case tracking-normal text-muted-foreground">
           {tokensQuery.isPending
             ? "loading…"
@@ -647,13 +672,19 @@ function TokenTable() {
                     <TableCell className="font-mono">
                       {t.uses}/{t.max_uses === null ? "∞" : t.max_uses}
                     </TableCell>
-                    <TableCell className="font-mono">{formatRelative(t.expires_at)}</TableCell>
+                    <TableCell className="font-mono">
+                      {formatRelative(t.expires_at)}
+                    </TableCell>
                     <TableCell>
                       <StatusBadge tone={tokenTone(state)} label={state} />
                     </TableCell>
                     <TableCell className="text-right">
                       {state === "active" && (
-                        <Button size="sm" variant="outline" onClick={() => openRevoke(t)}>
+                        <Button
+                          size="sm"
+                          variant="outline"
+                          onClick={() => openRevoke(t)}
+                        >
                           Revoke
                         </Button>
                       )}
@@ -678,8 +709,8 @@ function TokenTable() {
             <AlertDialogDescription>
               {revokeTarget !== null && (
                 <>
-                  <span className="font-mono">{revokeTarget.name}</span> will no longer enroll
-                  new machines. This cannot be undone.
+                  <span className="font-mono">{revokeTarget.name}</span> will no
+                  longer enroll new machines. This cannot be undone.
                 </>
               )}
             </AlertDialogDescription>
@@ -688,12 +719,16 @@ function TokenTable() {
           {revokeMutation.error !== null && (
             <Alert variant="destructive">
               <AlertTitle>Revoke failed</AlertTitle>
-              <AlertDescription>{revokeMutation.error.message}</AlertDescription>
+              <AlertDescription>
+                {revokeMutation.error.message}
+              </AlertDescription>
             </Alert>
           )}
 
           <AlertDialogFooter>
-            <AlertDialogCancel disabled={revokeMutation.isPending}>Cancel</AlertDialogCancel>
+            <AlertDialogCancel disabled={revokeMutation.isPending}>
+              Cancel
+            </AlertDialogCancel>
             <AlertDialogAction
               variant="destructive"
               disabled={revokeMutation.isPending}

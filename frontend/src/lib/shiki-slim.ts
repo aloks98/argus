@@ -19,7 +19,20 @@ import type { HighlighterCore } from "shiki/core";
 let highlighter: Promise<HighlighterCore> | undefined;
 
 function load(): Promise<HighlighterCore> {
-  highlighter ??= (async () => {
+  // On failure the cache is CLEARED before rethrowing: a transient chunk-load
+  // error (dev-server restart, flaky network) must not pin every later
+  // CodeBlock to a cached rejection — CodeBlock's catch renders plain text
+  // with no error surfaced, so a permanently poisoned cache would look
+  // exactly like "highlighting silently stopped working".
+  highlighter ??= build().catch((err: unknown) => {
+    highlighter = undefined;
+    throw err;
+  });
+  return highlighter;
+}
+
+function build(): Promise<HighlighterCore> {
+  return (async () => {
     // Themes must match what call sites pass to CodeBlock's `themes` prop
     // (EnrollPage passes min-light/vesper — chosen over CodeBlock's
     // github-default pair to match the app's black/hazard-yellow identity).
@@ -37,7 +50,6 @@ function load(): Promise<HighlighterCore> {
       engine: createJavaScriptRegexEngine(),
     });
   })();
-  return highlighter;
 }
 
 type CodeToHtmlOptions = Parameters<HighlighterCore["codeToHtml"]>[1];
