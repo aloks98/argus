@@ -14,6 +14,15 @@ export default defineConfig({
         find: /^echarts(\/.*)?$/,
         replacement: decodeURIComponent(new URL("./src/stubs/echarts.ts", import.meta.url).pathname),
       },
+      // See src/lib/shiki-slim.ts — rnui's CodeBlock imports bare `shiki`,
+      // whose bundle registers every grammar/theme (~12 MB of chunks, all
+      // embedded into the argus binary). The shim registers bash + the two
+      // default themes only. Exact match on purpose: the shim itself imports
+      // `shiki/core` and `shiki/engine/javascript`, which must NOT be rewritten.
+      {
+        find: /^shiki$/,
+        replacement: decodeURIComponent(new URL("./src/lib/shiki-slim.ts", import.meta.url).pathname),
+      },
     ],
   },
   build: {
