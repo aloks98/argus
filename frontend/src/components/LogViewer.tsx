@@ -108,6 +108,13 @@ export default function LogViewer({
     };
     // The browser's EventSource auto-reconnects; nothing to do on error.
     return () => es.close();
+    // Depends on `filters.priority`/`filters.window`, not `filters` itself,
+    // deliberately: `useLogFilters` derives a fresh `LogFilters` object from
+    // the URL params on every render (see lib/logFilters.ts), so its
+    // reference changes on every unrelated re-render (e.g. this page's 10s
+    // metrics poll). Depending on the object would tear down and reopen the
+    // EventSource on every one of those, not just on an actual filter change.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [machineId, source, filters.priority, filters.window]);
 
   const text = useMemo(() => lines.map(formatLogLine).join("\n"), [lines]);

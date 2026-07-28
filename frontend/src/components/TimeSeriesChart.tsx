@@ -196,6 +196,15 @@ export default function TimeSeriesChart({
         ...series.map((s) => ({ label: s.name, stroke: cssVar(s.colorVar, "#F5F5F5"), width: 2 })),
       ],
     }),
+    // exhaustive-deps wants `axis`, `label`, and `series` added here too, but
+    // both omissions are deliberate:
+    //  - `axis`/`label` are `cssVar` reads that only change when the theme's
+    //    CSS custom properties change, which is exactly what bumps
+    //    `themeVersion` (see useThemeVersion above) — already covered.
+    //  - `series` is deliberately represented by `seriesKey` above instead —
+    //    see the comment there. Adding the raw `series` array here would
+    //    reintroduce the per-render identity churn `seriesKey` exists to avoid.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
     [width, height, themeVersion, seriesKey, format, tooltipFormat, rightAxisFormat],
   );
 
