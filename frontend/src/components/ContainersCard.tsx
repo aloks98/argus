@@ -108,9 +108,9 @@ export default function ContainersCard({
             <TableHeader className="sticky top-0 z-10 [&_th]:bg-background">
               <TableRow>
                 <TableHead>Name</TableHead>
-                <TableHead>Image</TableHead>
+                <TableHead className="hidden md:table-cell">Image</TableHead>
                 <TableHead>State</TableHead>
-                <TableHead>Status</TableHead>
+                <TableHead className="hidden md:table-cell">Status</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
@@ -122,9 +122,11 @@ export default function ContainersCard({
                 return (
                   <TableRow key={c.id}>
                     <TableCell className="font-medium">
-                      <AssetTag tone={containerTone(c.state)}>{c.name}</AssetTag>
+                      <AssetTag tone={containerTone(c.state)} className="max-w-[16ch] md:max-w-[30ch]">
+                        <span className="min-w-0 truncate">{c.name}</span>
+                      </AssetTag>
                     </TableCell>
-                    <TableCell className="font-mono text-muted-foreground">
+                    <TableCell className="hidden md:table-cell font-mono text-muted-foreground">
                       {c.image}
                     </TableCell>
                     <TableCell>
@@ -135,7 +137,7 @@ export default function ContainersCard({
                         </Badge>
                       )}
                     </TableCell>
-                    <TableCell className="font-mono text-muted-foreground">
+                    <TableCell className="hidden md:table-cell font-mono text-muted-foreground">
                       {c.status}
                     </TableCell>
                     <TableCell className="whitespace-nowrap text-right">

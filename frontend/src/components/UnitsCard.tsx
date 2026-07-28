@@ -181,8 +181,8 @@ export default function UnitsCard({
               <TableRow>
                 <TableHead>Name</TableHead>
                 <TableHead>Active</TableHead>
-                <TableHead>Sub</TableHead>
-                <TableHead>Description</TableHead>
+                <TableHead className="hidden md:table-cell">Sub</TableHead>
+                <TableHead className="hidden md:table-cell">Description</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
               </TableRow>
             </TableHeader>
@@ -202,7 +202,7 @@ export default function UnitsCard({
                     <TableCell className="font-medium" title={u.name}>
                       <AssetTag
                         tone={unitTone(u.active_state)}
-                        className="max-w-[30ch]"
+                        className="max-w-[16ch] md:max-w-[30ch]"
                       >
                         <span className="min-w-0 truncate">{u.name}</span>
                       </AssetTag>
@@ -213,11 +213,11 @@ export default function UnitsCard({
                         label={u.active_state}
                       />
                     </TableCell>
-                    <TableCell className="font-mono text-muted-foreground">
+                    <TableCell className="hidden md:table-cell font-mono text-muted-foreground">
                       {u.sub_state}
                     </TableCell>
                     <TableCell
-                      className="max-w-[36ch] truncate text-muted-foreground"
+                      className="hidden md:table-cell max-w-[36ch] truncate text-muted-foreground"
                       title={u.description}
                     >
                       {u.description}
