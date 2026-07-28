@@ -12,6 +12,7 @@ use argus_proto::v1::AgentInfo;
 /// (baked into the binary at build time) rather than read from the environment.
 pub fn gather(agent_version: &str) -> Result<AgentInfo> {
     let uname = rustix::system::uname();
+    let (cpu_model, cpu_cores) = cpu_info();
 
     Ok(AgentInfo {
         hostname: uname.nodename().to_string_lossy().into_owned(),
@@ -25,7 +26,37 @@ pub fn gather(agent_version: &str) -> Result<AgentInfo> {
         // `gather()` only runs once, at enrollment, before any client exists.
         capabilities: Vec::new(),
         capabilities_reported: false,
+        cpu_model,
+        cpu_cores,
+        boot_time: sysinfo::System::boot_time() as i64,
+        virt: detect_virt(),
     })
+}
+
+/// CPU brand + logical core count via sysinfo (already a dependency for the
+/// metrics sampler). Best-effort: an empty brand string is simply reported
+/// empty and becomes NULL server-side.
+fn cpu_info() -> (String, u32) {
+    let mut sys = sysinfo::System::new();
+    sys.refresh_cpu_all();
+    let cpus = sys.cpus();
+    let model = cpus
+        .first()
+        .map(|c| c.brand().trim().to_string())
+        .unwrap_or_default();
+    (model, cpus.len() as u32)
+}
+
+/// `systemd-detect-virt` stdout, trimmed. CAREFUL: the command exits
+/// NON-ZERO for its most interesting answer -- "none" (bare metal) -- so
+/// failure is judged on spawn error / empty output, never on exit status.
+/// A host without the binary (Alpine, containers without systemd) reports
+/// empty -> NULL server-side.
+fn detect_virt() -> String {
+    match std::process::Command::new("systemd-detect-virt").output() {
+        Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        Err(_) => String::new(),
+    }
 }
 
 /// `/etc/machine-id` -- stable identity across reboots (present on Debian and
@@ -74,5 +105,17 @@ mod tests {
         assert!(!info.arch.is_empty(), "arch must not be empty");
         assert!(!info.machine_id.is_empty(), "machine_id must not be empty");
         assert_eq!(info.agent_version, "test");
+    }
+
+    #[test]
+    fn gather_returns_non_empty_cpu_boot_time_and_virt() {
+        let info = gather("test").expect("gather should succeed on this host");
+        assert!(!info.cpu_model.is_empty(), "cpu_model must not be empty");
+        assert!(info.cpu_cores > 0, "cpu_cores must be > 0");
+        assert!(info.boot_time > 0, "boot_time must be > 0");
+        // `systemd-detect-virt` exists on the dev box and always produces
+        // *some* answer -- "none" for bare metal is a real, non-empty
+        // result, not a failure (see `detect_virt`'s doc comment).
+        assert!(!info.virt.is_empty(), "virt must not be empty on this host");
     }
 }
