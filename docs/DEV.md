@@ -1377,3 +1377,29 @@ The explicit `<Command>` wrapper in CommandPalette.tsx is load-bearing.
 Remaining for the operator: add to a real phone's home screen over the LAN
 origin (iOS-style add; Chrome's install prompt needs the production HTTPS
 entrypoint) and tap fleet → machine → restart a unit.
+
+## Machine inventory — verification (2026-07-29)
+
+Design: `docs/superpowers/specs/2026-07-29-inventory-design.md`. Agent now
+reports `cpu_model` / `cpu_cores` / `boot_time` / `virt` (additive proto
+fields 10-13; `""`/`0` = not reported → NULL; both write paths coalesce so
+an old agent's Hello can never erase inventory — pinned by
+`old_agent_hello_does_not_erase_inventory` with deliberate-break evidence).
+`systemd-detect-virt` exits non-zero for `none`, so the probe judges
+failure on spawn error only. Facts are process-lifetime-stable and cached
+in a OnceLock — `gather()` runs on EVERY reconnect (the old "only at
+enrollment" comment was false), so uncached they'd fork/exec twice a
+second during connection flaps.
+
+Live: dev guest reports `Intel Xeon Gold 5120 · 16 cores · kvm`, boot
+7/25. UI: the spec strip stays lean (Status/OS/Address/Uptime/Last seen);
+everything else lives in the new ungated **System tab** (user decision —
+13 strip items "did not look good"). Every row omits when absent. All
+inventory conditionals use loose `!= null` ON PURPOSE: a frontend newer
+than the server receives payloads WITHOUT the new keys, and `undefined`
+slips past `!== null` — that skew rendered "undefined · undefined cores /
+up NaNm" live during this slice's own rollout.
+
+Verified headless: System tab desktop + 390px (zero overflow/errors),
+cpu/virt values rendered, swap row correctly absent on this swapless
+guest.
