@@ -257,21 +257,38 @@ impl AgentService for AgentSvc {
         let (tx, rx) = mpsc::channel::<Result<ServerFrame, Status>>(16);
         let pool = self.pool.clone();
         let hub = self.hub.clone();
-        let epoch = hub.register(machine_id, tx.clone());
+        let (epoch, shutdown) = hub.register(machine_id, tx.clone());
         let mut inbound = request.into_inner();
 
         tokio::spawn(async move {
-            while let Some(item) = inbound.next().await {
-                match item {
-                    Ok(frame) => {
-                        if let Err(e) =
-                            handle_agent_frame(&pool, &hub, machine_id, frame, &tx).await
-                        {
-                            tracing::warn!(error = %e, %machine_id, "session: error handling agent frame");
+            loop {
+                tokio::select! {
+                    item = inbound.next() => {
+                        match item {
+                            Some(Ok(frame)) => {
+                                if let Err(e) =
+                                    handle_agent_frame(&pool, &hub, machine_id, frame, &tx).await
+                                {
+                                    tracing::warn!(error = %e, %machine_id, "session: error handling agent frame");
+                                }
+                            }
+                            Some(Err(e)) => {
+                                tracing::warn!(error = %e, %machine_id, "session: inbound stream error");
+                                break;
+                            }
+                            None => break,
                         }
                     }
-                    Err(e) => {
-                        tracing::warn!(error = %e, %machine_id, "session: inbound stream error");
+                    // Fired by `Hub::register` when a later Session for this
+                    // same machine replaces this one: this connection can no
+                    // longer be routed to (the hub's `conns` entry is already
+                    // the new session's), so continuing to read `inbound`
+                    // here would just keep pumping heartbeats for a session
+                    // the hub can't dispatch verbs/logs/terminal to anymore.
+                    // Exit through the SAME teardown path a normal disconnect
+                    // takes, below.
+                    _ = shutdown.notified() => {
+                        tracing::info!(%machine_id, "session: superseded by a new connection for this machine");
                         break;
                     }
                 }
