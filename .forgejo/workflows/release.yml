@@ -70,6 +70,14 @@ permissions:
 # published release (assets uploaded twice, or a push interleaved with a
 # dry run) is worse than making the second run wait. No cancel-in-progress:
 # a real release publishing assets should never be killed mid-flight.
+# act_runner executes container-job run steps with `sh` (dash) unless told
+# otherwise -- every `set -euo pipefail` (a bashism) then dies instantly with
+# "Illegal option -o pipefail". Uncontainerized jobs happened to get bash,
+# which is why only container jobs failed. Pin bash for every step.
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: release-${{ github.ref }}
 
