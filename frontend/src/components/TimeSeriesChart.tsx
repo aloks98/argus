@@ -204,7 +204,7 @@ export default function TimeSeriesChart({
     //  - `series` is deliberately represented by `seriesKey` above instead —
     //    see the comment there. Adding the raw `series` array here would
     //    reintroduce the per-render identity churn `seriesKey` exists to avoid.
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
     [width, height, themeVersion, seriesKey, format, tooltipFormat, rightAxisFormat],
   );
 

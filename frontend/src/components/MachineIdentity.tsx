@@ -77,7 +77,7 @@ export default function MachineIdentity({
   // would silently discard whatever the operator is typing.
   useEffect(() => {
     form.reset(defaultsFrom(machine));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [machine.id]);
 
   const mutation = useUpdateMachine(machine.id);
