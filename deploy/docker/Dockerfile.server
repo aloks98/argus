@@ -1,0 +1,56 @@
+# Argus control plane image. Build context is the REPO ROOT (needs crates/,
+# frontend/, Cargo.lock all in scope), e.g.:
+#   docker build -f deploy/docker/Dockerfile.server -t argus:local .
+
+# --- frontend ---
+FROM node:22-slim AS frontend
+RUN npm install -g pnpm@11.17.0
+WORKDIR /app/frontend
+COPY frontend/package.json frontend/pnpm-lock.yaml frontend/pnpm-workspace.yaml ./
+RUN pnpm install --frozen-lockfile
+COPY frontend/ ./
+RUN pnpm run build
+
+# --- rust, cargo-chef for layer caching ---
+FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+WORKDIR /app
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+# Empirically verified (2026-07-29, docker 29.3.0/buildkit): this does NOT need
+# frontend/dist to exist. `cargo chef cook` stubs every workspace member's
+# source (crates/server/src/embed.rs included) with a placeholder `fn main(){}`
+# before compiling, specifically so the recipe step never runs real crate code
+# -- so the `#[derive(RustEmbed)] #[folder = "../../frontend/dist"]` in
+# embed.rs never expands here. Confirmed by running `cargo chef prepare` +
+# `cargo chef cook -p argus-server` in isolation against a build context whose
+# .dockerignore excludes frontend/dist entirely: cook completed, including
+# compiling argus-server's dependency graph. Dist is only required starting at
+# the `cargo build --release -p argus-server` below, which compiles
+# argus-server's own source for real -- so it's copied in just before that.
+RUN cargo chef cook --release --recipe-path recipe.json -p argus-server
+COPY . .
+COPY --from=frontend /app/frontend/dist /app/frontend/dist
+# sqlx's query!/query_scalar! macros compile-time-check against a live
+# database unless SQLX_OFFLINE=true, in which case they use the committed
+# .sqlx/ cache instead (same mechanism ci.yml's Clippy step relies on).
+# Empirically hit (2026-07-29): without this, `cargo build` here tried to
+# open a live Postgres connection and failed inside the isolated build
+# container ("Connection refused") -- there is no database reachable from a
+# docker build. This also makes the image build reproducible/hermetic: it
+# never depends on network access to a database.
+ENV SQLX_OFFLINE=true
+RUN cargo build --release -p argus-server
+
+# --- runtime ---
+FROM debian:bookworm-slim AS runtime
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --no-create-home argus
+COPY --from=builder /app/target/release/argus /usr/local/bin/argus
+USER argus
+EXPOSE 8080 9443
+HEALTHCHECK --interval=30s --timeout=3s CMD curl -sf http://localhost:8080/healthz || exit 1
+ENTRYPOINT ["/usr/local/bin/argus"]

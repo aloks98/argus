@@ -127,3 +127,44 @@ jobs:
         run: |
           file "$BIN"
           file "$BIN" | grep -qi 'static' || { echo "ERROR: agent is not statically linked"; exit 1; }
+
+  # PR-time guard: prove both Dockerfiles still build before merge, without
+  # pushing anything anywhere (no ghcr auth needed here -- that's the release
+  # workflow's job). Skips entirely on non-PR events and on PRs that don't
+  # touch anything the images depend on, since a full server image build is a
+  # release compile and not cheap.
+  #
+  # NOT YET EMPIRICALLY VERIFIED (task-2 constraint: the daemon question is
+  # runner-specific and can't be tested from this dev box) -- confirm on the
+  # first real PR that touches deploy/docker/**:
+  #   `container:` puts the job's steps inside catthehacker/ubuntu:act-24.04,
+  #   and `docker build` there only works if that container can reach a
+  #   docker daemon (e.g. the runner host's /var/run/docker.sock bind-mounted
+  #   in, or docker-in-docker). If `docker build` fails with something like
+  #   "Cannot connect to the Docker daemon" / "docker: command not found",
+  #   the large runner does NOT expose a daemon to job containers -- drop the
+  #   `container:` key entirely so this job runs directly on the runner host
+  #   instead (which does have docker; see CLAUDE.md / constraints.md: "docker
+  #   IS available on this dev box", true for the runner host too).
+  docker-build:
+    runs-on: large
+    if: ${{ github.event_name == 'pull_request' }}
+    container:
+      image: catthehacker/ubuntu:act-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Detect docker/package changes
+        id: filter
+        run: |
+          git fetch origin ${{ github.base_ref }} --depth=1
+          if git diff --name-only origin/${{ github.base_ref }}...HEAD | grep -qE '^(deploy/docker/|\.dockerignore|Cargo\.(toml|lock)|crates/|frontend/)'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build images (no push)
+        if: steps.filter.outputs.changed == 'true'
+        run: |
+          docker build -f deploy/docker/Dockerfile.server -t argus:ci .
+          docker build -f deploy/docker/Dockerfile.agent -t argus-agent:ci .

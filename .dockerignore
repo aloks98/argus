@@ -1,0 +1,17 @@
+target/
+frontend/node_modules/
+frontend/dist/
+dist-release/
+.git/
+.superpowers/
+docs/
+# Gitignored, dev-box-only (has a local DATABASE_URL + dev secrets in [env]).
+# Empirically confirmed (2026-07-29): if this leaks into the build context on
+# a dev box that has it on disk, cargo's sqlx macros pick up its DATABASE_URL
+# and try a LIVE connection during `cargo build --release`, which fails
+# (Connection refused, no Postgres reachable from the build container) instead
+# of using the committed .sqlx offline cache. A fresh CI checkout never has
+# this file (it's gitignored), so this only bites local `docker build` runs --
+# excluded here so local builds match CI behavior. Belt-and-suspenders with
+# Dockerfile.server's `ENV SQLX_OFFLINE=true`, which is the real fix.
+.cargo/
