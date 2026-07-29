@@ -3,7 +3,7 @@
 # stamped at release-package time.
 
 image:
-  repository: ghcr.io/CHANGEME/argus
+  repository: ghcr.io/aloks98/argus
   # Empty defaults to the chart's appVersion.
   tag: ""
   pullPolicy: IfNotPresent

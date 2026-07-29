@@ -16,8 +16,8 @@ Forgejo Releases. So:
 |---|---|---|
 | Source + tags | Forgejo (origin) | mirrored to GitHub too |
 | Release (tarballs, SHA256SUMS, chart `.tgz`) | Forgejo Release page (`.../releases`) | Forgejo only — the GitHub mirror shows the tag but no attached Release assets |
-| Docker images | `ghcr.io/<github-user>/argus`, `ghcr.io/<github-user>/argus-agent` | GitHub Container Registry, independent of either git host |
-| Helm chart (OCI) | `oci://ghcr.io/<github-user>/charts/argus` | same GHCR namespace |
+| Docker images | `ghcr.io/aloks98/argus`, `ghcr.io/aloks98/argus-agent` | GitHub Container Registry, independent of either git host |
+| Helm chart (OCI) | `oci://ghcr.io/aloks98/charts/argus` | same GHCR namespace |
 
 Point people at the Forgejo release page for tarballs, not GitHub's tag view.
 
@@ -31,7 +31,7 @@ Point people at the Forgejo release page for tarballs, not GitHub's tag view.
    a clear message if either is unset when a real release runs.
 2. **GitHub push-mirror.** Repo → Settings → Repository → "Mirror Settings" →
    "Add Push Mirror": the GitHub remote URL
-   (`https://github.com/<github-user>/argus.git`) and a GitHub PAT with
+   (`https://github.com/aloks98/argus.git`) and a GitHub PAT with
    `repo` scope for authorization. This is what makes the tag itself (and
    the rest of the source) show up on GitHub — it does not touch Releases or
    packages, see the table above.
@@ -49,7 +49,7 @@ Point people at the Forgejo release page for tarballs, not GitHub's tag view.
    `${{ secrets.RELEASE_TOKEN }}`.
 4. **`deploy/chart/argus/values.yaml`'s `image.repository`** ships as the
    placeholder `ghcr.io/CHANGEME/argus`. Update it to the real
-   `ghcr.io/<github-user>/argus` as part of the first release (see the
+   `ghcr.io/aloks98/argus` as part of the first release (see the
    checklist below) — until then, `helm install`/`helm template` need an
    explicit `--set image.repository=...` override.
 
@@ -73,9 +73,9 @@ Point people at the Forgejo release page for tarballs, not GitHub's tag view.
    at `git.nexus.e412.in/aloks98/argus/actions`, or `fj actions tasks`.
 5. **What lands where** once green: bare-metal tarballs (`argus-server-*`,
    `argus-agent-*`) + `SHA256SUMS` attached to the Forgejo Release for the
-   tag; `argus`/`argus-agent` pushed to `ghcr.io/<github-user>/...` as both
+   tag; `argus`/`argus-agent` pushed to `ghcr.io/aloks98/...` as both
    `:vX.Y.Z` and `:latest`; the packaged chart `.tgz` pushed to
-   `oci://ghcr.io/<github-user>/charts/argus` **and** attached to the same
+   `oci://ghcr.io/aloks98/charts/argus` **and** attached to the same
    Forgejo Release.
 
 ## CI environment notes
@@ -158,9 +158,9 @@ environment notes" above).
       `workflow_dispatch` run:
       `git push origin :v0.1.0 && git tag -d v0.1.0`, fix the secret, then
       `git tag v0.1.0 && git push origin v0.1.0`.
-- [ ] Verify `ghcr.io/<github-user>/argus:v0.1.0` and `:latest` pull.
-- [ ] Verify `ghcr.io/<github-user>/argus-agent:v0.1.0` and `:latest` pull.
-- [ ] Verify `helm install argus oci://ghcr.io/<github-user>/charts/argus
+- [ ] Verify `ghcr.io/aloks98/argus:v0.1.0` and `:latest` pull.
+- [ ] Verify `ghcr.io/aloks98/argus-agent:v0.1.0` and `:latest` pull.
+- [ ] Verify `helm install argus oci://ghcr.io/aloks98/charts/argus
       --version 0.1.0` works against a real cluster.
 - [ ] Download a tarball from the Forgejo Release page and run its
       `install.sh` on a real host.

@@ -60,7 +60,7 @@ docker run -d --name argus --network host \
   -e ARGUS_DATABASE_URL=postgres://argus:CHANGE_ME@localhost:5432/argus \
   -e ARGUS_FIELD_KEY="$FIELD_KEY" \
   -e ARGUS_PUBLIC_URL=https://argus.lab.example \
-  ghcr.io/<github-user>/argus:latest
+  ghcr.io/aloks98/argus:latest
 ```
 The control plane is stateless and containerizes cleanly. The **agent**
 doesn't — it needs host mounts (Docker socket, D-Bus, journal) that are easy
@@ -76,8 +76,8 @@ kubectl create secret generic argus-env \
   --from-literal=ARGUS_FIELD_KEY="$(openssl rand -base64 32)" \
   --from-literal=ARGUS_PUBLIC_URL=https://argus.example.com
 
-helm install argus oci://ghcr.io/<github-user>/charts/argus --version 0.1.0 \
-  --set image.repository=ghcr.io/<github-user>/argus
+helm install argus oci://ghcr.io/aloks98/charts/argus --version 0.1.0 \
+  --set image.repository=ghcr.io/aloks98/argus
 ```
 The chart never templates secret values — `existingSecret: argus-env` (the
 name above) is a hard requirement, not a default to trust. See
