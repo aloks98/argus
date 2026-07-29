@@ -15,7 +15,9 @@ install -m 755 "$DIR/argus-agent" /usr/local/bin/argus-agent
 install -m 644 "$DIR/argus-agent.service" /etc/systemd/system/argus-agent.service
 
 install -d -m 755 /etc/argus
-install -d /var/lib/argus-agent
+# Holds the agent's private key + issued client cert -- keep it readable
+# only by root (the agent itself runs as root, per argus-agent.service).
+install -d -m 700 /var/lib/argus-agent
 
 # Never clobber an existing config -- only seed it the first time.
 if [ ! -e /etc/argus/agent.env ]; then

@@ -5,6 +5,10 @@ Wants=network-online.target
 
 [Service]
 Type=simple
+# systemd (root, PID 1) reads this file during activation, BEFORE the
+# process is spawned and dropped to the DynamicUser UID below -- so a
+# root-owned, chmod 600 env file works as intended; the dynamic user never
+# needs read access to it itself.
 EnvironmentFile=/etc/argus/argus.env
 ExecStart=/usr/local/bin/argus
 Restart=on-failure
