@@ -132,9 +132,8 @@ fj actions dispatch release.yml <branch> -I dry_run=true
   `package-release.sh` unmodified; release-creation steps correctly skipped).
 - `images` — green, ~6m, both Dockerfiles build; GHCR login/push correctly
   skipped.
-- `chart` — pending at time of writing. Its `helm lint`/`helm package` logic
-  is unchanged from the already-locally-verified chart (see the chart PR);
-  confirm its full pipeline run before relying on it for a real release.
+- `chart` — green, ~1m10s (`helm lint`/`helm package`; OCI push and asset
+  upload correctly skipped on dispatch).
 
 Re-run the rehearsal after any workflow edit — this pipeline has already
 hidden two runner-specific bugs that only a real dispatch surfaced (see "CI

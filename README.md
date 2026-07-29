@@ -86,6 +86,7 @@ command it prints — endpoint, token, and CA certificate download, ready to
 paste onto the host. Don't hand-type `ARGUS_JOIN_TOKEN`; the page is the
 source of truth for it.
 
-> **Status:** PRD + skeleton. Subsystems are stubbed with their intended shape;
-> implementation starts with the "Spine" slice (enroll → mTLS → heartbeat → fleet
-> page). See `CLAUDE.md`.
+> **Status:** actively developed. Core slices are live — enrollment/mTLS,
+> metrics, Docker + systemd state and verbs, log tailing, interactive
+> terminal, OIDC + local-admin auth, machine inventory, and a responsive
+> PWA frontend. Design of record: [`docs/PRD.md`](docs/PRD.md).
