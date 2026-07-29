@@ -1,8 +1,6 @@
-//! Argus control plane (`argus`).
-//!
-//! Stateless binary: all state lives in Postgres (PRD §2). It serves two network
-//! surfaces — the browser HTTP surface (behind Traefik) and the agent mTLS gRPC
-//! surface (behind a dedicated MetalLB LoadBalancer). See docs/PRD.md.
+//! Argus control plane. Stateless: all state lives in Postgres (PRD §2).
+//! Serves two network surfaces -- browser HTTP (behind Traefik) and agent
+//! mTLS gRPC (behind a dedicated MetalLB LoadBalancer). See docs/PRD.md.
 
 mod auth;
 mod ca;
@@ -24,8 +22,8 @@ use std::sync::Arc;
 #[tokio::main]
 async fn main() -> Result<()> {
     // CLI dispatch happens before `Config::from_env` -- see
-    // `run_local_admin_cli`'s doc comment for why. One subcommand does not
-    // justify an argument-parsing dependency.
+    // `run_local_admin_cli`'s doc for why. One subcommand doesn't justify an
+    // argument-parsing dependency.
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("local-admin") {
         return run_local_admin_cli(&args).await;
@@ -71,15 +69,13 @@ async fn main() -> Result<()> {
     Ok(())
 }
 
-/// `argus local-admin reset [--username <name>]`, and the sole entry point for
-/// every other `local-admin` invocation (which prints usage and fails).
+/// `argus local-admin reset [--username <name>]`; every other invocation
+/// prints usage and fails.
 ///
-/// Deliberately does NOT call `config::Config::from_env`: this command is the
-/// recovery path for a control plane that refuses to boot (design §4's
-/// `auth_is_configured`), and a recovery command that requires the
-/// configuration that broke is not a recovery command. It reads only
-/// `ARGUS_DATABASE_URL` and connects via `db::connect_url`, which takes a bare
-/// URL for exactly this reason.
+/// Deliberately does NOT call `config::Config::from_env`: this is the
+/// recovery path for a control plane that refuses to boot (design §4), and a
+/// recovery command that needs the config that broke isn't a recovery
+/// command. Reads only `ARGUS_DATABASE_URL`, via `db::connect_url`'s bare-URL form.
 async fn run_local_admin_cli(args: &[String]) -> Result<()> {
     match args.get(2).map(String::as_str) {
         Some("reset") => {
@@ -94,24 +90,20 @@ async fn run_local_admin_cli(args: &[String]) -> Result<()> {
                     )
                 })?;
             let pool = db::connect_url(&database_url).await?;
-            // Migrations are idempotent and embedded (CLAUDE.md), so this is
-            // free on an already-current database -- but on a fresh one it's
-            // what stands between `local-admin reset` working and a raw
-            // `relation "local_admin" does not exist`. The CLI path skips
-            // `main`'s boot entirely, so it needs its own call.
+            // Idempotent/embedded (CLAUDE.md) -- free on a current DB, but on
+            // a fresh one it's what stands between this working and a raw
+            // "relation does not exist". The CLI path skips `main`'s boot.
             db::migrate(&pool).await?;
             let password = auth::local::reset_local_admin(&pool, &username).await?;
 
-            // Every verb goes through the audit log from the start (CLAUDE.md). This
-            // uses `Actor::System` (not inside `reset_local_admin`, which stays a plain
-            // generate-hash-store shared with the in-app rotation endpoint, which audits
-            // as `Actor::User`) because the CLI has host/database access but no
-            // authenticated principal -- exactly what `System` means. The username (not
-            // the password, which never touches an audit row) goes in `detail`.
+            // `Actor::System`: the CLI has host/database access but no
+            // authenticated principal. Lives here, not in `reset_local_admin`
+            // (shared with `rotate`'s `Actor::User` audit), so the username --
+            // never the password -- goes in `detail`.
             //
-            // A failed audit write must not cost the operator the password they just
-            // generated -- the reset already happened, so this is deliberately
-            // non-fatal: warn and keep going rather than skip the `println!` below.
+            // Deliberately non-fatal: the reset already happened, so a failed
+            // audit write must not cost the operator the password they just
+            // generated.
             if let Err(e) = repo::audit_with_detail(
                 &pool,
                 repo::Actor::System,
@@ -151,16 +143,11 @@ fn parse_username_flag(rest: &[String]) -> Option<String> {
     None
 }
 
-/// The boot rule (design §4): the invariant is "some authentication method is
-/// configured", not "OIDC specifically is". Extracted to a pure function so
-/// both branches are testable without a live process -- `main`'s only job is
-/// to supply the two facts this decides between.
-///
-/// `local_admin_present` is exactly `repo::local_admin_exists`'s result --
-/// that query's own correctness is covered separately
-/// (`repo::tests::local_admin_round_trips_and_rotation_updates_the_hash`).
-/// This function owns only the decision built on top of it, and the exact
-/// wording of the error naming the fix.
+/// The boot rule (design §4): "some auth method is configured", not "OIDC
+/// specifically". Pure function so both branches are testable without a live
+/// process. `local_admin_present` is exactly `repo::local_admin_exists`'s
+/// result -- that query's own correctness is covered separately; this
+/// function owns only the decision and the error's wording.
 fn auth_is_configured(oidc_present: bool, local_admin_present: bool) -> Result<()> {
     if !oidc_present && !local_admin_present {
         anyhow::bail!(
@@ -175,10 +162,9 @@ fn auth_is_configured(oidc_present: bool, local_admin_present: bool) -> Result<(
 mod tests {
     use super::auth_is_configured;
 
-    /// Design §14: "OIDC absent with a local admin present boots" and every
-    /// other combination that must NOT refuse to boot. §15 calls this
-    /// non-optional: it is the only thing standing between "no auth
-    /// configured" and a running control plane.
+    /// Design §14/§15: every combination that must NOT refuse to boot -- the
+    /// only thing standing between "no auth configured" and a running
+    /// control plane.
     #[test]
     fn boots_whenever_at_least_one_auth_method_is_present() {
         assert!(auth_is_configured(true, false).is_ok(), "OIDC alone");
@@ -186,10 +172,9 @@ mod tests {
         assert!(auth_is_configured(true, true).is_ok(), "both");
     }
 
-    /// Design §14: "both absent refuses to boot and the error names the CLI
-    /// command." Asserting only `is_err()` would pass even if the message
-    /// became useless -- the whole point of this branch is telling the
-    /// operator which command fixes it.
+    /// Design §14: refuses to boot, and the error names the fix. Asserting
+    /// only `is_err()` would pass even if the message became useless -- the
+    /// point of this branch is telling the operator what to run.
     #[test]
     fn refuses_to_boot_with_neither_and_names_the_fix() {
         let err = auth_is_configured(false, false).expect_err("neither must refuse to boot");
@@ -200,9 +185,8 @@ mod tests {
         );
     }
 
-    /// The same decision, composed with the REAL `repo::local_admin_exists`
-    /// query against a (test) Postgres -- the exact pipeline `main` runs, not
-    /// just the boolean truth table above. Proves the wiring, not only the logic.
+    /// Composed with the REAL `repo::local_admin_exists` query -- the exact
+    /// pipeline `main` runs, not just the boolean truth table above.
     #[sqlx::test]
     async fn boot_rule_composes_with_the_real_local_admin_query(
         pool: sqlx::PgPool,

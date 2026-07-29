@@ -1,44 +1,27 @@
 //! Global, in-memory rate limiter guarding `POST /auth/local` (design §10).
+//! Four decisions here must not be quietly reversed:
 //!
-//! Three decisions here are deliberate and must not be quietly reversed:
+//! 1. **Global, not per-IP.** Behind Traefik the peer address is the
+//!    proxy's; per-IP would require trusting the spoofable `X-Forwarded-For`.
+//! 2. **No permanent lockout, ever.** A hard lock would DoS the one
+//!    credential that rescues the operator; the delay escalates to
+//!    `MAX_DELAY` and stops (see `no_sequence_of_failures_produces_a_permanent_lock`).
+//! 3. **In memory, not a table.** One replica, no attacker-inducible restart
+//!    to reset the counter -- a table would only buy durability against a
+//!    crash nobody can cause, at the cost of a write per failed attempt.
+//! 4. **Hand-rolled, not `governor`.** GCRA answers "too many per period?";
+//!    this is keyed to *outcomes* (escalating delay per failure, unwound on
+//!    success), which a `Quota` can't express -- and governor's real
+//!    value-add, per-IP limiting, is what decision 1 rules out.
 //!
-//! 1. **Global, not per-IP.** Behind Traefik the peer address seen by the
-//!    control plane is the proxy's, so per-IP limiting either does nothing or
-//!    requires trusting `X-Forwarded-For` -- a client-controlled header an
-//!    attacker rotates freely, which would add a security dependency on
-//!    untrusted input. A global limit cannot be evaded that way, and there is
-//!    exactly one legitimate user to inconvenience.
-//! 2. **No permanent lockout, ever.** A hard lock would be a denial of
-//!    service on the one credential that exists to rescue the operator: an
-//!    attacker who cannot guess the password could still deny the recovery
-//!    path. The delay escalates to `MAX_DELAY` and stops there -- see
-//!    `no_sequence_of_failures_produces_a_permanent_lock` below, which proves
-//!    it for an arbitrarily long run of failures, not just a plausible one.
-//! 3. **In memory, not a table.** There is one replica, and an attacker
-//!    cannot force the restart that would reset the counter. A table would
-//!    buy durability against a crash nobody can induce, at the cost of a
-//!    write on every failed attempt.
-//! 4. **Hand-rolled, not `governor`.** Considered and rejected: GCRA answers
-//!    "too many requests per period?", but this state machine is keyed to
-//!    *outcomes* -- escalating delay per consecutive failure, reservation
-//!    unwound on success -- which a `Quota` cannot express. Governor's real
-//!    value-add is keyed (per-IP) limiting, which decision 1 rules out here.
+//! Backstop, not the primary defence (the generated password + argon2id
+//! are); stays pure logic plus a mutex -- no I/O, no async -- and takes
+//! `now: Instant` explicitly so tests can drive time without sleeping.
 //!
-//! This is a backstop, not the primary defence: the password is 24 random
-//! characters (arithmetically unguessable online -- design §7) and argon2id's
-//! ~100ms cost is the second layer. Accordingly this module stays pure logic
-//! plus a mutex: no I/O, no database, no async, and it takes `now: Instant`
-//! explicitly rather than reading the clock, so tests can drive time without
-//! sleeping.
-//!
-//! **`check` RESERVES the slot it grants, atomically, before the caller ever
-//! runs the (slow) argon2 verify.** Reading the count and recording the
-//! failure as two separate steps would let N concurrent callers all observe
-//! "under budget" before any of their ~100ms verifies finish, making the
-//! real limit "N concurrent" instead of `BURST` total. Incrementing under
-//! the same lock as the read closes that gap; `record_success` unwinds the
-//! reservation the moment a real success is confirmed, so a legitimate login
-//! is never left paying for its own reservation.
+//! `check` RESERVES the slot it grants, atomically, before the caller's
+//! (slow) argon2 verify runs -- reading the count and recording failure as
+//! two steps would let N concurrent callers all see "under budget" first,
+//! making the real limit "N concurrent" not `BURST` total.
 
 use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
@@ -46,9 +29,7 @@ use std::time::{Duration, Instant};
 /// Attempts allowed before any delay is imposed.
 pub const BURST: u32 = 5;
 
-/// The escalating delay never exceeds this (design §10.2): a hard lock would
-/// deny the one credential that exists to rescue the operator, so the delay
-/// is capped rather than ever becoming permanent.
+/// The escalating delay never exceeds this (design §10.2).
 pub const MAX_DELAY: Duration = Duration::from_secs(30);
 
 /// The mutable state, guarded by a single `Mutex` so `consecutive_failures`
@@ -60,11 +41,8 @@ struct Bucket {
     last_attempt: Option<Instant>,
 }
 
-/// Guards `POST /auth/local`. Shared across concurrent requests via
-/// `AppState`, so every method takes `&self` -- interior mutability via
-/// `std::sync::Mutex` rather than `&mut self`. Constructed once at startup
-/// (`http::serve`) and consulted by the login handler (`auth::local::login`)
-/// before it ever touches the database.
+/// Guards `POST /auth/local`, shared via `AppState` -- `&self` because state
+/// lives behind a `Mutex`, not `&mut self`.
 #[derive(Default)]
 pub struct LoginLimiter {
     bucket: Mutex<Bucket>,
@@ -75,21 +53,13 @@ impl LoginLimiter {
         Self::default()
     }
 
-    /// `None` means the caller may proceed immediately -- and this call has
-    /// ALREADY counted that as a pessimistic failure, incrementing
-    /// `consecutive_failures` and stamping `last_attempt` under the same lock
-    /// acquisition that read them, so no concurrent caller can observe the
-    /// pre-increment count. `record_success` unwinds that the moment a real
-    /// success is confirmed; a caller that never calls back in simply leaves
-    /// one reservation spent, the conservative direction to fail in.
+    /// `None` = proceed -- ALREADY counted as a pessimistic failure under the
+    /// same lock that read the count, so no concurrent caller sees the
+    /// pre-increment value. `record_success` unwinds it; an uncalled-back
+    /// caller just leaves one reservation spent (fails conservative).
     ///
-    /// `Some(d)` means wait `d` longer, and makes NO state change at all --
-    /// hammering while already delayed must not itself escalate the delay
-    /// further, or an attacker could extend their own penalty into ours.
-    ///
-    /// Never blocks, sleeps, or touches the database -- the handler decides
-    /// what a `429` looks like, and the (blocking) argon2 verify happens
-    /// entirely after this returns `None`.
+    /// `Some(d)` = wait `d` longer, NO state change (hammering while delayed
+    /// must not itself escalate the delay). Never blocks, sleeps, or touches the DB.
     pub fn check(&self, now: Instant) -> Option<Duration> {
         let mut bucket = self.lock();
         if bucket.consecutive_failures < BURST {
@@ -98,22 +68,17 @@ impl LoginLimiter {
             return None;
         }
         if bucket.consecutive_failures == BURST {
-            // Logged once per streak so a sustained brute force stays visible
-            // even though the throttled path below skips the audit log
-            // (consulting the limiter first is what keeps a hammering caller
-            // from costing the database). Fires only when `consecutive_failures`
-            // first equals `BURST` -- later admissions push it past `BURST`,
-            // and calls that arrive while still delayed (the `else` arm) leave
-            // it untouched -- so this can't re-fire on every poll, only once
-            // per fresh streak.
+            // Fires once per fresh streak (only when `consecutive_failures`
+            // first hits `BURST`) since the throttled path skips the audit
+            // log -- limiter-before-audit is what keeps a hammering caller
+            // off the database.
             tracing::warn!("local admin login rate limiter: burst exhausted, now throttling");
         }
         let delay = Self::delay_for(bucket.consecutive_failures);
         let Some(last) = bucket.last_attempt else {
             // Unreachable in practice (`consecutive_failures >= BURST > 0`
-            // implies some earlier call already set `last_attempt`), but if
-            // it ever were reached, failing OPEN (no delay) rather than
-            // unwrapping is the direction that can never become a lockout.
+            // implies `last_attempt` was already set), but if reached, fail
+            // OPEN (no delay) -- never toward a lockout.
             bucket.consecutive_failures += 1;
             bucket.last_attempt = Some(now);
             return None;
@@ -128,26 +93,21 @@ impl LoginLimiter {
         }
     }
 
-    /// A successful login clears the penalty entirely: the escalating delay
-    /// punishes a consecutive run of *failures* (or reservations that never
-    /// panned out), not lifetime attempts, so the legitimate user who
-    /// eventually gets the (generated, unmemorable) password right is not
-    /// left paying for earlier typos -- including the reservation `check`
-    /// took out for THIS successful attempt itself.
+    /// Clears the penalty entirely: the delay punishes a consecutive run of
+    /// *failures*, not lifetime attempts, so a legitimate user who eventually
+    /// gets the password right isn't left paying -- including for THIS
+    /// attempt's own reservation.
     pub fn record_success(&self) {
         let mut bucket = self.lock();
         bucket.consecutive_failures = 0;
         bucket.last_attempt = None;
     }
 
-    /// A panic in some unrelated request while holding this lock must not
-    /// turn into a permanently broken login endpoint -- every subsequent
-    /// request would see `.lock()` fail forever, which is a self-inflicted,
-    /// worse version of the permanent lockout this module exists to avoid
-    /// (decision 2 above). The guarded state is two plain fields with no
-    /// invariant a half-finished write can violate (a torn update is at
-    /// worst one stale counter), so recovering the inner value on poison and
-    /// continuing is safe, and strictly better than wedging the endpoint.
+    /// A panic elsewhere while holding this lock must not permanently break
+    /// the login endpoint (a self-inflicted version of decision 2's
+    /// lockout). The guarded state is two plain fields with no invariant a
+    /// torn write can violate (worst case: one stale counter), so
+    /// recovering on poison is safe.
     fn lock(&self) -> MutexGuard<'_, Bucket> {
         self.bucket
             .lock()
@@ -155,10 +115,9 @@ impl LoginLimiter {
     }
 
     /// `2^(failures - BURST)` seconds, capped at `MAX_DELAY`. `checked_pow`
-    /// (rather than a shift) means an arbitrarily long run of failures -- see
-    /// the 10,000-failure test below -- saturates to `u64::MAX` seconds
-    /// instead of overflowing or panicking, and the subsequent `.min`
-    /// collapses that to the real cap either way.
+    /// (not a shift) saturates an arbitrarily long failure run to
+    /// `u64::MAX` instead of overflowing/panicking; `.min` then collapses
+    /// it to the cap.
     fn delay_for(consecutive_failures: u32) -> Duration {
         let exponent = consecutive_failures - BURST;
         let seconds = 2u64.checked_pow(exponent).unwrap_or(u64::MAX);
@@ -170,11 +129,9 @@ impl LoginLimiter {
 mod tests {
     use super::*;
 
-    /// Drives the limiter through exactly `attempts` allowed reservations,
-    /// advancing the simulated clock only as far as each one's own reported
-    /// delay requires -- the fastest an attacker who never once succeeds
-    /// could possibly go. Returns the `Instant` at which the last one was
-    /// admitted, so callers can inspect the state immediately afterward.
+    /// Drives the limiter through `attempts` reservations, advancing the
+    /// clock only as far as each delay requires -- the fastest a
+    /// never-succeeding attacker could go. Returns the `Instant` of the last admission.
     fn exhaust(l: &LoginLimiter, mut now: Instant, attempts: u32) -> Instant {
         for _ in 0..attempts {
             while let Some(d) = l.check(now) {
@@ -200,13 +157,10 @@ mod tests {
         );
     }
 
-    /// The concurrency property this module exists to guarantee (see the
-    /// module doc): many requests arriving at (approximately) the same
-    /// instant -- modelled here as the same identical `Instant`, i.e. zero
-    /// interleaved verify latency at all, the worst case -- must not all be
-    /// admitted. `check` reserves the slot itself, under the lock, before the
-    /// caller ever runs the slow argon2 verify, so calling it far more than
-    /// `BURST` times at one identical instant still only lets `BURST` through.
+    /// The property this module exists to guarantee: many requests at the
+    /// same `Instant` (zero interleaved verify latency, the worst case) must
+    /// not all be admitted -- `check` reserves under the lock before the
+    /// caller's argon2 verify ever runs.
     #[test]
     fn concurrent_checks_at_the_same_instant_cannot_exceed_the_burst() {
         let l = LoginLimiter::new();
@@ -229,12 +183,10 @@ mod tests {
         );
     }
 
-    /// A hard lockout would be a denial of service on the one credential that
-    /// exists to rescue the operator. However many failed/reserved attempts
-    /// occur, waiting must eventually allow another attempt. Driven through
-    /// `check` itself now (rather than a separate `record_failure`), since
-    /// `check` is the only way to add to the count at all -- this proves the
-    /// property against the real, single entry point.
+    /// A hard lockout would DoS the recovery credential -- however many
+    /// attempts occur, waiting must eventually allow another. Driven through
+    /// `check` itself (the only way to add to the count), proving the
+    /// property against the real entry point.
     #[test]
     fn no_sequence_of_failures_produces_a_permanent_lock() {
         let l = LoginLimiter::new();
@@ -246,20 +198,12 @@ mod tests {
         );
     }
 
-    /// The one mutation that turns "no permanent lockout" into a REAL
-    /// permanent lockout: if the delayed (`Some(d)`) branch of `check` ever
-    /// stamped `last_attempt = now`, every poll from a caller hammering the
-    /// endpoint would push the countdown's origin forward by the poll
-    /// interval, so `elapsed >= delay` would never become true again.
-    ///
-    /// `exhaust` (used by every other test here) cannot catch this: it calls
-    /// `check` exactly once per delay period, jumping the simulated clock
-    /// straight to the boundary, so it never exercises a caller that polls
-    /// FASTER than the delay -- which is exactly what a real attacker (or an
-    /// impatient legitimate user) does. This test polls in small steps
-    /// instead, driven first well past the burst so the delay is pinned at
-    /// its cap (`MAX_DELAY`) -- the worst, most realistic case -- and asserts
-    /// admission happens within `MAX_DELAY` plus a little slack.
+    /// The one mutation that would turn "no permanent lockout" into a REAL
+    /// one: if the delayed branch ever stamped `last_attempt = now`, a caller
+    /// polling faster than the delay would push the countdown's origin
+    /// forward forever. `exhaust` can't catch this (it jumps straight to
+    /// each boundary); this test polls in small steps instead, pinned at
+    /// `MAX_DELAY`, and asserts admission within it plus slack.
     #[test]
     fn hammering_while_delayed_does_not_extend_the_delay() {
         let l = LoginLimiter::new();

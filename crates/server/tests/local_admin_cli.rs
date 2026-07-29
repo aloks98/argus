@@ -1,36 +1,25 @@
-//! Regression coverage for the single most important property of
-//! `argus local-admin reset`: it is dispatched in `main()` BEFORE
-//! `config::Config::from_env` is ever called, so it works when OIDC config,
+//! Regression coverage for the single most important property of `argus
+//! local-admin reset`: it dispatches in `main()` BEFORE
+//! `config::Config::from_env` runs, so it works when OIDC config,
 //! `ARGUS_FIELD_KEY`, and `ARGUS_PUBLIC_URL` are absent or wrong -- exactly
-//! the state a control plane that refuses to boot (`auth_is_configured`) is
-//! in, which is exactly when this command is needed.
+//! the state a control plane that refuses to boot is in, exactly when this
+//! command is needed.
 //!
-//! That property holds today only because the dispatch is physically the
-//! first thing in `main()`. Nothing else in the suite would catch a future
-//! contributor inserting a line above it (an early metrics hook, a log line,
-//! a feature-flag read); this test runs the actual COMPILED BINARY as a
-//! subprocess with the WHOLE environment cleared except `ARGUS_DATABASE_URL`,
-//! so a regression fails in CI instead of during a real outage.
+//! Nothing else in the suite would catch a future contributor inserting a
+//! line above that dispatch; this test runs the actual COMPILED BINARY as a
+//! subprocess with the WHOLE environment cleared except
+//! `ARGUS_DATABASE_URL`, so a regression fails in CI, not during an outage.
 //!
-//! Needs a real, already-migrated Postgres reachable via `ARGUS_DATABASE_URL`
-//! (or bare `DATABASE_URL`, which is all `.forgejo/workflows/ci.yml` sets --
-//! that job runs `sqlx migrate run` before `cargo test --workspace`, so the
-//! `local_admin` table already exists by the time this runs). Deliberately
-//! NOT `#[ignore]`d: it runs in the ordinary `cargo test --workspace` step,
-//! same as every other DB-backed test in this crate.
+//! Needs a real, already-migrated Postgres via `ARGUS_DATABASE_URL` (CI's
+//! `ci.yml` runs migrations first). Deliberately NOT `#[ignore]`d.
 //!
-//! CAUTION: `local_admin` is a single, upsert-only row, so this test
-//! necessarily overwrites it while running. Harmless in CI (the Postgres
-//! container is discarded afterward); locally, the test captures whatever
-//! row exists beforehand and restores it (or deletes it if none existed)
-//! before making any assertion, so a real local-admin credential a developer
-//! is relying on survives either way.
+//! CAUTION: `local_admin` is a single, upsert-only row this test overwrites
+//! while running. It captures whatever row exists beforehand and restores it
+//! (or deletes it if none existed) before any assertion, so a real
+//! developer's credential survives either way.
 //!
-//! Also covers the CLI's audit write (`Actor::System`, action
-//! `local_admin.reset`): unlike `local_admin`, `audit_log` is an
-//! append-only trail, so the row this test's reset produces is left in
-//! place rather than cleaned up -- that's the same accumulation a real
-//! reset in production is expected to leave behind.
+//! Also covers the CLI's audit write: `audit_log` is append-only, so this
+//! test's row is left in place -- the same accumulation a real reset leaves.
 
 use sqlx::{postgres::PgPoolOptions, Row};
 use std::process::Command;
@@ -60,10 +49,9 @@ async fn local_admin_reset_runs_with_only_the_database_url_present() {
             )
         });
 
-    // Baseline for the audit-log assertion below: the highest existing
-    // `local_admin.reset` row id, so the post-run check can look for a row
-    // strictly newer than anything already there rather than merely "a row
-    // exists" (which could pass even if this run wrote nothing).
+    // Baseline row id, so the post-run check can look for a row strictly
+    // newer than this rather than merely "a row exists" (which could pass
+    // even if this run wrote nothing).
     let audit_baseline_id: i64 = sqlx::query_scalar(
         "SELECT coalesce(max(id), 0) FROM audit_log WHERE action = 'local_admin.reset'",
     )
@@ -71,11 +59,9 @@ async fn local_admin_reset_runs_with_only_the_database_url_present() {
     .await
     .expect("read the audit_log baseline");
 
-    // The load-bearing check: the compiled binary, with the ENTIRE process
-    // environment cleared except the one variable the CLI is documented to
-    // need. No ARGUS_OIDC_*, no ARGUS_FIELD_KEY, no ARGUS_PUBLIC_URL --
-    // `env_clear` proves this isn't passing by accident because something
-    // else in the environment happened to be set.
+    // The load-bearing check: the compiled binary with the ENTIRE process
+    // environment cleared except the one var the CLI needs -- `env_clear`
+    // proves this isn't passing by accident because something else was set.
     let output = Command::new(env!("CARGO_BIN_EXE_argus"))
         .args(["local-admin", "reset"])
         .env_clear()
@@ -83,9 +69,8 @@ async fn local_admin_reset_runs_with_only_the_database_url_present() {
         .output()
         .expect("spawn the compiled argus binary");
 
-    // Restore the prior row (or remove the one this test created) before any
-    // assertion, so a failed assertion below still leaves the database as it
-    // was found.
+    // Restore/remove before any assertion, so a failed assertion still
+    // leaves the database as it was found.
     match &prior {
         Some((username, password_hash)) => {
             sqlx::query(
@@ -121,10 +106,9 @@ async fn local_admin_reset_runs_with_only_the_database_url_present() {
         "expected a generated password in the output, got: {stdout}"
     );
 
-    // The reset must leave an audit trail (CLAUDE.md: "a verb without an
-    // audit_log write is incomplete"), attributed to `Actor::System` (no
-    // authenticated principal exists on this path) with the username -- and
-    // ONLY the username, never the password -- in `detail`.
+    // Must leave an audit trail (CLAUDE.md's audit rule), attributed to
+    // `Actor::System` (no authenticated principal here), with ONLY the
+    // username -- never the password -- in `detail`.
     let row = sqlx::query(
         "SELECT actor, result, detail FROM audit_log \
          WHERE action = 'local_admin.reset' AND id > $1 \

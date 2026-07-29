@@ -1,5 +1,3 @@
-//! Browser authentication: middleware, extractor, and the OIDC flow.
-
 pub mod claims;
 pub mod local;
 pub mod oidc;
@@ -18,10 +16,10 @@ use axum::{
 };
 use axum_extra::extract::cookie::CookieJar;
 
-/// Resolves the session cookie to an `Identity` and stores it in the request
-/// extensions. Applied to the whole `/api` router, so it covers plain JSON,
-/// SSE and the terminal WebSocket in one place -- cookies ride the upgrade
-/// request, so no transport needs special handling.
+/// Resolves the session cookie to an `Identity`, stored in request extensions.
+/// Applied to the whole `/api` router, so it covers plain JSON, SSE, and the
+/// terminal WebSocket in one place -- cookies ride the upgrade request, so no
+/// transport needs special handling.
 pub async fn require_auth(
     State(state): State<AppState>,
     jar: CookieJar,
@@ -58,12 +56,9 @@ fn unauthenticated() -> Response {
         .into_response()
 }
 
-/// Handler extractor for the authenticated user.
-///
-/// Infallible in practice: it can only be used on routes behind
-/// `require_auth`, which inserts the extension. The rejection exists so a
-/// future route mounted outside the layer fails loudly rather than silently
-/// attributing an action to nobody.
+/// Infallible in practice: only usable on routes behind `require_auth`, which
+/// inserts the extension. The rejection exists so a route mounted outside the
+/// layer fails loudly rather than silently attributing an action to nobody.
 pub struct AuthUser(pub Identity);
 
 impl<S: Send + Sync> axum::extract::FromRequestParts<S> for AuthUser {

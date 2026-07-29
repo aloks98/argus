@@ -1,28 +1,17 @@
-//! Identity-field validation (fleet-identity slice, design "Validation rules")
-//! and agent-cert parsing.
-//!
-//! The validation module (`normalize_tags`, `normalize_display_name`,
-//! `validate_notes`) provides ONE implementation shared by every write path — the
-//! PATCH handler, token minting, and enroll-time application all funnel through
-//! here so the rules cannot drift apart. No regex crate: the character class is
-//! trivial and the server has no regex dependency to justify.
+//! `normalize_tags`, `normalize_display_name`, and `validate_notes` are the
+//! ONE implementation shared by every write path (PATCH handler, token
+//! minting, enroll-time), so the rules cannot drift apart. No regex crate:
+//! the character class is trivial.
 //!
 //! `ServerTlsConfig::client_ca_root` + `client_auth_optional` (see
-//! `grpc::serve`) make presenting a client cert optional-but-verified
-//! directly -- no manual `tokio_rustls::TlsAcceptor` / `WebPkiClientVerifier`
-//! fallback is needed. `Request::peer_certs()` returns `None` when no client
-//! cert was presented (the `Enroll` caller) and `Some` otherwise.
-//!
-//! `agent_id_from_peer` is called from `grpc::session`, which requires a
-//! client cert and cross-checks its CN-derived `agent_id` against
-//! `repo::cert_is_active`'s fingerprint lookup before starting the bidi loop.
+//! `grpc::serve`) make presenting a client cert optional-but-verified.
+//! `Request::peer_certs()` returns `None` when none was presented (the
+//! `Enroll` caller), `Some` otherwise.
 
 use anyhow::{anyhow, Context, Result};
 use rustls::pki_types::CertificateDer;
 use uuid::Uuid;
 use x509_parser::prelude::{FromDer, X509Certificate};
-
-// === Validation constants and functions ===
 
 pub const MAX_TAGS: usize = 16;
 const MAX_TAG_LEN: usize = 32;
@@ -83,20 +72,14 @@ pub fn validate_notes(raw: &str) -> Result<(), String> {
     Ok(())
 }
 
-// === Agent certificate parsing ===
-
-/// Extract the `agent_id` from the leaf of a peer certificate chain. The
-/// internal CA signs agent client certs with the `agent_id` UUID as the CN
-/// (`ca::sign_csr`, PRD §5.3); this mirrors the CN-parsing idiom already used
-/// in `ca.rs` and the `grpc` enroll tests.
+/// Extracts the `agent_id` from a peer cert's CN (the internal CA signs agent
+/// certs with the `agent_id` UUID as CN, `ca::sign_csr`, PRD §5.3).
 ///
-/// SECURITY PRECONDITION: this function performs **no** certificate-chain
-/// validation -- it is a pure ASN.1 CN parser. Callers MUST pass certs
-/// obtained from [`tonic::Request::peer_certs`] on a connection served by
-/// `grpc::serve` (which sets `client_ca_root`, so rustls has already validated
-/// the chain against the internal CA). Feeding it cert bytes from any
-/// unvalidated source (e.g. a client-populated proto field) would let an
-/// attacker choose the returned `agent_id`.
+/// SECURITY PRECONDITION: performs **no** chain validation -- pure ASN.1 CN
+/// parsing. Callers MUST pass certs from [`tonic::Request::peer_certs`] on a
+/// connection served by `grpc::serve` (chain already validated against the
+/// internal CA via `client_ca_root`); an unvalidated source (e.g. a
+/// client-populated proto field) would let an attacker choose the `agent_id`.
 pub fn agent_id_from_peer(certs: &[CertificateDer]) -> Result<Uuid> {
     let leaf = certs
         .first()
@@ -121,8 +104,6 @@ mod tests {
     use super::*;
     use rcgen::{CertificateParams, DistinguishedName, DnType, KeyPair};
 
-    // === Validation tests ===
-
     #[test]
     fn tags_are_trimmed_lowercased_and_deduped_in_order() {
         let raw = vec![" Infra ".into(), "media".into(), "infra".into()];
@@ -131,7 +112,6 @@ mod tests {
 
     #[test]
     fn each_tag_rejection_class_names_the_offender() {
-        // Whitespace-only normalizes to empty and is rejected (not dropped).
         assert!(normalize_tags(&["  ".into()]).is_err());
         let long = "a".repeat(33);
         let long_vec = vec![long.clone()];
@@ -147,7 +127,6 @@ mod tests {
     fn more_than_max_tags_is_rejected_after_dedupe() {
         let raw: Vec<String> = (0..MAX_TAGS + 1).map(|i| format!("t{i}")).collect();
         assert!(normalize_tags(&raw).is_err());
-        // ...but 17 raw entries that dedupe to <= 16 are fine.
         let mut dup = vec!["same".to_string(); 2];
         dup.extend((0..MAX_TAGS - 1).map(|i| format!("t{i}")));
         assert_eq!(dup.len(), MAX_TAGS + 1);
@@ -173,19 +152,15 @@ mod tests {
 
     #[test]
     fn display_name_counts_characters_not_bytes() {
-        // "ä" (U+00E4) is 2 bytes but 1 character; the cap counts characters.
         assert!(normalize_display_name(&"ä".repeat(64)).is_ok());
         assert!(normalize_display_name(&"ä".repeat(65)).is_err());
     }
 
     #[test]
     fn notes_counts_characters_not_bytes() {
-        // "ä" (U+00E4) is 2 bytes but 1 character; the cap counts characters.
         assert!(validate_notes(&"ä".repeat(4000)).is_ok());
         assert!(validate_notes(&"ä".repeat(4001)).is_err());
     }
-
-    // === Agent certificate parsing tests ===
 
     #[test]
     fn agent_id_from_peer_reads_the_uuid_from_the_leaf_cns_cn() {

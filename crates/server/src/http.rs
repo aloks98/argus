@@ -1,8 +1,5 @@
-//! Browser HTTP surface (PRD §9.1).
-//!
-//! Sits behind Traefik + cert-manager + Zitadel OIDC. Serves the embedded React
-//! app with SPA fallback, plus health endpoints. The `/api`, SSE, and WebSocket
-//! routes land with their slices.
+//! Browser HTTP surface (PRD §9.1), behind Traefik + cert-manager + Zitadel
+//! OIDC. Serves the embedded React app (SPA fallback) plus health endpoints.
 
 use crate::config::Config;
 use crate::embed::Assets;
@@ -31,29 +28,23 @@ use tokio_stream::StreamExt;
 use tower_http::trace::TraceLayer;
 use uuid::Uuid;
 
-/// Shared router state: the Postgres pool backing `/api` handlers, the
-/// in-memory session `Hub` backing the Docker state + verb endpoints, the
-/// OIDC config, the field cipher the OIDC flow uses to seal its pre-auth flow
-/// cookie (the same `FieldCipher` that already protects `ca_material`), and
-/// the lazily-discovering OIDC client (`crate::auth::oidc`).
 #[derive(Clone)]
 pub struct AppState {
     pub pool: PgPool,
     pub hub: Arc<Hub>,
-    /// `None` when OIDC is not configured (local-admin design §4) -- a valid,
-    /// boot-succeeding state. `/auth/login` and `/auth/callback` degrade to a
-    /// 404 rather than unwrap it.
+    /// `None` when OIDC isn't configured (design §4) -- a valid,
+    /// boot-succeeding state. `/auth/login`/`/auth/callback` degrade to 404.
     pub oidc: Option<Arc<crate::config::OidcConfig>>,
+    /// The same cipher that protects `ca_material` at rest, reused to seal
+    /// the OIDC flow's pre-auth cookie.
     pub cipher: Arc<crate::crypto::FieldCipher>,
     pub oidc_client: Option<Arc<crate::auth::oidc::OidcClient>>,
-    /// `Config.public_url`, carried independently of `oidc` so the session
-    /// cookie's `Secure` attribute can be decided with no OIDC config present
-    /// at all -- a local login sets a cookie in exactly that state
-    /// (local-admin design §4).
+    /// Carried independently of `oidc` so the session cookie's `Secure`
+    /// attribute can be decided with no OIDC config present -- a local login
+    /// sets a cookie in exactly that state (design §4).
     pub public_url: String,
-    /// Guards `POST /auth/local` (local-admin design §10). One instance for
-    /// the process's lifetime, shared via this `Arc` clone across every
-    /// request -- a per-request limiter would limit nothing.
+    /// One instance for the process's lifetime, shared via this `Arc` clone
+    /// across every request -- a per-request limiter would limit nothing.
     pub limiter: Arc<crate::auth::ratelimit::LoginLimiter>,
 }
 
@@ -63,11 +54,9 @@ pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
         crate::crypto::FieldCipher::from_b64_key(&cfg.field_key_b64)
             .context("building the field cipher for the OIDC flow cookie")?,
     );
-    // Building this is local-only (an HTTP client + an optional local CA cert
-    // read); discovery itself happens lazily on first login, never here, so a
-    // down IdP at boot cannot delay the agent gRPC surface or health checks.
-    // Only built when OIDC is configured at all -- otherwise there is no
-    // provider to build a client against.
+    // Building this is local-only; discovery happens lazily on first login,
+    // never here, so a down IdP at boot can't delay the agent gRPC surface
+    // or health checks.
     let oidc_client = oidc
         .clone()
         .map(crate::auth::oidc::OidcClient::new)
@@ -94,10 +83,8 @@ pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
 /// Build the router without binding a socket, so tests can drive it directly
 /// via `tower::ServiceExt::oneshot`.
 fn router(state: AppState) -> Router {
-    // Everything under /api requires a session -- including the SSE log streams
-    // and the terminal WebSocket. Building them as a separate Router and
-    // layering once is what guarantees a new /api route cannot be added
-    // unprotected by accident.
+    // Built as a separate Router with the auth layer applied once, so a new
+    // /api route can't be added unprotected by accident.
     let api = Router::new()
         .route("/api/me", get(me))
         .route("/api/fleet", get(fleet))
@@ -119,10 +106,7 @@ fn router(state: AppState) -> Router {
             "/api/machines/{id}/terminal",
             axum::routing::any(crate::terminal::terminal_ws),
         )
-        // `POST /api/local-admin/rotate` lives INSIDE this router deliberately
-        // (local-admin design §5.2): it must sit behind the same
-        // `require_auth` layer and `SameSite=Lax` cookie as every other verb,
-        // not under the public `/auth/*` prefix.
+        // Deliberately INSIDE this router (design §5.2) -- see `auth::local::rotate`'s doc.
         .route("/api/local-admin/rotate", post(crate::auth::local::rotate))
         .route("/api/enrollment-tokens", get(list_tokens).post(mint_token))
         .route("/api/enrollment-tokens/{id}", delete(revoke_token))
@@ -134,10 +118,9 @@ fn router(state: AppState) -> Router {
             crate::auth::require_auth,
         ));
 
-    // Public: infra endpoints (PRD §9.1 puts them outside OIDC), the OIDC flow
-    // itself, the local-admin login, and the SPA bundle -- which must render
-    // the sign-in view BEFORE any session exists. The bundle is an empty
-    // shell; all data is behind /api.
+    // Public (PRD §9.1): infra endpoints, the OIDC/local-admin login flows,
+    // and the SPA bundle, which must render the sign-in view BEFORE any
+    // session exists. The bundle is an empty shell; all data is behind /api.
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
@@ -205,8 +188,6 @@ struct SparkSeries {
     mem: Vec<f64>,
 }
 
-/// `GET /api/fleet` -- list every machine with its status, for the fleet page.
-/// Behind `require_auth` (mounted once on the whole `/api` router).
 async fn fleet(State(state): State<AppState>) -> Result<Json<Vec<FleetRow>>, StatusCode> {
     let rows = sqlx::query!(
         r#"SELECT id, hostname, display_name, os, host(primary_ip) as "primary_ip?", status,
@@ -326,8 +307,6 @@ impl From<repo::MachineDetail> for MachineDetailDto {
     }
 }
 
-/// `GET /api/machines/{id}` -- one machine's full inventory row, for the
-/// detail page.
 async fn machine(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -356,11 +335,9 @@ struct MachinePatch {
     tags: Option<Vec<String>>,
 }
 
-/// Generic over `T` so both `MachinePatch` (`Option<Option<String>>`) and the
-/// enrollment-token mint body (`Option<Option<i32>>` / `Option<Option<i64>>`)
-/// can share this: absent key vs. explicit JSON `null` carry different
-/// meanings in both bodies, and plain `Option<T>` cannot represent that
-/// difference after serde.
+/// Shared by `MachinePatch` and the enrollment-token mint body: absent key
+/// vs. explicit JSON `null` carry different meanings that plain `Option<T>`
+/// can't represent after serde.
 fn double_option<'de, D, T>(d: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -370,9 +347,8 @@ where
     Ok(Some(Option::<T>::deserialize(d)?))
 }
 
-/// `PATCH /api/machines/{id}` -- display name / notes / tags. Only the fields
-/// present in the body change. Every outcome that MUTATED is audited; a 400
-/// mutates nothing and is not.
+/// Only fields present in the body change. Every outcome that MUTATED is
+/// audited; a 400 mutates nothing and is not.
 async fn patch_machine(
     State(state): State<AppState>,
     crate::auth::AuthUser(identity): crate::auth::AuthUser,
@@ -420,15 +396,10 @@ async fn patch_machine(
     let dn_arg: Option<Option<&str>> = display_name.as_ref().map(|o| o.as_deref());
     let notes_arg: Option<Option<&str>> = notes.as_ref().map(|o| o.as_deref());
 
-    // Fail closed (CLAUDE.md: every verb goes through the audit log from the
-    // start): the mutation and its `machine.update` row are ONE transaction,
-    // committed together or not at all. `run_verb` gets fail-closed by
-    // auditing BEFORE dispatch, but that ordering isn't available here --
-    // "does this machine exist" (the 404) can only be answered by attempting
-    // the update itself, so the update necessarily runs first. Sharing a `tx`
-    // instead means a failed audit write rolls the update back with it: an
-    // unaudited mutation must never persist, and a client told "500" must
-    // find the database agrees.
+    // Fail closed (CLAUDE.md's audit rule): the mutation and its audit row
+    // share ONE transaction. Unlike `run_verb` (which audits BEFORE
+    // dispatch), the 404 here can only be answered by attempting the update,
+    // so the update runs first -- a failed audit write rolls it back with it.
     let mut tx = match state.pool.begin().await {
         Ok(tx) => tx,
         Err(err) => {
@@ -447,9 +418,8 @@ async fn patch_machine(
             }
         };
     if !updated {
-        // `tx` drops here un-committed -- there was nothing to roll back (no
-        // row matched), but this keeps the "never commit without an audit
-        // row" invariant true unconditionally rather than by accident.
+        // `tx` drops un-committed -- nothing to roll back, but keeps "never
+        // commit without an audit row" true unconditionally, not by accident.
         return StatusCode::NOT_FOUND.into_response();
     }
 
@@ -465,8 +435,6 @@ async fn patch_machine(
     .await
     {
         tracing::error!(error = %err, "failed to audit machine.update; rolling back the update");
-        // `tx` drops here un-committed, which rolls the update back: the
-        // whole point of sharing a transaction with the write above.
         return StatusCode::INTERNAL_SERVER_ERROR.into_response();
     }
 
@@ -488,9 +456,8 @@ async fn patch_machine(
 
 // === Enrollment tokens (fleet-identity slice) ===
 
-/// One `enrollment_tokens` row for the browser. `token` is `None` -- and
-/// thus omitted via `skip_serializing_if` -- on every path except the mint
-/// response, where it carries the raw credential exactly once: never
+/// `token` is `None` (omitted via `skip_serializing_if`) except on the mint
+/// response, where it carries the raw credential exactly once -- never
 /// persisted, never returned again.
 #[derive(serde::Serialize)]
 struct TokenDto {
@@ -528,7 +495,7 @@ impl From<repo::TokenRow> for TokenDto {
     }
 }
 
-/// `GET /api/enrollment-tokens` -- newest first. Never the hash or raw token.
+/// Newest first. Never the hash or raw token.
 async fn list_tokens(State(state): State<AppState>) -> Response {
     match repo::list_enrollment_tokens(&state.pool).await {
         Ok(rows) => Json(rows.into_iter().map(TokenDto::from).collect::<Vec<_>>()).into_response(),
@@ -539,11 +506,10 @@ async fn list_tokens(State(state): State<AppState>) -> Response {
     }
 }
 
-/// Body of `POST /api/enrollment-tokens`. `max_uses`/`expires_in_hours` reuse
-/// `double_option`: an absent key takes the default (`1` use / 24h), an
-/// explicit JSON `null` means unlimited/never, and an explicit number is
-/// clamped into range. `tags` has no such tri-state -- there is no existing
-/// row to "leave alone" on a create -- so an absent key is simply "no tags".
+/// `max_uses`/`expires_in_hours` reuse `double_option`: absent -> default (1
+/// use / 24h), explicit `null` -> unlimited/never, explicit number ->
+/// clamped into range. `tags` has no such tri-state (nothing to "leave
+/// alone" on a create), so absent is simply "no tags".
 #[derive(serde::Deserialize)]
 struct MintTokenBody {
     name: String,
@@ -556,15 +522,9 @@ struct MintTokenBody {
     expires_in_hours: Option<Option<i64>>,
 }
 
-/// `POST /api/enrollment-tokens` -- mint a join token. Absent `max_uses` ⇒
-/// 1, absent `expires_in_hours` ⇒ 24h; explicit JSON `null` for either ⇒
-/// unlimited/never; an explicit number is clamped into range rather than
-/// rejected.
-///
 /// The insert and its `enroll_token.create` audit row share one transaction
-/// -- the same fail-closed convention `patch_machine` established (see its
-/// doc comment): a minted-but-unaudited token is exactly the gap CLAUDE.md's
-/// audit rule rules out, so a failed audit write rolls the mint back with it.
+/// -- same fail-closed convention as `patch_machine` (see its doc): a failed
+/// audit write rolls the mint back with it.
 async fn mint_token(
     State(state): State<AppState>,
     crate::auth::AuthUser(identity): crate::auth::AuthUser,
@@ -717,9 +677,8 @@ async fn revoke_token(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// The CA certificate for the enroll page's download button. Behind auth like
-/// the rest of `/api` (the cert is not secret, but nothing here is served
-/// unauthenticated). 503 when the CA hasn't been initialized yet.
+/// For the enroll page's download button. Not secret, but nothing under
+/// `/api` is unauthenticated. 503 when the CA hasn't been initialized yet.
 async fn ca_pem(State(state): State<AppState>) -> Response {
     match sqlx::query_scalar!("SELECT cert_pem FROM ca_material WHERE id = 1")
         .fetch_optional(&state.pool)
@@ -776,8 +735,7 @@ struct RangeQuery {
     range: Option<String>,
 }
 
-/// `GET /api/machines/{id}/metrics?range=` -- a machine's metrics history for
-/// the detail-page charts. `range` is one of `1h` (default), `6h`, `24h`.
+/// `range` is one of `1h` (default), `6h`, `24h`.
 async fn machine_metrics(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -826,8 +784,8 @@ impl From<argus_proto::v1::Container> for ContainerDto {
     }
 }
 
-/// `GET /api/machines/{id}/docker` — the machine's latest cached container list
-/// (empty when the agent hasn't reported / has no Docker daemon).
+/// The machine's latest cached container list (empty if the agent hasn't
+/// reported, or has no Docker daemon).
 async fn machine_docker(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -859,8 +817,8 @@ impl From<argus_proto::v1::Unit> for UnitDto {
     }
 }
 
-/// `GET /api/machines/{id}/systemd` — the machine's latest cached unit list
-/// (empty when the agent hasn't reported / has no systemd).
+/// The machine's latest cached unit list (empty if the agent hasn't
+/// reported, or has no systemd).
 async fn machine_systemd(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -924,20 +882,13 @@ fn source_is_valid(raw: &str) -> bool {
     }
 }
 
-/// Resolve the UI's single `window` value plus `priority` into concrete filters.
-/// `window` is one of `boot | 1h | 24h | all`; `boot` and a relative window are
-/// alternative answers to the same question and are never combined.
+/// `window` is one of `boot | 1h | 24h | all`; `boot` and a relative window
+/// are alternative answers to the same question and are never combined.
 ///
-/// `since_ms` is resolved to an ABSOLUTE epoch here, but freshly — from `now`
-/// at the moment THIS request is handled, not anchored to when the view was
-/// first opened. This function is called independently for the tail request
-/// and for every later page request of the same view, so each read is
-/// self-consistent with the window as of THAT request, but the window itself
-/// creeps forward across the view's lifetime rather than staying pinned. A
-/// view left open across a window boundary — e.g. `window=24h` held open for
-/// more than a day — can therefore end up holding lines older than its own
-/// (current) window. Returns `None` when the input is invalid, which the
-/// caller turns into a 400.
+/// `since_ms` resolves to an ABSOLUTE epoch freshly from `now` at request
+/// time, not anchored to when the view opened -- each read is
+/// self-consistent, but the window creeps forward across a long-lived view.
+/// `None` on invalid input, which the caller turns into a 400.
 fn resolve_log_filters(priority: Option<u32>, window: Option<&str>) -> Option<LogFilters> {
     let max_priority = match priority {
         None => 0,
@@ -962,25 +913,17 @@ fn resolve_log_filters(priority: Option<u32>, window: Option<&str>) -> Option<Lo
     })
 }
 
-/// `resolve_log_filters` plus an explicit, already-resolved cutoff.
+/// `resolve_log_filters` plus an explicit, already-resolved cutoff: a page
+/// read must use the SAME cutoff as its stream, or a long-lived view finds
+/// each page truncated to a fresh `now` instead of its original window.
+/// `since_ms` wins over `window` (still validated even when overridden).
 ///
-/// A page read must use the SAME cutoff its stream was given, otherwise every
-/// request re-resolves `now` and a view open longer than its own window finds
-/// each page fully truncated — reporting "beginning of window" while still
-/// displaying a longer span. The stream announces its resolved cutoff in a
-/// `meta` frame and the client echoes it here, so `since_ms` wins over `window`.
-/// `window` is still validated even when overridden, so a malformed request is
-/// rejected rather than silently accepted.
-///
-/// `Some(0)` is treated as "no explicit cutoff", matching the convention used
-/// everywhere else in this codebase that `since_ms == 0` means unset (see
-/// `crates/agent/src/logs.rs`). This is not a hypothetical: `window=boot`
-/// resolves to `since_ms = 0`, so the `meta` frame announces `{"since_ms":0}`
-/// and the client dutifully echoes `since_ms=0` back on every page read of a
-/// boot-windowed tail. Treating that as authoritative would set
-/// `current_boot = false` and silently drop the boot filter on every page
-/// read — the resolved `since_ms=0` cutoff is then inert (0 means unset), so
-/// the page comes back unfiltered by boot at all.
+/// `Some(0)` = "no explicit cutoff" (the `since_ms==0` means unset
+/// convention used everywhere in this codebase, see
+/// `crates/agent/src/logs.rs`) -- NOT hypothetical: `window=boot` resolves
+/// to `since_ms=0`, so the `meta` frame announces it and the client echoes
+/// it back on every page read. Treating that as authoritative would
+/// silently drop the boot filter on every subsequent page.
 fn resolve_log_filters_with_since(
     priority: Option<u32>,
     window: Option<&str>,
@@ -994,12 +937,9 @@ fn resolve_log_filters_with_since(
     Some(f)
 }
 
-/// Filters only apply to journal reads — `run_docker` ignores them entirely,
-/// so a docker source has no priority or window concept. Zero them for any
-/// non-journal source before they're forwarded to the agent or recorded in the
-/// audit target, so what's dispatched (and what's audited) matches what the
-/// agent actually does with the read rather than asserting a filter that was
-/// silently ignored.
+/// Journal-only concept -- `run_docker` ignores filters entirely. Zeroed for
+/// any non-journal source before dispatch/audit, so what's audited matches
+/// what the agent actually did, not a filter that was silently ignored.
 fn filters_for_source(source: &str, filters: LogFilters) -> LogFilters {
     if source.starts_with("journal:") {
         filters
@@ -1024,10 +964,9 @@ fn audit_target(source: &str, f: &LogFilters) -> String {
     s
 }
 
-/// Sends `LogTailStop` when the SSE response is dropped — i.e. the browser
-/// navigated away, closed the tab, or lost its connection. This is the only
-/// thing that stops a `journalctl -f` from outliving the view that asked for
-/// it, so it must stay owned by the stream.
+/// Sends `LogTailStop` when the SSE response is dropped (tab closed, nav
+/// away, connection lost) -- the only thing stopping a `journalctl -f` from
+/// outliving the view, so this must stay owned by the stream.
 struct TailGuard {
     hub: Arc<Hub>,
     machine_id: Uuid,
@@ -1063,8 +1002,6 @@ async fn log_stream(
     let Some(filters) = resolve_log_filters(q.priority, q.window.as_deref()) else {
         return (StatusCode::BAD_REQUEST, "invalid priority or window").into_response();
     };
-    // Docker ignores filters entirely; zero them before dispatch and audit so
-    // neither claims a narrowing that never happened.
     let filters = filters_for_source(&q.source, filters);
     let tail = q.tail.unwrap_or(DEFAULT_TAIL_LINES).min(MAX_TAIL_LINES);
     let follow = q.follow.unwrap_or(true);
@@ -1090,10 +1027,9 @@ async fn log_stream(
         return (StatusCode::CONFLICT, "agent not connected").into_response();
     }
 
-    // Reading logs is not a mutation, but it can expose secrets, so who read
-    // what is recorded — the PRD already treats terminal.open the same way.
-    // There is no result to update later, so the row is written once as `ok`,
-    // only now that the tail is actually live on the agent.
+    // Reading logs isn't a mutation but can expose secrets, so who read what
+    // is recorded (PRD treats `terminal.open` the same way) -- written once
+    // as `ok`, only now that the tail is actually live on the agent.
     let command_id = Uuid::new_v4();
     if let Err(e) = repo::audit_command(
         &state.pool,
@@ -1127,11 +1063,10 @@ async fn log_stream(
         request_id,
     };
 
-    // Announce the resolved cutoff FIRST, so every page read for this tail can
-    // echo it back instead of re-resolving `now` and drifting. A *named* event
-    // deliberately: the browser's EventSource routes named events to
-    // addEventListener and NOT to onmessage, so this frame cannot be mistaken
-    // for a log line by the existing NDJSON parsing.
+    // Announced FIRST so every page read of this tail can echo it back
+    // instead of re-resolving `now` and drifting. A *named* event
+    // deliberately: EventSource routes named events to addEventListener,
+    // not onmessage, so this can't be mistaken for a log line.
     let meta = Event::default()
         .event("meta")
         .data(format!(r#"{{"since_ms":{}}}"#, filters.since_ms));
@@ -1152,8 +1087,7 @@ async fn log_stream(
 /// the request. journalctl returns a bounded page quickly.
 const PAGE_TIMEOUT: Duration = Duration::from_secs(15);
 
-/// `GET /api/machines/{id}/logs/page?source=&before=&limit=` — one backward page
-/// of a unit's journal, collected from a short-lived non-follow tail. Journal
+/// One backward page, collected from a short-lived non-follow tail. Journal
 /// only; docker has no cursor.
 async fn logs_page(
     State(state): State<AppState>,
@@ -1161,8 +1095,6 @@ async fn logs_page(
     Query(q): Query<LogPageQuery>,
     crate::auth::AuthUser(identity): crate::auth::AuthUser,
 ) -> Response {
-    // Journal only: reuse the shared validator, then reject anything but a
-    // journal source (docker paging is unsupported).
     if !source_is_valid(&q.source) || !q.source.starts_with("journal:") {
         return (StatusCode::BAD_REQUEST, "invalid or non-journal source").into_response();
     }
@@ -1183,9 +1115,9 @@ async fn logs_page(
     let filters = filters_for_source(&q.source, filters);
     let limit = q.limit.unwrap_or(DEFAULT_TAIL_LINES).min(MAX_TAIL_LINES);
 
-    // Open the tail and dispatch BEFORE auditing, mirroring log_stream: an
-    // offline agent must 409 with NO `logs.page` row at all, and a later
-    // timeout must not leave an `ok` row for a read that never returned.
+    // Dispatch BEFORE auditing (mirrors `log_stream`): an offline agent must
+    // 409 with NO `logs.page` row, and a timeout must not leave an `ok` row
+    // for a read that never returned.
     let (request_id, mut rx) = state.hub.open_tail(id);
     if let Err(DispatchError::NotConnected) = state
         .hub
@@ -1204,9 +1136,8 @@ async fn logs_page(
         return (StatusCode::CONFLICT, "agent not connected").into_response();
     }
 
-    // Reading logs is not a mutation but can expose secrets, so record who read
-    // what — only now that the page read is actually live on the agent. Same
-    // posture as logs.open; fail closed if the row can't be written.
+    // Same posture as `logs.open` (see its comment): recorded only once the
+    // read is actually live, fail closed if the row can't be written.
     let command_id = Uuid::new_v4();
     if let Err(e) = repo::audit_command(
         &state.pool,
@@ -1231,8 +1162,7 @@ async fn logs_page(
             .into_response();
     }
 
-    // Collect chunks until eof (or timeout). The agent sends the whole page then
-    // an eof chunk.
+    // Agent sends the whole page, then an eof chunk.
     let mut buf: Vec<u8> = Vec::new();
     let collected = tokio::time::timeout(PAGE_TIMEOUT, async {
         while let Some(chunk) = rx.recv().await {
@@ -1243,10 +1173,9 @@ async fn logs_page(
         }
     })
     .await;
-    // Tear the short-lived tail down on the agent too. The page read is a
-    // non-follow process that exits on its own, but the agent only drops its
-    // AbortHandle map entry on LogTailStop, so without this each page fetch
-    // would leak a dead handle for the session's lifetime.
+    // Tear down the agent-side tail too: the read process exits on its own,
+    // but the agent only drops its `AbortHandle` entry on `LogTailStop` --
+    // without this, each page fetch leaks a dead handle for the session's life.
     state.hub.close_tail(&request_id);
     if let Err(e) = state.hub.send_log_stop(id, request_id).await {
         tracing::debug!(error = ?e, "logs page: stop not delivered (agent gone)");
@@ -1293,8 +1222,6 @@ struct VerbResult {
     status: &'static str,
 }
 
-/// `POST /api/machines/{id}/docker/{container}/{action}` — dispatch a container
-/// verb and wait up to `VERB_TIMEOUT` for the agent's result.
 async fn container_action(
     State(state): State<AppState>,
     Path((id, container, action)): Path<(Uuid, String, String)>,
@@ -1318,8 +1245,6 @@ async fn container_action(
     .await
 }
 
-/// `POST /api/machines/{id}/units/{unit}/{action}` — dispatch a systemd unit
-/// verb and wait up to `VERB_TIMEOUT` for the agent's result.
 async fn unit_action(
     State(state): State<AppState>,
     Path((id, unit, action)): Path<(Uuid, String, String)>,
@@ -1331,10 +1256,9 @@ async fn unit_action(
         "restart" => Verb::UnitRestart,
         _ => return (StatusCode::BAD_REQUEST, "unknown action").into_response(),
     };
-    // A systemd unit name is never empty and never contains '/'. Reject rather
-    // than forward something an agent would only fail on anyway. (The empty case
-    // is unreachable through the router — matchit won't bind an empty path
-    // segment — but is kept so the guard holds for any direct caller.)
+    // A unit name is never empty and never contains '/'; reject rather than
+    // forward something the agent would only fail on. (Empty is unreachable
+    // through the router -- matchit won't bind it -- kept for any direct caller.)
     if unit.is_empty() || unit.contains('/') {
         return (StatusCode::BAD_REQUEST, "invalid unit name").into_response();
     }
@@ -1350,10 +1274,9 @@ async fn unit_action(
     .await
 }
 
-/// The shared verb pipeline for every verb family: audit-before-dispatch (fail
-/// closed), dispatch, then a bounded wait for the agent's result. `timeout` is
-/// injected so tests don't wait the full 10s. `identity` is the caller
-/// authenticated by `require_auth` -- it attributes both the audit row and the
+/// The shared verb pipeline: audit-before-dispatch (fail closed), dispatch,
+/// then a bounded wait for the result. `timeout` is injected so tests don't
+/// wait the full 10s. `identity` attributes both the audit row and the
 /// `issued_by` the agent sees on the wire to the real operator.
 async fn run_verb(
     state: &AppState,
@@ -1367,17 +1290,15 @@ async fn run_verb(
     let command_id = Uuid::new_v4();
     let cid = command_id.to_string();
 
-    // Register the waiter AND write the dispatched audit row BEFORE dispatch, so
-    // the row is guaranteed to exist before the agent can round-trip a
-    // CommandResult -- whose grpc-side UPDATE (repo::update_command_result) is
-    // keyed by command_id and would otherwise silently no-op against a
-    // not-yet-inserted row, freezing it at "dispatched" forever.
+    // Registered AND audited BEFORE dispatch: the row must exist before the
+    // agent can round-trip a CommandResult, whose UPDATE is keyed by
+    // command_id and would otherwise silently no-op against a not-yet-inserted
+    // row, freezing it at "dispatched" forever.
     //
     // NOTE: "dispatched" is NOT guaranteed-terminal -- do not assume a row's
-    // result is final. If the session ends before a spawned verb task finishes
-    // (a unit verb may take up to 90s), the CommandResult send is dropped and
-    // nothing resolves this row. Reconciling stale rows is deliberately
-    // deferred to a scheduled job (CLAUDE.md's apalis-vs-pgmq gate).
+    // result is final. A session ending before a spawned verb task finishes
+    // (up to 90s) drops the CommandResult; reconciling stale rows is
+    // deliberately deferred to a scheduled job (CLAUDE.md's apalis-vs-pgmq gate).
     let rx = state.hub.register_pending(cid.clone(), id);
     if let Err(e) = repo::audit_command(
         &state.pool,
@@ -1413,10 +1334,9 @@ async fn run_verb(
         .await
     {
         state.hub.abandon_pending(&cid);
-        // The agent is offline: no CommandResult will ever arrive to resolve the
-        // row, so flip it to the terminal "denied" state here. This is the one
-        // case the grpc CommandResult arm cannot cover (the command was never
-        // delivered), so it does not conflict with that arm being the sole
+        // Agent offline: no CommandResult will ever arrive, so flip to
+        // terminal "denied" here -- the one case the grpc CommandResult arm
+        // can't cover, so it doesn't conflict with that arm being the sole
         // writer of a real ok/error result.
         if let Err(e) = repo::update_command_result(&state.pool, command_id, id, "denied").await {
             tracing::error!(error = %e, "verb: denied audit update failed");
@@ -1670,12 +1590,10 @@ mod tests {
         Ok(())
     }
 
-    /// `repo`-level tests already pin the tri-state through `upsert_machine`
-    /// and `machine_detail`; this pins the same tri-state through the actual
-    /// `GET /api/machines/{id}` JSON body -- the contract the frontend's
-    /// tab-gating reads (`MachineDetailPage.tsx`'s `caps`/`lacks()`). `null`
-    /// must gate NOTHING (agent predates capability reporting); `[]` must
-    /// gate EVERYTHING (reported, has none) -- must survive serialization.
+    /// Pins the capability tri-state through the actual `GET
+    /// /api/machines/{id}` JSON body -- the contract
+    /// `MachineDetailPage.tsx`'s `caps`/`lacks()` reads. `null` must gate
+    /// NOTHING (predates capability reporting); `[]` must gate EVERYTHING.
     #[sqlx::test]
     async fn machine_detail_json_carries_the_capability_tri_state(
         pool: PgPool,
@@ -1735,13 +1653,10 @@ mod tests {
         Ok(())
     }
 
-    /// The four inventory columns (`cpu_model`/`cpu_cores`/`boot_time`/`virt`)
-    /// must ride along in the detail JSON exactly like `capabilities` does:
-    /// present with values when reported, present as explicit `null` when
-    /// not. Presence is checked with `contains_key`, never bare indexing --
-    /// `serde_json::Value`'s `Index` impl returns `Value::Null` for an
-    /// ABSENT key too, so `detail["cpu_model"] == Value::Null` alone can't
-    /// distinguish "key missing" from "key present, value null".
+    /// The four inventory columns ride along like `capabilities`: present
+    /// with values when reported, present as explicit `null` when not.
+    /// Checked with `contains_key`, never bare indexing (same `Value::Null`
+    /// for-absent-key gotcha as the fleet test above).
     #[sqlx::test]
     async fn machine_detail_json_carries_inventory_fields(pool: PgPool) -> anyhow::Result<()> {
         let with_id: Uuid = sqlx::query!(
@@ -1812,9 +1727,8 @@ mod tests {
         (state, hub)
     }
 
-    /// A stand-in `Identity` for tests that call `run_verb`/`open_and_audit`
-    /// directly rather than through the router (so they never touch
-    /// `require_auth`, but the handlers themselves now take an `Identity`).
+    /// A stand-in `Identity` for tests that call handlers directly rather
+    /// than through the router (bypassing `require_auth`).
     fn test_identity() -> repo::Identity {
         repo::Identity {
             subject: "test-subject".into(),
@@ -1823,10 +1737,9 @@ mod tests {
         }
     }
 
-    /// Seeds a live session and returns a `Cookie` header value, for tests
-    /// that drive `/api` routes through the router: every one of them now
-    /// sits behind `require_auth`, so a request with no cookie gets a 401
-    /// before ever reaching the handler under test.
+    /// Seeds a live session and returns a `Cookie` header value: every
+    /// `/api` route now sits behind `require_auth`, so a request with no
+    /// cookie 401s before reaching the handler under test.
     async fn auth_cookie(pool: &PgPool) -> anyhow::Result<String> {
         let (token, hash) = crate::auth::session::new_session_token();
         repo::create_session(
@@ -1839,13 +1752,8 @@ mod tests {
         Ok(format!("{}={}", argus_common::SESSION_COOKIE, token))
     }
 
-    /// Drives an authenticated JSON request straight through the router --
-    /// method, uri, the session cookie, and a serialized JSON body -- for the
-    /// handlers that take a body (`PATCH /api/machines/{id}` and
-    /// `POST /api/enrollment-tokens`). Mirrors the file's existing
-    /// `Request::builder()...oneshot()` style used throughout this module,
-    /// just consolidated so body-carrying tests don't repeat the same five
-    /// lines per call.
+    /// Consolidated so body-carrying tests (`PATCH`/`POST` handlers) don't
+    /// repeat the same five lines per call.
     async fn request_json(
         app: &Router,
         method: &str,
@@ -1867,9 +1775,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Drives an authenticated, bodyless request straight through the router
-    /// -- the `GET`/`DELETE` counterpart to `request_json` above, for the
-    /// enrollment-token endpoints' list/revoke tests.
+    /// The bodyless (`GET`/`DELETE`) counterpart to `request_json`.
     async fn request(
         app: &Router,
         method: &str,
@@ -1889,9 +1795,7 @@ mod tests {
             .unwrap()
     }
 
-    /// Parses a response body as JSON, consuming the response. Pairs with
-    /// `request`/`request_json` so token tests can go straight from response
-    /// to `serde_json::Value` without repeating the `to_bytes` dance.
+    /// Pairs with `request`/`request_json`, skipping the `to_bytes` dance.
     async fn body_json<T: serde::de::DeserializeOwned>(
         res: axum::http::Response<Body>,
     ) -> anyhow::Result<T> {
@@ -2034,13 +1938,11 @@ mod tests {
         Ok(())
     }
 
-    /// The dev DB fact this whole slice leans on: `make_interval` propagates
-    /// a NULL `hours` argument straight through to a NULL result, which is
-    /// what lets `mint_enrollment_token` store "never expires" by simply
-    /// passing `None` into `make_interval(hours => $6)` with no `CASE`.
-    /// Pinned here so a future Postgres version that changed this behavior
-    /// would fail loudly in CI instead of silently expiring "unlimited"
-    /// tokens.
+    /// `make_interval` propagates a NULL `hours` straight through to a NULL
+    /// result -- what lets `mint_enrollment_token` store "never expires" by
+    /// passing `None` with no `CASE`. Pinned so a future Postgres version
+    /// changing this fails loudly in CI, not by silently expiring
+    /// "unlimited" tokens.
     #[sqlx::test]
     async fn make_interval_of_null_hours_is_null(pool: PgPool) -> anyhow::Result<()> {
         let expires_at: Option<OffsetDateTime> = sqlx::query_scalar!(
@@ -2445,8 +2347,8 @@ mod tests {
         let (state, _hub) = app_state_with_hub(pool);
         let app = router(state);
 
-        // A unit name is never empty and never contains '/'. `%2F` decodes to a
-        // slash inside the path segment, which must not be forwarded to an agent.
+        // `%2F` decodes to a slash inside the path segment -- must not be
+        // forwarded to an agent (path-traversal-shaped input).
         let resp = app
             .oneshot(
                 Request::builder()
@@ -2609,9 +2511,8 @@ mod tests {
             .await?;
         assert_eq!(resp.status(), StatusCode::CONFLICT);
 
-        // The connectivity failure must be checked BEFORE the audit write: a
-        // 409 must never leave a misleading `logs.open`/`ok` row behind for a
-        // read that never actually opened.
+        // Must be checked BEFORE the audit write (see `log_stream`'s comment):
+        // a 409 must never leave a misleading `logs.open`/`ok` row behind.
         let row = sqlx::query!(
             "SELECT count(*) AS count FROM audit_log WHERE machine_id = $1 AND action = 'logs.open' AND result = 'ok'",
             machine_id,
@@ -3055,8 +2956,6 @@ mod tests {
         tokio::spawn(async move {
             while let Some(Ok(frame)) = agent_rx.recv().await {
                 if let Some(server_frame::Payload::LogTailStart(req)) = frame.payload {
-                    // A docker read carries no filters, whatever the query
-                    // string asked for: `run_docker` ignores them entirely.
                     assert_eq!(
                         req.max_priority, 0,
                         "docker reads must not carry a priority filter"
@@ -3111,10 +3010,9 @@ mod tests {
         Ok(())
     }
 
-    // --- resolve_log_filters: the ONLY definition of the `window` -> proto
-    // mapping (see the doc comment on the function). Direct, DB-free coverage
-    // so swapping the 3_600_000 / 86_400_000 constants can't slip past every
-    // other gate silently.
+    // `resolve_log_filters`: the ONLY definition of the `window` -> proto
+    // mapping. Direct, DB-free coverage so swapping the 3_600_000/86_400_000
+    // constants can't slip past every other gate silently.
 
     #[test]
     fn resolve_log_filters_boot_sets_current_boot_and_no_since() {
@@ -3214,12 +3112,10 @@ mod tests {
 
     #[test]
     fn explicit_since_ms_turns_off_a_requested_boot_window() {
-        // window="boot" sets current_boot=true; an explicit since_ms must
-        // still win and flip it back to false -- an explicit cutoff and a
-        // boot window are alternative answers to the same question and must
-        // never combine. This is the true->false transition;
-        // `explicit_since_ms_overrides_the_window` above (window="1h") never
-        // exercises it since current_boot is already false there.
+        // An explicit since_ms must win and flip current_boot back to false --
+        // boot and an explicit cutoff must never combine. This is the
+        // true->false transition; the `1h` test above never exercises it
+        // (current_boot is already false there).
         let f = resolve_log_filters_with_since(None, Some("boot"), Some(1_600_000_000_000))
             .expect("a boot window plus an explicit since_ms is valid");
         assert_eq!(f.since_ms, 1_600_000_000_000);
@@ -3231,11 +3127,9 @@ mod tests {
 
     #[test]
     fn explicit_since_ms_of_zero_does_not_turn_off_a_requested_boot_window() {
-        // The reachable pair: `window=boot` resolves to `since_ms=0` (unlike
-        // the unreachable pair above), which must NOT be treated as an
-        // explicit cutoff -- see `resolve_log_filters_with_since`'s doc
-        // comment for why `since_ms==0` means "unset" and must not suppress
-        // the boot window.
+        // `window=boot` resolves to `since_ms=0`, which must NOT be treated
+        // as an explicit cutoff (see `resolve_log_filters_with_since`'s doc
+        // for why `since_ms==0` means "unset").
         let f = resolve_log_filters_with_since(None, Some("boot"), Some(0))
             .expect("boot plus since_ms=0 is valid");
         assert!(
@@ -3258,8 +3152,8 @@ mod tests {
         assert!(resolve_log_filters_with_since(None, Some("bogus"), Some(1)).is_none());
     }
 
-    // --- content_type: the PWA manifest must be served with the MIME type
-    // browsers require to treat it as installable.
+    // The PWA manifest must be served with the MIME type browsers require
+    // to treat it as installable.
 
     #[test]
     fn content_type_serves_the_webmanifest_mime() {
@@ -3335,12 +3229,10 @@ mod tests {
         Ok(())
     }
 
-    /// The SSE log stream is a different transport (`Sse::new(...)` rather
-    /// than `Json(...)`) and nothing about it visually resembles
-    /// `/api/fleet`, so it's exactly the kind of route a refactor could
-    /// accidentally move outside the `api` sub-router. Assert the exact
-    /// status so a regression (200 = started streaming, or 500) isn't
-    /// mistaken for a pass.
+    /// A different transport (`Sse::new` not `Json`) that looks nothing like
+    /// `/api/fleet` -- exactly the kind of route a refactor could
+    /// accidentally move outside the `api` sub-router. Asserts the exact
+    /// status so a regression (200 or 500) isn't mistaken for a pass.
     #[sqlx::test]
     async fn logs_stream_route_requires_a_session(pool: PgPool) -> anyhow::Result<()> {
         let app = router(test_state(pool));
@@ -3364,13 +3256,10 @@ mod tests {
         Ok(())
     }
 
-    /// The terminal WebSocket differs from a JSON handler: a successful
-    /// upgrade returns `101 Switching Protocols`, not `200`. `require_auth`
-    /// wraps the whole `api` sub-router as a layer, so it must reject with
-    /// `401` BEFORE axum hands the connection to `WebSocketUpgrade` -- a
-    /// refactor that moved this route outside that layer would turn it into
-    /// a live unauthenticated root shell. `oneshot` never completes the
-    /// upgrade, so asserting the status alone proves the layer ran first.
+    /// A successful upgrade returns `101`, not `200`. `require_auth` wraps
+    /// the whole `api` sub-router, so it must reject with `401` BEFORE axum
+    /// hands off to `WebSocketUpgrade` -- moving this route outside that
+    /// layer would turn it into a live unauthenticated root shell.
     #[sqlx::test]
     async fn terminal_websocket_upgrade_requires_a_session(pool: PgPool) -> anyhow::Result<()> {
         let app = router(test_state(pool));
@@ -3502,9 +3391,8 @@ mod tests {
             "a failed login must not set a session cookie"
         );
 
-        // CLAUDE.md: every verb goes through the audit log from the start.
-        // Design §9 requires `method` on the row explicitly, not merely "some
-        // audit row got written".
+        // CLAUDE.md's audit rule + design §9: `method` must be explicit on
+        // the row, not merely "some audit row got written".
         let audited =
             sqlx::query!("SELECT result, detail FROM audit_log WHERE action = 'auth.denied'")
                 .fetch_one(&pool)
@@ -3558,15 +3446,12 @@ mod tests {
         assert_eq!(me.status(), StatusCode::OK);
         let me_body = axum::body::to_bytes(me.into_body(), 64 * 1024).await?;
         let me_json: serde_json::Value = serde_json::from_slice(&me_body)?;
-        // Design §8: the `local:` prefix namespaces the subject so it can
-        // never collide with a provider's `sub`. Nothing else asserts this --
-        // pin it so a future refactor that drops or reshapes the prefix
-        // fails here instead of silently opening a collision path.
+        // Design §8: `local:` namespaces the subject so it can never collide
+        // with a provider's `sub`. Nothing else asserts this at this level --
+        // pin it so a refactor that drops the prefix fails here.
         assert_eq!(me_json["subject"], "local:admin");
 
-        // CLAUDE.md: every verb goes through the audit log from the start,
-        // and design §9 requires `method` be explicit on the row -- nothing
-        // else would notice it silently vanishing.
+        // Same audit-detail rationale as the login-denial test above.
         let audited =
             sqlx::query!("SELECT result, detail FROM audit_log WHERE action = 'auth.login'")
                 .fetch_one(&pool)
@@ -3595,11 +3480,9 @@ mod tests {
         Ok(())
     }
 
-    /// Same failure across all three reasons: wrong password, wrong username
-    /// (a row exists, but the caller names a different one), and no admin
-    /// configured at all. Pins body AND status as byte-identical, not merely
-    /// "some 401" -- design §11's whole point is that these three cases must
-    /// be indistinguishable to the caller.
+    /// Pins body AND status as byte-identical across all three failure
+    /// reasons (wrong password, wrong username, no admin) -- design §11's
+    /// whole point is that these cases must be indistinguishable.
     #[sqlx::test]
     async fn local_login_failure_response_is_identical_across_all_three_reasons(
         pool: PgPool,
@@ -3666,11 +3549,9 @@ mod tests {
         pool: PgPool,
     ) -> anyhow::Result<()> {
         let state = test_state(pool);
-        // Exhaust the burst directly against the limiter -- no admin row is
-        // ever created, so if the handler queried the database on this path
-        // it would 401 (or 500, absent a row/table setup), never 429. `check`
-        // itself reserves the slot it grants, so calling it alone -- with no
-        // separate `record_failure` -- is enough to spend the whole burst.
+        // If the handler queried the DB on this path it would 401/500, never
+        // 429. `check` itself reserves the slot it grants, so calling it
+        // alone (no `record_failure`) is enough to spend the whole burst.
         let now = std::time::Instant::now();
         for _ in 0..(crate::auth::ratelimit::BURST + 1) {
             state.limiter.check(now);
@@ -3695,13 +3576,10 @@ mod tests {
     }
 
     /// `check` must reserve the slot it grants, not just report "under
-    /// budget" -- otherwise concurrent requests can all read the same
-    /// pre-reservation count and all pass. Proven here at the real router by
-    /// firing far more than `BURST` requests at `/auth/local` SIMULTANEOUSLY
-    /// (no admin row, so every one takes the real ~100ms argon2 dummy-hash
-    /// path, giving them actual overlapping wall-clock time to race in).
-    /// With the reservation folded into `check`, at most `BURST` may ever be
-    /// admitted regardless of how they interleave.
+    /// budget" -- otherwise concurrent requests could all read the same
+    /// pre-reservation count and all pass. Fires far more than `BURST`
+    /// requests SIMULTANEOUSLY (no admin row, so each pays the real ~100ms
+    /// dummy-hash path, giving them real overlapping wall-clock time to race).
     #[sqlx::test]
     async fn concurrent_local_logins_cannot_collectively_exceed_the_burst(
         pool: PgPool,
@@ -3751,10 +3629,9 @@ mod tests {
     async fn local_admin_rotate_requires_auth_and_issues_a_new_password(
         pool: PgPool,
     ) -> anyhow::Result<()> {
-        // A NON-default username: a hardcoded `reset_local_admin(&pool, "admin")`
-        // -- the exact shortcut `rotate` deliberately avoids -- would pass a
-        // test seeded with "admin" identically to the real username-preserving
-        // implementation. Only a non-default seed can tell the two apart.
+        // A NON-default username: a hardcoded `reset_local_admin(pool,
+        // "admin")` -- the shortcut `rotate` deliberately avoids -- would
+        // pass this test identically. Only a non-default seed tells them apart.
         let hash = crate::auth::password::hash_password("original")?;
         repo::upsert_local_admin(&pool, "breakglass", &hash).await?;
 

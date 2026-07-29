@@ -1,7 +1,6 @@
-//! Server-side DB repository (PRD §5, §6.1): enrollment-token consumption,
-//! machine inventory upsert, issued-cert bookkeeping, online/offline status,
-//! and the audit log. Every query is compile-time-checked via
-//! `sqlx::query!`/`query_as!` against the live dev Postgres (`DATABASE_URL`).
+//! Server-side DB repository (PRD §5, §6.1). Every query is
+//! compile-time-checked via `sqlx::query!`/`query_as!` against the live dev
+//! Postgres (`DATABASE_URL`).
 
 use anyhow::Result;
 use rand::Rng;
@@ -12,17 +11,11 @@ use uuid::Uuid;
 
 /// Outcome of atomically checking + consuming an enrollment token.
 pub enum TokenCheck {
-    // `grpc::enroll` doesn't use the token's name as the audit *actor* (the
-    // closed `Actor` enum has no variant for an arbitrary token name); it's
-    // still the only server-verified record of which token authorized the
-    // call, so `enroll` stamps it into every `agent.enroll` row's `detail`
-    // instead (`repo::audit_with_detail`).
+    // `Actor` has no variant for an arbitrary token name, so `enroll` stamps
+    // it into `agent.enroll`'s `detail` instead (`audit_with_detail`).
     //
-    // `display_name`/`tags` carry the identity `mint_enrollment_token` was
-    // given, applied to the machine right after `upsert_machine`
-    // (`apply_token_identity` below) -- a null/empty value here means the
-    // token never set that field, not that it should clear the machine's
-    // existing one.
+    // `display_name`/`tags`: a null/empty value here means the token never
+    // set that field, not that it should clear the machine's existing one.
     Valid {
         token_name: String,
         display_name: Option<String>,
@@ -54,12 +47,10 @@ pub struct AgentInfoRow {
     pub virt: Option<String>,
 }
 
-/// Hash `token_plain` with sha256 and atomically check-and-consume the
-/// matching `enrollment_tokens` row: rejects revoked/expired/uses-exhausted
-/// tokens, otherwise increments `uses` and returns the token's `name`. The
-/// raw token is never stored -- only its hash is ever looked up (PRD §5.2).
-/// The check and the increment happen in one `UPDATE ... RETURNING` so two
-/// concurrent enrollments can't both slip through on the last remaining use.
+/// Atomically checks + consumes the matching `enrollment_tokens` row (looked
+/// up by sha256 of `token_plain` -- the raw token is never stored, PRD §5.2).
+/// One `UPDATE ... RETURNING` so two concurrent enrollments can't both slip
+/// through on the last remaining use.
 pub async fn consume_enrollment_token(
     executor: impl sqlx::PgExecutor<'_>,
     token_plain: &str,
@@ -91,11 +82,9 @@ pub async fn consume_enrollment_token(
     })
 }
 
-/// 32-character token over the full `[A-Za-z0-9]` alphabet, unlike
-/// `password.rs`'s ambiguous-char-excluding one: an enrollment token is
-/// copy-pasted into a join command, never hand-transcribed under pressure,
-/// so the 0/O/1/l/I collision risk that motivates the narrower alphabet
-/// doesn't apply here.
+/// 32-char token over the full `[A-Za-z0-9]` alphabet, unlike `password.rs`'s
+/// ambiguous-char-excluding one: a token is copy-pasted into a join command,
+/// never hand-transcribed under pressure, so the collision risk doesn't apply.
 const TOKEN_LEN: usize = 32;
 const TOKEN_ALPHABET: &str = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -139,20 +128,17 @@ pub async fn list_enrollment_tokens(executor: impl sqlx::PgExecutor<'_>) -> Resu
     Ok(rows)
 }
 
-/// Mint a new join token: generate the raw 32-char credential, store only its
-/// sha256, and compute the expiry in SQL. `expires_in_hours: None` stores
-/// "never": `make_interval` propagates a NULL argument straight to a NULL
-/// result, so passing the `Option<i32>` through to `make_interval(hours =>
-/// $6)` needs no extra `CASE`.
+/// Generates the raw credential, stores only its sha256, computes expiry in
+/// SQL. `expires_in_hours: None` stores "never": `make_interval` propagates a
+/// NULL straight through to NULL, so no extra `CASE` is needed.
 pub async fn mint_enrollment_token(
     executor: impl sqlx::PgExecutor<'_>,
     name: &str,
     display_name: Option<&str>,
     tags: &[String],
     max_uses: Option<i32>,
-    // `int4` (Postgres `make_interval`'s `hours` parameter is `int`, not
-    // `bigint`) -- 8760 (the handler's upper clamp, one year) fits
-    // comfortably, so this is not a real range restriction.
+    // `int4`: `make_interval`'s `hours` param is `int` not `bigint`; the
+    // handler's upper clamp (one year = 8760) fits comfortably.
     expires_in_hours: Option<i32>,
     created_by: &str,
 ) -> Result<(TokenRow, String)> {
@@ -178,9 +164,8 @@ pub async fn mint_enrollment_token(
     Ok((row, raw))
 }
 
-/// Look up an enrollment token's `name` by id -- used by the revoke handler
-/// to fetch the name BEFORE revoking (inside the same transaction as the
-/// revoke), so the `enroll_token.revoke` audit row's detail can name the
+/// Used by the revoke handler to fetch the name BEFORE revoking (same
+/// transaction), so the `enroll_token.revoke` audit detail can name the
 /// token without a second round trip after the mutation.
 pub async fn enrollment_token_name(
     executor: impl sqlx::PgExecutor<'_>,
@@ -254,14 +239,13 @@ pub async fn upsert_machine(
     Ok(row.id)
 }
 
-/// Refresh a machine's inventory columns, keyed by the AUTHENTICATED id --
-/// never the agent's self-reported `machine_id` string. Does not touch
-/// machine_id, status, tags, or enrolled_at.
+/// Refreshes a machine's inventory, keyed by the AUTHENTICATED id -- never
+/// the agent's self-reported `machine_id` string. Doesn't touch machine_id,
+/// status, tags, or enrolled_at.
 ///
-/// `Session`'s `Hello` handling must call this instead of `upsert_machine`:
-/// an authenticated-but-misbehaving agent could self-report another
-/// machine's `machine_id`, which would let it silently overwrite that
-/// machine's row via `upsert_machine`'s `ON CONFLICT (machine_id)`.
+/// `Hello` must call this instead of `upsert_machine`: a misbehaving agent
+/// could self-report another machine's `machine_id` and silently overwrite
+/// that row via `upsert_machine`'s `ON CONFLICT (machine_id)`.
 pub async fn update_machine_inventory(
     executor: impl sqlx::PgExecutor<'_>,
     machine_id: Uuid,
@@ -305,10 +289,9 @@ pub async fn update_machine_inventory(
     Ok(())
 }
 
-/// Apply a token's identity fields to the machine it just enrolled — ONLY
-/// where the token actually set them: a null display_name / empty tags on
-/// the token leaves the machine's existing values untouched, which is what
-/// makes re-enrollment after CA rotation identity-preserving by default.
+/// Applies a token's identity fields ONLY where the token set them: a null
+/// `display_name` / empty `tags` leaves the machine's existing values
+/// untouched -- what makes re-enrollment after CA rotation identity-preserving.
 pub async fn apply_token_identity(
     executor: impl sqlx::PgExecutor<'_>,
     machine_id: Uuid,
@@ -332,10 +315,9 @@ pub async fn apply_token_identity(
     Ok(())
 }
 
-/// Record a freshly-issued client cert against its machine (PRD §5.3).
-/// `serial` is the decimal serial string from `ca::SignedCert::serial`;
-/// binding it through `::numeric` avoids pulling in sqlx's `bigdecimal`
-/// feature just to accept a `numeric` column.
+/// Records a freshly-issued client cert against its machine (PRD §5.3).
+/// `serial` binds through `::numeric` (from `ca::SignedCert::serial`'s
+/// decimal string) to avoid pulling in sqlx's `bigdecimal` feature.
 pub async fn insert_agent_cert(
     executor: impl sqlx::PgExecutor<'_>,
     machine_id: Uuid,
@@ -381,21 +363,14 @@ pub async fn cert_is_active(pool: &PgPool, fingerprint: &str) -> Result<Option<U
     Ok(row.map(|r| r.machine_id))
 }
 
-/// Record that a machine is alive as of now: stamp `last_seen_at` *and*
-/// (re)assert `status = 'online'`. Called both at session establishment and
-/// on every liveness-bearing frame thereafter.
+/// Stamps `last_seen_at` and (re)asserts `status = 'online'`. Called at
+/// session establishment and on every liveness-bearing frame after.
 ///
-/// Re-asserting the status on every such frame is load-bearing, not
-/// redundant with the establishment call: `mark_stale_offline` flips any
-/// machine whose `last_seen_at` falls behind the cutoff even if its session
-/// is merely stalled (slow host, paused VM, network hiccup). If a heartbeat
-/// only stamped the timestamp, such a machine could never come back --
-/// `last_seen_at` would keep advancing while `status` stayed `offline`
-/// forever, since a brand-new session is the only other writer of `online`.
-///
-/// A frame is itself proof of life, so it's what restores the status; which
-/// frames count is decided by the caller (`grpc::handle_frame`) -- notably
-/// log chunks do not.
+/// Re-asserting status per frame is load-bearing, not redundant:
+/// `mark_stale_offline` flips a merely-stalled session too, and if a
+/// heartbeat only stamped the timestamp, such a machine could never come
+/// back (only a new session writes `online`). Which frames count is the
+/// caller's decision (`grpc::handle_frame`) -- log chunks do not.
 pub async fn mark_online(pool: &PgPool, machine_id: Uuid) -> Result<()> {
     sqlx::query!(
         "UPDATE machines SET status = 'online', last_seen_at = now(), updated_at = now() WHERE id = $1",
@@ -407,10 +382,9 @@ pub async fn mark_online(pool: &PgPool, machine_id: Uuid) -> Result<()> {
     Ok(())
 }
 
-/// Flip any `online` machine not seen within `older_than` to `offline` (a
-/// periodic background sweep). The cutoff is computed in Rust and bound as a
-/// plain `timestamptz`, rather than binding a Postgres interval. Returns the
-/// number of rows flipped.
+/// Flips any `online` machine not seen within `older_than` to `offline`
+/// (periodic sweep). Cutoff computed in Rust, bound as `timestamptz` rather
+/// than a Postgres interval. Returns the rows flipped.
 pub async fn mark_stale_offline(pool: &PgPool, older_than: std::time::Duration) -> Result<u64> {
     let cutoff = OffsetDateTime::now_utc() - older_than;
 
@@ -429,10 +403,8 @@ pub async fn mark_stale_offline(pool: &PgPool, older_than: std::time::Duration) 
     Ok(result.rows_affected())
 }
 
-/// Delete `metrics` rows older than `older_than` (the hourly retention
-/// prune). Mirrors `mark_stale_offline`: the cutoff is computed in Rust and
-/// bound as a plain `timestamptz` rather than binding a Postgres interval.
-/// Returns the number of rows deleted.
+/// Deletes `metrics` rows older than `older_than` (hourly retention prune).
+/// Mirrors `mark_stale_offline`'s cutoff handling. Returns rows deleted.
 pub async fn prune_metrics(
     exec: impl sqlx::PgExecutor<'_>,
     older_than: std::time::Duration,
@@ -469,15 +441,10 @@ pub async fn audit(
     Ok(())
 }
 
-/// Like `audit`, but also stamps a `detail` payload. For `agent.enroll`: the
-/// row's `actor` alone can't carry "which enrollment token authorized this"
-/// -- before a machine exists there's no principal but `Actor::System`, and
-/// `agent_id` is a self-reported claim, not a cert-verified fact (see
-/// `update_machine_inventory`'s doc comment). The token hash check IS
-/// server-verified, so it goes in `detail` instead:
-/// `{"enrollment_token": <name>}`; without it, "which token enrolled machine
-/// X" becomes unanswerable, since `enrollment_tokens` only tracks a bare
-/// `uses` counter.
+/// Like `audit`, but stamps a `detail` payload. For `agent.enroll`: before a
+/// machine exists there's no principal but `Actor::System`, so the only
+/// server-verified record of which token authorized the call goes in
+/// `detail` (`{"enrollment_token": <name>}`) instead of `actor`.
 pub async fn audit_with_detail(
     executor: impl sqlx::PgExecutor<'_>,
     actor: Actor<'_>,
@@ -571,9 +538,8 @@ pub struct MetricsSampleRow {
     pub uptime_secs: i64,
 }
 
-/// Append one metrics sample for `machine_id`. `ts` is always `now()` at
-/// insert time -- the session handler calls this once per heartbeat, so
-/// there is no client-supplied timestamp to trust or distrust.
+/// Appends one metrics sample for `machine_id` (once per heartbeat, from the
+/// session handler).
 pub async fn insert_metrics(
     executor: impl sqlx::PgExecutor<'_>,
     machine_id: Uuid,
@@ -783,10 +749,9 @@ impl Identity {
     }
 }
 
-/// Who performed an audited action. A closed set on purpose: a browser verb
-/// can only be recorded by producing an `Identity`, which only the auth
-/// middleware mints -- so "forgot to wire the actor through" is a compile
-/// error rather than a plausible-looking audit row.
+/// Who performed an audited action. A closed set ON PURPOSE: only the auth
+/// middleware can mint an `Identity`, so "forgot to wire the actor through"
+/// is a compile error, not a plausible-looking audit row.
 pub enum Actor<'a> {
     User(&'a Identity),
     Agent(Uuid),
@@ -850,8 +815,7 @@ pub async fn delete_session(pool: &PgPool, token_hash: &[u8]) -> Result<()> {
 }
 
 /// Hygiene, not enforcement: `lookup_session` already filters on
-/// `expires_at > now()`, so an unswept row is never usable. Called from the
-/// sweeper tick in `jobs::run`, after `mark_stale_offline`.
+/// `expires_at > now()`, so an unswept row is never usable.
 pub async fn delete_expired_sessions(pool: &PgPool) -> Result<u64> {
     let r = sqlx::query!("DELETE FROM sessions WHERE expires_at <= now()")
         .execute(pool)
@@ -859,11 +823,7 @@ pub async fn delete_expired_sessions(pool: &PgPool) -> Result<u64> {
     Ok(r.rows_affected())
 }
 
-// The local-admin break-glass credential. `local_admin_exists` is
-// wired to the boot rule (`main.rs`); `upsert_local_admin` is wired to the CLI
-// (`argus local-admin reset`, via `auth::local::reset_local_admin`);
-// `get_local_admin`/`LocalAdmin`/`touch_local_admin_login` are wired to
-// `POST /auth/local` (`auth::local::login`).
+// The local-admin break-glass credential (see `auth::local`).
 pub struct LocalAdmin {
     pub username: String,
     pub password_hash: String,
@@ -928,7 +888,6 @@ mod tests {
     async fn consume_enrollment_token_enforces_uses_revoked_and_expiry() {
         let pool = test_pool().await;
 
-        // -- valid once, then Invalid once max_uses is exhausted --
         let plain = format!("test-token-{}", Uuid::new_v4());
         let hash = Sha256::digest(plain.as_bytes()).to_vec();
         sqlx::query!(
@@ -960,7 +919,6 @@ mod tests {
             .await
             .expect("cleanup exhausted token");
 
-        // -- revoked --
         let plain_revoked = format!("test-token-revoked-{}", Uuid::new_v4());
         let hash_revoked = Sha256::digest(plain_revoked.as_bytes()).to_vec();
         sqlx::query!(
@@ -988,7 +946,6 @@ mod tests {
         .await
         .expect("cleanup revoked token");
 
-        // -- expired --
         let plain_expired = format!("test-token-expired-{}", Uuid::new_v4());
         let hash_expired = Sha256::digest(plain_expired.as_bytes()).to_vec();
         let past = OffsetDateTime::now_utc() - time::Duration::hours(1);
@@ -1019,9 +976,8 @@ mod tests {
         .expect("cleanup expired token");
     }
 
-    /// Minimal `AgentInfoRow` for tests that only care about machine identity
-    /// (machine_id/hostname), not the full inventory snapshot exercised by
-    /// `upsert_machine_is_idempotent_by_machine_id_and_updates_inventory` below.
+    /// Minimal `AgentInfoRow` for tests that only care about machine identity,
+    /// not the full inventory snapshot (see `upsert_machine_is_idempotent...` below).
     fn test_agent_info(machine_id: &str) -> AgentInfoRow {
         AgentInfoRow {
             machine_id: machine_id.into(),
@@ -1302,10 +1258,8 @@ mod tests {
             .expect("cleanup");
     }
 
-    /// Seed a minimal `machines` row for the metrics tests below, returning
-    /// its `id`. These run against `#[sqlx::test]`'s fresh, auto-migrated
-    /// per-test database, so unlike the tests above there is no shared-DB
-    /// cleanup to do.
+    /// Seeds a minimal `machines` row, returning its `id`. `#[sqlx::test]`
+    /// gives each test a fresh DB, so (unlike the tests above) no cleanup is needed.
     async fn seed_machine(pool: &PgPool, hostname: &str) -> Uuid {
         let machine_id_str = format!("test-metrics-machine-{}", Uuid::new_v4());
         sqlx::query!(
@@ -1319,29 +1273,21 @@ mod tests {
         .id
     }
 
-    /// Regression: a machine the sweeper flipped while its session was merely
-    /// stalled must return to `online` on its next heartbeat (see
-    /// `mark_online`'s doc comment for why re-asserting status on every
-    /// heartbeat matters).
-    ///
-    /// `#[sqlx::test]` rather than the shared-DB style above because
-    /// `mark_stale_offline` sweeps every row in the database, so it needs a
-    /// database of its own to make an exact count meaningful.
+    /// Regression: a machine the sweeper flipped while merely stalled must
+    /// return to `online` on its next heartbeat (see `mark_online`'s doc).
+    /// `#[sqlx::test]` (own DB) because `mark_stale_offline` sweeps every row.
     #[sqlx::test]
     async fn heartbeat_after_sweep_restores_online(pool: PgPool) -> anyhow::Result<()> {
         let id = seed_machine(&pool, "stalled-host").await;
 
-        // The precondition — an online machine whose heartbeats then stalled —
-        // is set up in raw SQL rather than by calling `mark_online`. Driving
-        // the setup through the function under test lets a regression in it
-        // hide: with the status write removed, the machine never reaches
-        // `online`, the sweep below flips nothing, and the test fails at the
-        // precondition instead of at the assertion that names the bug.
+        // Raw SQL, not `mark_online`, for the precondition: driving setup
+        // through the function under test would let a regression in it hide
+        // (status write removed -> sweep flips nothing -> fails at the
+        // precondition, not at the assertion naming the bug).
         //
-        // Backdating past the cutoff (rather than sweeping with a zero one)
-        // states the actual scenario — heartbeats stalled longer than the 45s
-        // the sweeper allows — and keeps the test off the razor's edge between
-        // the Rust-side cutoff and Postgres's `now()`.
+        // Backdating past the cutoff (not sweeping with a zero one) states the
+        // actual scenario and avoids the razor's edge between the Rust-side
+        // cutoff and Postgres's `now()`.
         sqlx::query!(
             "UPDATE machines SET status = 'online', last_seen_at = now() - interval '5 minutes' WHERE id = $1",
             id,
@@ -1569,7 +1515,6 @@ mod tests {
     async fn capabilities_round_trip_and_none_stays_distinct_from_empty(
         pool: PgPool,
     ) -> anyhow::Result<()> {
-        // Reported set survives a round trip.
         let id = upsert_machine(
             &pool,
             &AgentInfoRow {
@@ -1597,8 +1542,8 @@ mod tests {
             Some(vec!["systemd".to_string(), "journal".to_string()])
         );
 
-        // An EMPTY reported set is stored as `{}` and must NOT collapse to NULL:
-        // it means "this host has none", which gates everything.
+        // An EMPTY set stores as `{}`, must NOT collapse to NULL -- it means
+        // "has none", which gates everything.
         let empty_id = upsert_machine(
             &pool,
             &AgentInfoRow {
@@ -1654,12 +1599,10 @@ mod tests {
         Ok(())
     }
 
-    /// The property above (`capabilities_round_trip_and_none_stays_distinct_from_empty`)
-    /// only ever inserts fresh rows, so it never reaches `upsert_machine`'s
-    /// `ON CONFLICT` branch -- the one place `coalesce(EXCLUDED.capabilities,
-    /// machines.capabilities)` actually runs. This test calls `upsert_machine`
-    /// TWICE on the SAME `machine_id`: the second call (a silent, pre-capability
-    /// agent reporting `None`) must not erase what the first call established.
+    /// The test above never reaches `upsert_machine`'s `ON CONFLICT` branch --
+    /// the one place `coalesce(EXCLUDED.capabilities, machines.capabilities)`
+    /// runs. Calls `upsert_machine` TWICE on the SAME `machine_id`: the
+    /// second (a silent `None` report) must not erase what the first established.
     #[sqlx::test]
     async fn upsert_machine_on_conflict_none_does_not_erase_capabilities(
         pool: PgPool,
@@ -1685,8 +1628,6 @@ mod tests {
         )
         .await?;
 
-        // Same machine_id -> hits ON CONFLICT this time. A None report must not
-        // clobber the capabilities established by the first upsert.
         let id2 = upsert_machine(
             &pool,
             &AgentInfoRow {
@@ -1780,10 +1721,8 @@ mod tests {
     }
 
     /// `update_machine_inventory` is the Hello-path refresh, keyed by the
-    /// authenticated `machines.id` (never the self-reported `machine_id`
-    /// string). Pins both halves of the tri-state contract directly: a
-    /// `None` report preserves what's on disk, and a subsequent explicit
-    /// report overwrites it.
+    /// authenticated id (never the self-reported `machine_id`). Pins both
+    /// halves of the tri-state contract: `None` preserves, explicit overwrites.
     #[sqlx::test]
     async fn update_machine_inventory_none_preserves_then_explicit_overwrites_capabilities(
         pool: PgPool,
@@ -1871,17 +1810,11 @@ mod tests {
         Ok(())
     }
 
-    /// The load-bearing invariant of the inventory slice: the four hardware
-    /// columns (`cpu_model`/`cpu_cores`/`boot_time`/`virt`) added alongside
-    /// `capabilities` must obey the SAME tri-state discipline -- a `None`
-    /// report never erases a previously-stored value.
-    ///
-    /// The seed write uses `upsert_machine` with a full inventory but isn't
-    /// itself under test; the assertions below target the SECOND write (an
-    /// old, all-None agent's report), exercised through both
-    /// `update_machine_inventory` (the Hello-path refresh) and
-    /// `upsert_machine` again (the enroll path) -- both paths must honor the
-    /// same invariant.
+    /// The hardware columns (`cpu_model`/`cpu_cores`/`boot_time`/`virt`) must
+    /// obey the SAME tri-state discipline as `capabilities`: a `None` report
+    /// never erases a previously-stored value. Exercises both
+    /// `update_machine_inventory` (Hello-path) and `upsert_machine` (enroll
+    /// path) -- both must honor the invariant.
     #[sqlx::test]
     async fn old_agent_hello_does_not_erase_inventory(pool: PgPool) -> anyhow::Result<()> {
         // Full inventory arrives once (new agent)...
@@ -1892,8 +1825,8 @@ mod tests {
         info.virt = Some("kvm".into());
         let id = upsert_machine(&pool, &info).await?;
 
-        // ...then an OLD agent's Hello: the same machine, all four fields None
-        // (that's exactly what ""/0 on the wire map to). Nothing may be erased.
+        // ...then an OLD agent's Hello: all four fields None (what ""/0 on
+        // the wire map to). Nothing may be erased.
         let old = test_agent_info("m-inv");
         update_machine_inventory(&pool, id, &old).await?;
         upsert_machine(&pool, &old).await?; // both paths, same invariant
@@ -2064,13 +1997,11 @@ mod tests {
     ) -> anyhow::Result<()> {
         upsert_local_admin(&pool, "admin", "$argon2id$x").await?;
 
-        // Bypass the repo helper to prove the SCHEMA enforces single-row, not
-        // just our upsert. Two different constraints are in play, and both
-        // need their own row to be proven:
+        // Bypass the repo helper: proves the SCHEMA enforces single-row, not
+        // just the upsert. Two constraints are in play, each needing its own row.
 
-        // 1. `id = true` collides with the existing row's PRIMARY KEY. This
-        //    alone would be rejected even if `local_admin_single_row` (the
-        //    `check (id)` constraint) did not exist.
+        // 1. `id = true` collides with the PRIMARY KEY alone, even without
+        //    the `local_admin_single_row` check constraint.
         let same_id = sqlx::query!(
             "INSERT INTO local_admin (id, username, password_hash) VALUES (true, 'other', 'y')"
         )
@@ -2081,12 +2012,10 @@ mod tests {
             "a second id = true row must collide on the primary key"
         );
 
-        // 2. `id = false` is a DISTINCT primary key value, so the PK alone
-        //    permits it -- only `local_admin_single_row`'s `check (id)`
-        //    blocks it. This is the constraint's actual job: without it, a
-        //    row with id = false would sit in the table, invisible to
-        //    `get_local_admin` (which filters `WHERE id = true`), while
-        //    every other test in this file kept passing.
+        // 2. `id = false` is a DISTINCT PK value -- only the check
+        //    constraint blocks it. That's its actual job: without it, this
+        //    row would sit invisible to `get_local_admin` (`WHERE id =
+        //    true`) while every other test kept passing.
         let other_id = sqlx::query!(
             "INSERT INTO local_admin (id, username, password_hash) VALUES (false, 'other', 'y')"
         )

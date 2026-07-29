@@ -20,13 +20,9 @@ pub fn merge_claims(
     merged
 }
 
-/// Resolve a dot-separated path. A path, not a flat name, because Keycloak
-/// nests roles under `realm_access.roles`.
-///
-/// Note the deliberate consequence: a provider whose claim NAME contains dots
-/// (Zitadel's `urn:zitadel:...` does not, but a custom namespaced claim might)
-/// cannot be addressed. That is accepted -- nesting is the common case and a
-/// dotted literal name is rare.
+/// Resolves a dot-separated path (Keycloak nests roles under
+/// `realm_access.roles`). Deliberate consequence: a claim NAME containing
+/// dots can't be addressed -- accepted since nesting is the common case.
 pub fn claim_at_path<'a>(claims: &'a Map<String, Value>, path: &str) -> Option<&'a Value> {
     let mut parts = path.split('.');
     let mut current = claims.get(parts.next()?)?;
@@ -41,14 +37,12 @@ pub fn claim_at_path<'a>(claims: &'a Map<String, Value>, path: &str) -> Option<&
 /// closed is the only safe default for an authorisation input.
 pub fn roles_from_claim(value: &Value) -> Vec<String> {
     match value {
-        // Authentik, Okta, Keycloak, Auth0.
         Value::Array(items) => items
             .iter()
             .filter_map(|v| v.as_str().map(str::to_string))
             .collect(),
         // Zitadel: the KEYS are the role names; the values are org metadata.
         Value::Object(map) => map.keys().cloned().collect(),
-        // Space-delimited, as some providers emit for scope-shaped claims.
         Value::String(s) => s.split_whitespace().map(str::to_string).collect(),
         _ => Vec::new(),
     }
@@ -72,19 +66,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
-    /// Real claim shapes from four providers. OIDC standardises identity, not
-    /// authorisation, so this variance IS the feature -- if this table stops
-    /// passing, "generic OIDC support" is a false claim.
     #[test]
     fn roles_extracted_from_every_real_provider_shape() {
-        // Authentik / Okta: flat array of strings.
         let okta = json!({"groups": ["argus-admin", "everyone"]});
         assert_eq!(
             roles_from_claim(claim_at_path(okta.as_object().unwrap(), "groups").unwrap()),
             vec!["argus-admin", "everyone"]
         );
 
-        // Keycloak: array nested one level down.
         let keycloak = json!({"realm_access": {"roles": ["argus-admin", "offline_access"]}});
         assert_eq!(
             roles_from_claim(
@@ -93,7 +82,6 @@ mod tests {
             vec!["argus-admin", "offline_access"]
         );
 
-        // Zitadel: an OBJECT whose KEYS are the role names.
         let zitadel = json!({
             "urn:zitadel:iam:org:project:roles": {
                 "argus-admin": {"orgid": "example.zitadel.cloud"}
@@ -110,7 +98,6 @@ mod tests {
             vec!["argus-admin"]
         );
 
-        // Space-delimited string, as some providers emit for scope-like claims.
         let spaced = json!({"roles": "argus-admin operator"});
         assert_eq!(
             roles_from_claim(claim_at_path(spaced.as_object().unwrap(), "roles").unwrap()),
@@ -160,8 +147,7 @@ mod tests {
         ));
         assert!(is_admitted(&roles, &RequiredRole::Named("operator".into())));
         assert!(is_admitted(&roles, &RequiredRole::Any));
-        // `Any` means "any authenticated user", including one holding no roles
-        // at all -- providers with no roles concept must still work.
+        // `Any` admits even a roleless caller -- providers with no roles concept must still work.
         assert!(is_admitted(&[], &RequiredRole::Any));
         assert!(!is_admitted(
             &[],
