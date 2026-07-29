@@ -103,10 +103,7 @@ function MetricChartCard({
       </CardHeader>
       <CardContent>
         {timestamps.length === 0 ? (
-          <EmptyState
-            title="No data yet"
-            description="Waiting for metrics to accumulate."
-          />
+          <EmptyState title="No data yet" description="Waiting for metrics to accumulate." />
         ) : (
           <TimeSeriesChart
             timestamps={timestamps}
@@ -150,8 +147,7 @@ export default function MachineDetailPage() {
   const units = systemdQuery.data ?? [];
   const isPending = machineQuery.isPending;
   const notFound = machineQuery.error?.message === "machine 404";
-  const error =
-    machineQuery.error ?? metricsQuery.error ?? dockerQuery.error ?? systemdQuery.error;
+  const error = machineQuery.error ?? metricsQuery.error ?? dockerQuery.error ?? systemdQuery.error;
 
   // `null` capabilities means the agent predates capability reporting: gate
   // NOTHING rather than blanking a working machine. An explicit (possibly
@@ -209,9 +205,7 @@ export default function MachineDetailPage() {
     return (
       <Alert variant="destructive">
         <AlertTitle>Invalid machine id</AlertTitle>
-        <AlertDescription>
-          No machine id was provided in the URL.
-        </AlertDescription>
+        <AlertDescription>No machine id was provided in the URL.</AlertDescription>
       </Alert>
     );
   }
@@ -256,8 +250,7 @@ export default function MachineDetailPage() {
   const resources = latestResources(metrics);
   const loadPoints = buildLoadSeries(metrics);
   const netPoints = buildNetRateSeries(metrics);
-  const latestNet =
-    netPoints.length > 0 ? netPoints[netPoints.length - 1] : null;
+  const latestNet = netPoints.length > 0 ? netPoints[netPoints.length - 1] : null;
 
   // `!= null` (not `!==`): boot_time is an additive proto column, so a
   // frontend newer than the server it's talking to sees `undefined` here,
@@ -331,9 +324,7 @@ export default function MachineDetailPage() {
             </Button>
           </div>
           {machine.display_name !== null && (
-            <p className="mt-1 font-mono text-[11px] text-muted-foreground">
-              {machine.hostname}
-            </p>
+            <p className="mt-1 font-mono text-[11px] text-muted-foreground">{machine.hostname}</p>
           )}
           {machine.tags.length > 0 && (
             <div className="mt-2 flex flex-wrap gap-1">
@@ -536,11 +527,7 @@ export default function MachineDetailPage() {
           <div className="flex h-[70vh] min-h-0 flex-col">
             <LogFilterBar value={logFilters} onChange={setLogFilters} />
             <div className="min-h-0 flex-1">
-              <LogViewer
-                machineId={id}
-                source={SYSTEM_JOURNAL}
-                filters={logFilters}
-              />
+              <LogViewer machineId={id} source={SYSTEM_JOURNAL} filters={logFilters} />
             </div>
           </div>
         </TabsContent>

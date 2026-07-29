@@ -280,11 +280,7 @@ function MintTokenForm({
       {/* `noValidate`: see SignIn.tsx's LocalSignInForm for why — without
           it the browser's own bubble validation wins the race against
           FieldError. */}
-      <form
-        noValidate
-        onSubmit={form.handleSubmit(onSubmit)}
-        className="flex flex-col gap-4"
-      >
+      <form noValidate onSubmit={form.handleSubmit(onSubmit)} className="flex flex-col gap-4">
         <FieldGroup>
           <Controller
             name="name"
@@ -398,9 +394,7 @@ function MintTokenForm({
                 control={form.control}
                 render={({ field, fieldState }) => (
                   <Field data-invalid={fieldState.invalid}>
-                    <FieldLabel htmlFor="mint-expires-in-hours">
-                      Expires in (hours)
-                    </FieldLabel>
+                    <FieldLabel htmlFor="mint-expires-in-hours">Expires in (hours)</FieldLabel>
                     <div className="flex flex-wrap items-center gap-3">
                       <Input
                         {...field}
@@ -493,9 +487,7 @@ function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
     // command block below doesn't need a second scrolling wrapper.
     <div className="flex min-w-0 flex-col gap-4">
       <div className="flex max-w-full items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2">
-        <code className="min-w-0 flex-1 select-all break-all font-mono text-sm">
-          {data.token}
-        </code>
+        <code className="min-w-0 flex-1 select-all break-all font-mono text-sm">{data.token}</code>
         <CopyButton value={data.token} />
       </div>
 
@@ -523,8 +515,8 @@ function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
           themes={{ light: "min-light", dark: "vesper" }}
         />
         <FieldDescription className="mt-1">
-          Replace <code>&lt;agent-endpoint&gt;</code> with the address agents reach the
-          control plane on — Argus cannot know its externally routable address.
+          Replace <code>&lt;agent-endpoint&gt;</code> with the address agents reach the control
+          plane on — Argus cannot know its externally routable address.
         </FieldDescription>
       </div>
     </div>
@@ -650,8 +642,8 @@ function TokenTable() {
             <AlertDialogDescription>
               {revokeTarget !== null && (
                 <>
-                  <span className="font-mono">{revokeTarget.name}</span> will no longer enroll
-                  new machines. This cannot be undone.
+                  <span className="font-mono">{revokeTarget.name}</span> will no longer enroll new
+                  machines. This cannot be undone.
                 </>
               )}
             </AlertDialogDescription>

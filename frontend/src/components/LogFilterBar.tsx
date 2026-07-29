@@ -1,12 +1,6 @@
 // Priority + time-window controls, shared by the Logs tab and the per-unit
 // dialog so there is one control and one code path for both journal surfaces.
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@e412/rnui-react";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@e412/rnui-react";
 import type { LogFilters, LogWindow } from "../api";
 
 /**
@@ -52,9 +46,7 @@ export default function LogFilterBar({
       <Select
         items={PRIORITIES}
         value={String(value.priority)}
-        onValueChange={(v: string | null) =>
-          onChange({ ...value, priority: Number(v ?? "0") })
-        }
+        onValueChange={(v: string | null) => onChange({ ...value, priority: Number(v ?? "0") })}
       >
         <SelectTrigger size="sm" className="w-48 font-mono text-xs">
           <SelectValue />

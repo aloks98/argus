@@ -1,11 +1,7 @@
 // TanStack Query hooks — the single data layer for the SPA. Every screen
 // consumes these instead of hand-rolling its own useEffect/setInterval poll;
 // see FleetPage.tsx and MachineDetailPage.tsx for the call sites.
-import {
-  useMutation,
-  useQuery,
-  useQueryClient,
-} from "@tanstack/react-query";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   containerAction,
   getDocker,
@@ -19,12 +15,7 @@ import {
   revokeToken,
   unitAction,
 } from "../api";
-import type {
-  ContainerAction,
-  MachinePatchBody,
-  MintTokenBody,
-  UnitAction,
-} from "../api";
+import type { ContainerAction, MachinePatchBody, MintTokenBody, UnitAction } from "../api";
 
 /** Polling cadences (ms). Fleet is the scan view, so it refreshes faster. */
 const FLEET_INTERVAL = 5_000;

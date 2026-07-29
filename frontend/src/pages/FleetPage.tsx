@@ -90,10 +90,7 @@ function FleetTable({ rows }: { rows: FleetRow[] }) {
           {rows.map((row) => (
             <TableRow key={row.id}>
               <TableCell className="font-medium">
-                <Link
-                  to={`/machines/${row.id}`}
-                  className="flex flex-col items-start gap-0.5"
-                >
+                <Link to={`/machines/${row.id}`} className="flex flex-col items-start gap-0.5">
                   <AssetTag tone={machineTone(row.status)}>{displayName(row)}</AssetTag>
                   {/* Only when the operator actually renamed the machine —
                       otherwise this would just repeat the AssetTag above. */}
@@ -235,7 +232,9 @@ export default function FleetPage() {
   // fleet entirely — the dropdown only ever offers real tags) falls back to
   // an empty section rather than disappearing.
   const groupSection =
-    group !== null ? (groupFleet(filtered).find((s) => s.tag === group) ?? { tag: group, rows: [] }) : null;
+    group !== null
+      ? (groupFleet(filtered).find((s) => s.tag === group) ?? { tag: group, rows: [] })
+      : null;
 
   return (
     <>
@@ -244,9 +243,7 @@ export default function FleetPage() {
           <span className="flex flex-wrap items-baseline gap-2">
             <span>Machines</span>
             <span className="font-mono text-[11px] normal-case tracking-normal text-muted-foreground">
-              {isPending
-                ? "loading…"
-                : `${rows.length} machine${rows.length === 1 ? "" : "s"}`}
+              {isPending ? "loading…" : `${rows.length} machine${rows.length === 1 ? "" : "s"}`}
             </span>
           </span>
         }

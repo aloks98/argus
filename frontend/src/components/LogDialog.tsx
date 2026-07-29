@@ -51,9 +51,7 @@ export default function LogDialog() {
           </DialogDescription>
         </DialogHeader>
         <div className="flex min-h-0 flex-1 flex-col p-4">
-          {source?.startsWith("journal:") && (
-            <LogFilterBar value={filters} onChange={setFilters} />
-          )}
+          {source?.startsWith("journal:") && <LogFilterBar value={filters} onChange={setFilters} />}
           {open && id !== undefined && source !== null && (
             <div className="min-h-0 flex-1">
               <LogViewer machineId={id} source={source} filters={filters} />

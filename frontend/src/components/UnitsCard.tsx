@@ -95,10 +95,9 @@ export default function UnitsCard({
         <Alert variant="warning" className="mb-4">
           <AlertTitle>Outcome unconfirmed</AlertTitle>
           <AlertDescription>
-            <span className="font-mono">{action.variables?.unit}</span> was
-            dispatched, but the agent did not report a result in time. It may
-            still be starting or stopping — this table refreshes as new state
-            arrives.
+            <span className="font-mono">{action.variables?.unit}</span> was dispatched, but the
+            agent did not report a result in time. It may still be starting or stopping — this table
+            refreshes as new state arrives.
           </AlertDescription>
         </Alert>
       )}
@@ -106,14 +105,11 @@ export default function UnitsCard({
       {action.isSuccess && action.data.status !== "pending" && (
         <Alert variant="success" className="mb-4">
           <AlertTitle>
-            {action.variables === undefined
-              ? "Done"
-              : `Unit ${VERB_DONE[action.variables.action]}`}
+            {action.variables === undefined ? "Done" : `Unit ${VERB_DONE[action.variables.action]}`}
           </AlertTitle>
           <AlertDescription>
-            <span className="font-mono">{action.variables?.unit}</span> —
-            systemd reported the job completed. The row below updates on the next
-            snapshot.
+            <span className="font-mono">{action.variables?.unit}</span> — systemd reported the job
+            completed. The row below updates on the next snapshot.
           </AlertDescription>
         </Alert>
       )}
@@ -168,10 +164,7 @@ export default function UnitsCard({
             description="This host reported no systemd units (or has no systemd)."
           />
         ) : rows.length === 0 ? (
-          <EmptyState
-            title="No matching units"
-            description="No unit matches the current filter."
-          />
+          <EmptyState title="No matching units" description="No unit matches the current filter." />
         ) : (
           <Table>
             {/* Pinned while the body scrolls — at this row count the column
@@ -193,8 +186,7 @@ export default function UnitsCard({
             <TableBody>
               {rows.map((u) => {
                 const active = u.active_state === "active";
-                const rowBusy =
-                  action.isPending && action.variables?.unit === u.name;
+                const rowBusy = action.isPending && action.variables?.unit === u.name;
                 return (
                   <TableRow key={u.name}>
                     {/* Unit names are unbounded — escaped device names like
@@ -212,10 +204,7 @@ export default function UnitsCard({
                       </AssetTag>
                     </TableCell>
                     <TableCell className="hidden md:table-cell">
-                      <StatusBadge
-                        tone={unitTone(u.active_state)}
-                        label={u.active_state}
-                      />
+                      <StatusBadge tone={unitTone(u.active_state)} label={u.active_state} />
                     </TableCell>
                     <TableCell className="hidden md:table-cell font-mono text-muted-foreground">
                       {u.sub_state}
@@ -260,7 +249,11 @@ export default function UnitsCard({
                             <Button
                               size="sm"
                               variant="outline"
-                              render={<Link to={`?tab=units&logs=${encodeURIComponent(`journal:${u.name}`)}`} />}
+                              render={
+                                <Link
+                                  to={`?tab=units&logs=${encodeURIComponent(`journal:${u.name}`)}`}
+                                />
+                              }
                               nativeButton={false}
                             >
                               Logs
@@ -286,9 +279,7 @@ export default function UnitsCard({
                             variant="outline"
                             disabled={active}
                             title={active ? "Already active" : undefined}
-                            onClick={() =>
-                              action.mutate({ unit: u.name, action: "start" })
-                            }
+                            onClick={() => action.mutate({ unit: u.name, action: "start" })}
                           >
                             Start
                           </Button>
@@ -297,18 +288,14 @@ export default function UnitsCard({
                             variant="outline"
                             disabled={!active}
                             title={!active ? "Not running" : undefined}
-                            onClick={() =>
-                              action.mutate({ unit: u.name, action: "stop" })
-                            }
+                            onClick={() => action.mutate({ unit: u.name, action: "stop" })}
                           >
                             Stop
                           </Button>
                           <Button
                             size="sm"
                             variant="outline"
-                            onClick={() =>
-                              action.mutate({ unit: u.name, action: "restart" })
-                            }
+                            onClick={() => action.mutate({ unit: u.name, action: "restart" })}
                           >
                             Restart
                           </Button>

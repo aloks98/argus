@@ -231,7 +231,9 @@ export default function LogViewer({
             return (
               <span className="font-mono text-xs">
                 <span className="mr-2 inline-block text-muted-foreground tabular-nums">{ts}</span>
-                <span className="mr-2 inline-block min-w-[12ch] text-muted-foreground">{ident}</span>
+                <span className="mr-2 inline-block min-w-[12ch] text-muted-foreground">
+                  {ident}
+                </span>
                 <span className={LEVEL_TEXT[levelTone(level)]}>{msg}</span>
               </span>
             );

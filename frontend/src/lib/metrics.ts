@@ -7,9 +7,7 @@ export type ChartPoint = { ts: string; value: number };
 
 // cpu% is reported directly by the agent.
 export function buildCpuSeries(points: MetricPoint[]): ChartPoint[] {
-  return points
-    .filter((p) => p.cpu_pct !== null)
-    .map((p) => ({ ts: p.ts, value: p.cpu_pct! }));
+  return points.filter((p) => p.cpu_pct !== null).map((p) => ({ ts: p.ts, value: p.cpu_pct! }));
 }
 
 // Absolute bytes used, not a derived percentage — a percentage hides the real
@@ -17,9 +15,7 @@ export function buildCpuSeries(points: MetricPoint[]): ChartPoint[] {
 // the same either way; only the axis becomes meaningful. Points missing the
 // counter are skipped rather than plotted as 0.
 export function buildMemUsedSeries(points: MetricPoint[]): ChartPoint[] {
-  return points
-    .filter((p) => p.mem_used !== null)
-    .map((p) => ({ ts: p.ts, value: p.mem_used! }));
+  return points.filter((p) => p.mem_used !== null).map((p) => ({ ts: p.ts, value: p.mem_used! }));
 }
 
 /** The latest point carrying both counters — the card header's used/total. */
@@ -38,9 +34,7 @@ export function latestMem(points: MetricPoint[]): { used: number; total: number 
  * carry the disk counter pair without the swap pair or vice versa — so each
  * is found separately rather than reusing a single "latest complete point".
  */
-export function latestResources(
-  points: MetricPoint[],
-): {
+export function latestResources(points: MetricPoint[]): {
   disk: { used: number; total: number } | null;
   swap: { used: number; total: number } | null;
 } {
@@ -66,9 +60,7 @@ export function latestResources(
 // load1 is NOT a percentage — leave it unbounded so the chart auto-scales to
 // the series max instead of clamping to 0-100.
 export function buildLoadSeries(points: MetricPoint[]): ChartPoint[] {
-  return points
-    .filter((p) => p.load1 !== null)
-    .map((p) => ({ ts: p.ts, value: p.load1! }));
+  return points.filter((p) => p.load1 !== null).map((p) => ({ ts: p.ts, value: p.load1! }));
 }
 
 export type NetRatePoint = { ts: string; rx: number; tx: number };

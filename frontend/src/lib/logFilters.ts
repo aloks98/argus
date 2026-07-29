@@ -19,9 +19,7 @@ import type { LogFilters } from "../api";
  * -b` composes with `--cursor`, so it would silently cap scroll-back at the last
  * reboot on a view that can otherwise page back indefinitely.
  */
-export function useLogFilters(
-  fallback: LogFilters,
-): [LogFilters, (next: LogFilters) => void] {
+export function useLogFilters(fallback: LogFilters): [LogFilters, (next: LogFilters) => void] {
   const [searchParams, setSearchParams] = useSearchParams();
   const filters = filtersFromParams(searchParams, fallback);
 

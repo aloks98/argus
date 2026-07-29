@@ -133,7 +133,11 @@ export default function TerminalView({ machineId }: { machineId: string }) {
   }, [maximized]);
 
   return (
-    <div className={maximized ? "fixed inset-0 z-50 flex flex-col bg-background p-2" : "flex h-[70vh] flex-col"}>
+    <div
+      className={
+        maximized ? "fixed inset-0 z-50 flex flex-col bg-background p-2" : "flex h-[70vh] flex-col"
+      }
+    >
       <div className="flex items-center justify-between pb-1">
         <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
           {closed ?? "interactive shell"}

@@ -6,7 +6,11 @@ export default function NotFoundPage() {
     <EmptyState
       title="Page not found"
       description="That URL doesn't match anything in Argus."
-      action={<Link to="/machines" className="text-xs underline">Back to machines</Link>}
+      action={
+        <Link to="/machines" className="text-xs underline">
+          Back to machines
+        </Link>
+      }
     />
   );
 }

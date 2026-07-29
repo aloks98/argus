@@ -12,7 +12,9 @@ export default defineConfig({
       // no longer registers echarts at module scope.
       {
         find: /^echarts(\/.*)?$/,
-        replacement: decodeURIComponent(new URL("./src/stubs/echarts.ts", import.meta.url).pathname),
+        replacement: decodeURIComponent(
+          new URL("./src/stubs/echarts.ts", import.meta.url).pathname,
+        ),
       },
       // See src/lib/shiki-slim.ts — rnui's CodeBlock imports bare `shiki`,
       // whose bundle registers every grammar/theme (~12 MB of chunks, all
@@ -21,7 +23,9 @@ export default defineConfig({
       // `shiki/core` and `shiki/engine/javascript`, which must NOT be rewritten.
       {
         find: /^shiki$/,
-        replacement: decodeURIComponent(new URL("./src/lib/shiki-slim.ts", import.meta.url).pathname),
+        replacement: decodeURIComponent(
+          new URL("./src/lib/shiki-slim.ts", import.meta.url).pathname,
+        ),
       },
     ],
   },

@@ -62,7 +62,9 @@ export default function CommandPalette({
             {entries.map((e) => (
               <CommandItem key={e.key} value={`${e.label} ${e.keywords}`} onSelect={() => go(e.to)}>
                 <span>{e.label}</span>
-                <span className="ml-auto font-mono text-[11px] text-muted-foreground">{e.hint}</span>
+                <span className="ml-auto font-mono text-[11px] text-muted-foreground">
+                  {e.hint}
+                </span>
               </CommandItem>
             ))}
           </CommandGroup>

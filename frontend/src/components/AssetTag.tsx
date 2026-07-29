@@ -26,7 +26,14 @@ export default function AssetTag({
   children: React.ReactNode;
   className?: string;
 }) {
-  const variant = tone === "ok" ? "success" : tone === "warn" ? "warning" : tone === "fail" ? "destructive" : "secondary";
+  const variant =
+    tone === "ok"
+      ? "success"
+      : tone === "warn"
+        ? "warning"
+        : tone === "fail"
+          ? "destructive"
+          : "secondary";
 
   return (
     <Badge

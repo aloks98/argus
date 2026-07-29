@@ -116,7 +116,9 @@ function TopBar({ onOpenPalette }: { onOpenPalette: () => void }) {
           header is the one place these are always one tap away. `ml-auto` sits
           on the summary when it renders, else on this cluster, so the group is
           right-aligned in both states. */}
-      <div className={summary === null ? "ml-auto flex items-center gap-2" : "flex items-center gap-2"}>
+      <div
+        className={summary === null ? "ml-auto flex items-center gap-2" : "flex items-center gap-2"}
+      >
         <CommandPaletteTrigger onOpen={onOpenPalette} />
         <ThemeToggle showLabel={false} />
       </div>
@@ -198,8 +200,8 @@ function AccountFooter({
           title: "Sign-out failed",
           message: (
             <>
-              {message} Your session is still active on this server -- you are
-              NOT signed out. Try again before walking away from this browser.
+              {message} Your session is still active on this server -- you are NOT signed out. Try
+              again before walking away from this browser.
             </>
           ),
         });
@@ -223,7 +225,9 @@ function AccountFooter({
         )}
         {/* ml-auto (not justify-between on the parent) so the actions stay
             right-aligned even when the identity is absent. */}
-        <div className={rail ? "flex flex-col items-center gap-1" : "ml-auto flex items-center gap-1"}>
+        <div
+          className={rail ? "flex flex-col items-center gap-1" : "ml-auto flex items-center gap-1"}
+        >
           <RotateLocalAdmin
             onError={(message) =>
               onAccountError(message === null ? null : { title: "Rotation failed", message })
@@ -304,14 +308,16 @@ function FleetSidebar({
             <SidebarGroupContent>
               <SidebarMenu className={rail ? "items-center gap-1 py-2" : undefined}>
                 {items.map((r) => {
-                  const isActive = matchPath({ path: r.path, end: false }, location.pathname) !== null;
+                  const isActive =
+                    matchPath({ path: r.path, end: false }, location.pathname) !== null;
                   // `end: false` above (and NavLink's own default) match this
                   // entry for any descendant route (e.g. /machines/:id), so
                   // it can be "active" without being the exact current page.
                   // Only claim aria-current="page" for an exact match; use
                   // the generic "true" token otherwise (NavLink still only
                   // emits the attribute at all when its own isActive fires).
-                  const isCurrentPage = matchPath({ path: r.path, end: true }, location.pathname) !== null;
+                  const isCurrentPage =
+                    matchPath({ path: r.path, end: true }, location.pathname) !== null;
                   const Icon = r.nav!.icon;
                   return (
                     <SidebarMenuItem key={r.path}>
@@ -319,7 +325,9 @@ function FleetSidebar({
                         size="sm"
                         isActive={isActive}
                         title={r.nav!.label}
-                        render={<NavLink to={r.path} aria-current={isCurrentPage ? "page" : "true"} />}
+                        render={
+                          <NavLink to={r.path} aria-current={isCurrentPage ? "page" : "true"} />
+                        }
                         className={
                           rail
                             ? "size-9 justify-center rounded-none p-0 data-active:bg-primary/20 data-active:text-foreground"

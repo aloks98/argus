@@ -118,11 +118,7 @@ export default function MachineIdentity({
       {/* `noValidate`: without it the browser's own bubble validation
           fires first and FieldError never gets a chance to render — see
           SignIn.tsx's LocalSignInForm for the same note. */}
-      <form
-        noValidate
-        onSubmit={form.handleSubmit(onSubmit)}
-        className="flex flex-col gap-4"
-      >
+      <form noValidate onSubmit={form.handleSubmit(onSubmit)} className="flex flex-col gap-4">
         <FieldGroup>
           <Controller
             name="display_name"

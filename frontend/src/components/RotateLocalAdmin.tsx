@@ -65,8 +65,7 @@ export default function RotateLocalAdmin({
           <DialogHeader>
             <DialogTitle>New local admin password</DialogTitle>
             <DialogDescription>
-              Shown once, right now. Argus does not display or store it anywhere
-              else.
+              Shown once, right now. Argus does not display or store it anywhere else.
             </DialogDescription>
           </DialogHeader>
 
@@ -80,8 +79,7 @@ export default function RotateLocalAdmin({
           <Alert variant="warning">
             <AlertTitle>This will not be shown again</AlertTitle>
             <AlertDescription>
-              Copy it into a password manager now -- closing this dialog discards
-              it for good.
+              Copy it into a password manager now -- closing this dialog discards it for good.
             </AlertDescription>
           </Alert>
         </DialogContent>

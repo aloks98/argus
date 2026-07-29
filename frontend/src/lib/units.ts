@@ -19,11 +19,7 @@ export function countFailed(units: Unit[]): number {
  * case-insensitive substring of the name or description, then sorted
  * failed → active → other and alphabetically within each group.
  */
-export function visibleUnits(
-  units: Unit[],
-  filter: string,
-  failedOnly: boolean,
-): Unit[] {
+export function visibleUnits(units: Unit[], filter: string, failedOnly: boolean): Unit[] {
   const needle = filter.trim().toLowerCase();
   return units
     .filter((u) => !failedOnly || u.active_state === "failed")

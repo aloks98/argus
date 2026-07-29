@@ -156,10 +156,7 @@ export async function getMachine(id: string): Promise<MachineDetail> {
   return r.json();
 }
 
-export async function getMetrics(
-  id: string,
-  range: "1h" | "6h" | "24h",
-): Promise<MetricPoint[]> {
+export async function getMetrics(id: string, range: "1h" | "6h" | "24h"): Promise<MetricPoint[]> {
   const r = unauthenticatedOr(await fetch(`/api/machines/${id}/metrics?range=${range}`));
   if (!r.ok) throw new Error(`metrics ${r.status}`);
   return r.json();
@@ -220,9 +217,7 @@ export async function containerAction(
   container: string,
   action: ContainerAction,
 ): Promise<VerbResult> {
-  return postVerb(
-    `/api/machines/${id}/docker/${encodeURIComponent(container)}/${action}`,
-  );
+  return postVerb(`/api/machines/${id}/docker/${encodeURIComponent(container)}/${action}`);
 }
 
 export type Unit = {
@@ -246,9 +241,7 @@ export async function unitAction(
   unit: string,
   action: UnitAction,
 ): Promise<VerbResult> {
-  return postVerb(
-    `/api/machines/${id}/units/${encodeURIComponent(unit)}/${action}`,
-  );
+  return postVerb(`/api/machines/${id}/units/${encodeURIComponent(unit)}/${action}`);
 }
 
 /** A log source: `journal:<unit>` or `docker:<container>`. */
@@ -273,18 +266,13 @@ export const SYSTEM_JOURNAL = "journal:@system";
  * or invalid — the same forgiving guard `?tab=typo` gets, so a bad link renders
  * the default view instead of nothing.
  */
-export function filtersFromParams(
-  params: URLSearchParams,
-  fallback: LogFilters,
-): LogFilters {
+export function filtersFromParams(params: URLSearchParams, fallback: LogFilters): LogFilters {
   const rawPStr = params.get("priority");
   const rawP = rawPStr === null ? NaN : Number(rawPStr);
   const priority = Number.isInteger(rawP) && rawP >= 0 && rawP <= 7 ? rawP : fallback.priority;
   const rawW = params.get("window");
   const window: LogWindow =
-    rawW === "boot" || rawW === "1h" || rawW === "24h" || rawW === "all"
-      ? rawW
-      : fallback.window;
+    rawW === "boot" || rawW === "1h" || rawW === "24h" || rawW === "all" ? rawW : fallback.window;
   return { priority, window };
 }
 
