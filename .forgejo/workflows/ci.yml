@@ -1,8 +1,13 @@
 # Forgejo Actions CI for Argus.
 #
-# Runs on a `medium`-labelled act_runner using catthehacker's Rust image
-# (rustc/cargo/rustfmt/clippy + node + git + gcc/make preinstalled — no rustup or
-# node install step needed).
+# Two-stage layout: `checks` is the fast-fail gate (formatting + lint +
+# typecheck, no builds, no database) on the small runner; `build-test` does
+# the heavy compile/test work on medium, in parallel when runner capacity
+# allows. Both use catthehacker's Rust image (rustc/cargo/rustfmt/clippy +
+# node + git + gcc/make preinstalled).
+#
+# pnpm is installed via `npm i -g`, not corepack: newer Node builds dropped
+# bundled corepack, and the runner image's Node version is not pinned by us.
 name: CI
 
 on:
@@ -15,7 +20,26 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
-  check-test:
+  checks:
+    runs-on: small
+    container:
+      image: catthehacker/ubuntu:rust-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Frontend lint + format + typecheck
+        run: |
+          npm install -g pnpm@11.17.0
+          pnpm --dir frontend install --frozen-lockfile
+          pnpm --dir frontend run fmt:check
+          pnpm --dir frontend run lint
+          pnpm --dir frontend run typecheck
+
+      - name: Rustfmt
+        run: cargo fmt --all --check
+
+  build-test:
     runs-on: medium
     container:
       image: catthehacker/ubuntu:rust-24.04
@@ -40,18 +64,12 @@ jobs:
           su postgres -c "psql -v ON_ERROR_STOP=1 -c \"CREATE DATABASE argus;\""
 
       # The server embeds frontend/dist via rust-embed, so it MUST exist before any
-      # cargo build/clippy/test of the workspace.
+      # cargo build/clippy/test of the workspace. Lint/typecheck live in `checks`.
       - name: Build the embedded frontend
         run: |
-          corepack enable
-          corepack prepare pnpm@11.17.0 --activate
+          npm install -g pnpm@11.17.0
           pnpm --dir frontend install --frozen-lockfile
-          pnpm --dir frontend run typecheck
-          pnpm --dir frontend run lint
           pnpm --dir frontend run build
-
-      - name: Rustfmt
-        run: cargo fmt --all --check
 
       # Uses the committed .sqlx offline cache, so no database is needed here.
       - name: Clippy (deny warnings)
@@ -104,7 +122,8 @@ jobs:
         run: cargo build -p argus-agent --release --target x86_64-unknown-linux-musl
 
       - name: Assert the agent binary is statically linked
+        env:
+          BIN: target/x86_64-unknown-linux-musl/release/argus-agent
         run: |
-          BIN=target/x86_64-unknown-linux-musl/release/argus-agent
           file "$BIN"
           file "$BIN" | grep -qi 'static' || { echo "ERROR: agent is not statically linked"; exit 1; }
