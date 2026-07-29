@@ -68,7 +68,7 @@ Point people at the Forgejo release page for tarballs, not GitHub's tag view.
    git tag v0.1.0
    git push origin v0.1.0
    ```
-4. **Watch the three jobs** (`version` → `artifacts` + `images` in parallel →
+4. **Watch the four jobs** (`version` → `artifacts` + `images` in parallel →
    `chart`, which needs both `version` and `artifacts`): Forgejo Actions UI
    at `git.nexus.e412.in/aloks98/argus/actions`, or `fj actions tasks`.
 5. **What lands where** once green: bare-metal tarballs (`argus-server-*`,

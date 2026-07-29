@@ -142,19 +142,20 @@ jobs:
       # reason, and without it package-release.sh's agent build WOULD fail --
       # this is a real, necessary fix regardless of the item below.
       #
-      # KNOWN OPEN ISSUE (see task-4-report.md for the full trail): `artifacts`
-      # has not yet completed successfully in dry-run rehearsal. Two earlier
-      # theories (SQLX_OFFLINE not reaching the build, a stale .sqlx/ cache)
-      # were checked and ruled out -- SQLX_OFFLINE is set correctly and the
-      # committed cache matches the current queries. This musl-tools gap was
-      # the next candidate (confirmed real, fixed here) but adding it did NOT
-      # resolve the failure in the last rehearsal run, which failed EARLIER
-      # (~67s) than the pre-fix run did (~210s) -- an inconsistency that
-      # couldn't be resolved without direct log access (unavailable from the
-      # session that did this work: no browser tools configured, and
-      # extracting the `fj` CLI's auth token to hit the log API directly was
-      # correctly refused by the permission system as credential access).
-      # Post-merge, check this job's actual log output on the next run.
+      # User request: the musl std target (~30MB via rustup) and the cargo
+      # registry re-download on every run. actions/cache needs act_runner's
+      # cache server; if it's unavailable the step degrades to a warning and
+      # the job still passes -- verified by rehearsal either way.
+      - name: Cache musl target + cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains/*/lib/rustlib/x86_64-unknown-linux-musl
+            ~/.cargo/registry
+          key: musl-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            musl-cargo-
+
       - name: Install musl toolchain
         run: |
           set -euo pipefail
@@ -185,6 +186,7 @@ jobs:
       - name: Build release notes
         if: ${{ github.event_name == 'push' }}
         run: |
+          git config --global --add safe.directory "$(pwd)"
           set -euo pipefail
           git fetch --unshallow --tags --quiet || git fetch --tags --quiet
           PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
@@ -204,7 +206,7 @@ jobs:
         run: |
           set -euo pipefail
           NOTES_JSON=$(cat .release-notes.json)
-          curl -sf -X POST "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases" \
+          curl -sfS -X POST "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases" \
             -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
             -d "{\"tag_name\":\"$GITHUB_REF_NAME\",\"name\":\"$GITHUB_REF_NAME\",\"body\":$NOTES_JSON}" | tee release.json
           python3 -c "import json;print(json.load(open('release.json'))['id'])" > .release-id.txt
@@ -217,7 +219,7 @@ jobs:
           set -euo pipefail
           RID=$(cat .release-id.txt)
           for f in dist-release/*; do
-            curl -sf -X POST "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases/$RID/assets?name=$(basename "$f")" \
+            curl -sfS -X POST "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases/$RID/assets?name=$(basename "$f")" \
               -H "Authorization: token $TOKEN" -F "attachment=@$f"
           done
 
@@ -323,7 +325,7 @@ jobs:
           set -euo pipefail
           helm package deploy/chart/argus \
             --version "${{ needs.version.outputs.version }}" \
-            --app-version "${{ needs.version.outputs.version }}"
+            --app-version "${{ needs.version.outputs.image_tag }}"
 
       - name: Push chart to GHCR
         if: ${{ github.event_name == 'push' }}
@@ -351,8 +353,8 @@ jobs:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          RID=$(curl -sf "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+          RID=$(curl -sfS "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
             -H "Authorization: token $TOKEN" | python3 -c "import json,sys;print(json.load(sys.stdin)['id'])")
           f="argus-${{ needs.version.outputs.version }}.tgz"
-          curl -sf -X POST "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases/$RID/assets?name=$(basename "$f")" \
+          curl -sfS -X POST "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases/$RID/assets?name=$(basename "$f")" \
             -H "Authorization: token $TOKEN" -F "attachment=@$f"

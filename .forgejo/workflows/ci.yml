@@ -129,6 +129,20 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # User request: the musl std target (~30MB via rustup) and the cargo
+      # registry re-download on every run. actions/cache needs act_runner's
+      # cache server; if it's unavailable the step degrades to a warning and
+      # the job still passes -- verified by rehearsal either way.
+      - name: Cache musl target + cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.rustup/toolchains/*/lib/rustlib/x86_64-unknown-linux-musl
+            ~/.cargo/registry
+          key: musl-cargo-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            musl-cargo-
+
       - name: Install musl toolchain
         run: |
           apt-get update
@@ -168,8 +182,9 @@ jobs:
   docker-build:
     runs-on: large
     if: ${{ github.event_name == 'pull_request' }}
-    container:
-      image: catthehacker/ubuntu:act-24.04
+    # No `container:` here ON PURPOSE: on this runner, job containers (a)
+    # cannot reach the docker daemon and (b) cannot write $GITHUB_OUTPUT --
+    # both bisection-confirmed during the release-pipeline rehearsals.
     steps:
       - name: Checkout
         uses: actions/checkout@v4

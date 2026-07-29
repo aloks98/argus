@@ -51,9 +51,14 @@ file, then `sudo systemctl enable --now argus`.
 
 ### Docker
 ```bash
+# Generate the field key ONCE and keep it: it encrypts the internal CA's
+# private key at rest -- a fresh key on container recreation permanently
+# orphans the CA and every enrolled agent.
+FIELD_KEY="$(openssl rand -base64 32)"
+
 docker run -d --name argus --network host \
   -e ARGUS_DATABASE_URL=postgres://argus:CHANGE_ME@localhost:5432/argus \
-  -e ARGUS_FIELD_KEY=$(openssl rand -base64 32) \
+  -e ARGUS_FIELD_KEY="$FIELD_KEY" \
   -e ARGUS_PUBLIC_URL=https://argus.lab.example \
   ghcr.io/<github-user>/argus:latest
 ```
