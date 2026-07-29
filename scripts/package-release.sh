@@ -3,17 +3,30 @@
 # and runnable locally: scripts/package-release.sh <version>
 set -euo pipefail
 VERSION="${1:?usage: package-release.sh <version, e.g. 0.1.0>}"
-ROOT="$(git rev-parse --show-toplevel)"
+# Resolved from the script location, not git: in CI containers,
+# actions/checkout can leave the repo owned by another uid and git then
+# refuses with "dubious ownership" -- the script path needs no git at all.
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT="$ROOT/dist-release"
 rm -rf "$OUT" && mkdir -p "$OUT"
 
 # Server: embedded frontend first, then release build.
-npm install -g pnpm@11.17.0 >/dev/null 2>&1 || true
+echo "==> ensure pnpm"
+# No silent fallback: if pnpm is absent AND this install fails (registry
+# unreachable, npm broken), the whole run must fail HERE with npm's real
+# error -- not three lines later with a bare "pnpm: command not found".
+if ! command -v pnpm >/dev/null; then
+  npm install -g pnpm@11.17.0
+fi
+echo "==> frontend install"
 pnpm --dir "$ROOT/frontend" install --frozen-lockfile
+echo "==> frontend build"
 pnpm --dir "$ROOT/frontend" run build
+echo "==> server release build"
 cargo build --release -p argus-server
 
 # Agent: static musl, asserted.
+echo "==> agent musl build"
 rustup target add x86_64-unknown-linux-musl
 cargo build --release -p argus-agent --target x86_64-unknown-linux-musl
 AGENT_BIN="$ROOT/target/x86_64-unknown-linux-musl/release/argus-agent"
