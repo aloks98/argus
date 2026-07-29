@@ -30,7 +30,7 @@ frontend/       Vite + React + @e412/rnui-react, embedded into argus
 ## Build
 The frontend must be built before the server (it is embedded via `rust-embed`):
 ```bash
-npm --prefix frontend ci && npm --prefix frontend run build
+pnpm --dir frontend install --frozen-lockfile && pnpm --dir frontend run build
 cargo build --release
 ```
 

@@ -43,10 +43,12 @@ jobs:
       # cargo build/clippy/test of the workspace.
       - name: Build the embedded frontend
         run: |
-          npm --prefix frontend ci
-          npm --prefix frontend run typecheck
-          npm --prefix frontend run lint
-          npm --prefix frontend run build
+          corepack enable
+          corepack prepare pnpm@11.17.0 --activate
+          pnpm --dir frontend install --frozen-lockfile
+          pnpm --dir frontend run typecheck
+          pnpm --dir frontend run lint
+          pnpm --dir frontend run build
 
       - name: Rustfmt
         run: cargo fmt --all --check
