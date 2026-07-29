@@ -1,13 +1,13 @@
-// Interactive shell over a WebSocket. We own the xterm instance and the socket;
-// Binary frames carry PTY bytes both ways. Text frames are asymmetric: browser
-// -> server they're the JSON resize control, but the sole server -> browser
-// Text frame is a human-readable reason (e.g. "agent not connected") sent
-// immediately before the socket closes because no PTY was ever opened — there
-// is no PtyOutput to carry that failure, so this is the only channel for it.
-// Maximize is a LAYOUT toggle on the same mounted terminal — never a remount,
-// which would drop the shell. No auto-reconnect: a closed shell is gone, so we
-// surface a "Start new session" button rather than silently opening a fresh
-// one behind the same view.
+// Interactive shell over a WebSocket. Binary frames carry PTY bytes both
+// ways; Text frames are asymmetric — browser->server they're the JSON
+// resize control, but the only server->browser Text frame is a
+// human-readable close reason (e.g. "agent not connected") sent when no PTY
+// was ever opened, since there's no PtyOutput to carry that failure.
+//
+// Maximize is a LAYOUT toggle on the same mounted terminal, never a
+// remount (which would drop the shell). No auto-reconnect: a closed shell
+// is gone, so we surface "Start new session" rather than silently opening
+// a fresh one behind the same view.
 import { useEffect, useRef, useState } from "react";
 import { Terminal } from "@xterm/xterm";
 import { FitAddon } from "@xterm/addon-fit";
@@ -46,12 +46,10 @@ export default function TerminalView({ machineId }: { machineId: string }) {
     ws.binaryType = "arraybuffer";
     const enc = new TextEncoder();
 
-    // The most specific close reason seen so far. onmessage (a server-sent
-    // reason like "agent not connected") and onerror can both fire before the
-    // close event that inevitably follows them, and neither must be clobbered
-    // by onclose's generic fallback — so whichever handler runs first records
-    // its reason here, and later handlers only fill in a reason if this is
-    // still unset.
+    // The most specific close reason seen so far. onmessage/onerror can
+    // both fire before the close event that follows them, and neither must
+    // be clobbered by onclose's generic fallback — whichever handler runs
+    // first records its reason; later handlers only fill in if still unset.
     let reason: string | null = null;
 
     const sendResize = () => {
@@ -76,10 +74,9 @@ export default function TerminalView({ machineId }: { machineId: string }) {
     };
     ws.onclose = (e) => {
       // A normal, reasonless close (shell exited, idle timeout) keeps the
-      // existing "session closed" wording. An abnormal close the server
-      // tagged with a CloseEvent.reason wins over that generic text; either
-      // way, a reason already recorded by onmessage/onerror above wins over
-      // both, since it is the most specific thing we've heard.
+      // generic "session closed" wording; an abnormal close's `reason` wins
+      // over that. Either way, a reason already recorded by onmessage/
+      // onerror wins over both — it's the most specific thing heard.
       if (reason === null) {
         reason =
           e.reason || (e.code === 1000 ? "session closed" : `connection closed (code ${e.code})`);
@@ -94,7 +91,6 @@ export default function TerminalView({ machineId }: { machineId: string }) {
       setClosed(reason);
     };
 
-    // Keystrokes -> Binary frames.
     const dataSub = term.onData((s) => {
       if (ws.readyState === WebSocket.OPEN) ws.send(enc.encode(s));
     });
@@ -106,12 +102,11 @@ export default function TerminalView({ machineId }: { machineId: string }) {
     return () => {
       dataSub.dispose();
       ro.disconnect();
-      // Detach handlers before/after closing: browser close events are
-      // asynchronous, so without this a stale onclose from THIS (dead) socket
-      // can still fire after "Start new session" has bumped `gen` and a new
-      // effect run has opened a live socket — clobbering the new session's
-      // banner with this one's leftover message. `ws.close()` still runs so
-      // the server learns to kill the shell; only the callbacks are removed.
+      // Detach handlers before closing: browser close events are async, so
+      // a stale onclose from THIS (dead) socket could otherwise fire after
+      // "Start new session" bumped `gen` and opened a live one — clobbering
+      // the new session's banner. `ws.close()` still runs; only callbacks
+      // are removed.
       ws.onopen = null;
       ws.onmessage = null;
       ws.onclose = null;
@@ -122,18 +117,20 @@ export default function TerminalView({ machineId }: { machineId: string }) {
     };
   }, [machineId, gen]);
 
-  // Restore keyboard focus to the terminal after a maximize/restore toggle.
-  // Maximize only ever changes the wrapper's layout class -- the same
-  // mounted `Terminal` and its hidden input stay put -- so a plain
-  // `.focus()` here is enough; there is no remount to race against. Also
-  // fires (harmlessly) on initial mount, redundant with the `term.focus()`
-  // call above but not incorrect.
+  // Restore keyboard focus after a maximize/restore toggle: the wrapper's
+  // layout class changes, but the same mounted `Terminal` stays put, so a
+  // plain `.focus()` is enough — no remount to race against. (Harmlessly
+  // redundant with the mount-time `term.focus()` above.)
   useEffect(() => {
     termRef.current?.focus();
   }, [maximized]);
 
   return (
-    <div className={maximized ? "fixed inset-0 z-50 flex flex-col bg-background p-2" : "flex h-[70vh] flex-col"}>
+    <div
+      className={
+        maximized ? "fixed inset-0 z-50 flex flex-col bg-background p-2" : "flex h-[70vh] flex-col"
+      }
+    >
       <div className="flex items-center justify-between pb-1">
         <span className="font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
           {closed ?? "interactive shell"}
@@ -152,46 +149,38 @@ export default function TerminalView({ machineId }: { machineId: string }) {
           </Button>
         </div>
       </div>
-      {/* The border is load-bearing, not decoration: the terminal surface is
-          always `bg-black`, and in dark mode the page background is #000000
-          too — without an edge the terminal is invisible against the page and
-          the prompt appears to float in empty space. `--border` resolves to
-          #242424 in dark and #D4D4D8 in light, so one border works for both.
-          `bg-black` and the padding live here too, so the inset gap reads as
-          part of the terminal surface rather than as a gap showing the page
-          through — and, like the border, padding on the mount div itself
-          would corrupt FitAddon's measurement, whereas padding here is
-          outside the box it measures.
-          It lives on THIS wrapper, one level above the div xterm mounts
-          into, deliberately: `FitAddon.proposeDimensions()` measures
-          `term.element.parentElement` via `getComputedStyle(...).height`/
-          `.width`, and under this app's global `box-sizing: border-box`
-          reset that computed value INCLUDES the element's own border. Put
-          the border directly on the mount div and FitAddon would overcount
-          the available space by the border's thickness on each axis (it
-          only subtracts the xterm-rendered element's padding, never a
-          border on its own parent), nudging cols/rows up by a fraction of a
-          cell and clipping the last row/column against `overflow-hidden`.
-          Keeping the mount div itself borderless — sized to fill this
-          wrapper's content box via h-full/w-full — keeps that measurement
-          exact in both normal and maximized layout. */}
+      {/* Border is load-bearing, not decoration: the terminal is always
+          `bg-black`, and dark mode's page background is #000000 too — no
+          edge means the terminal is invisible against the page. `--border`
+          resolves differently per theme, so one border class works for both;
+          `bg-black` and padding live here too so the inset gap reads as
+          terminal, not page showing through.
+
+          Both border AND padding MUST live on THIS wrapper, one level above
+          the xterm mount div, not on the mount div itself: `FitAddon.
+          proposeDimensions()` measures the mount div's parent via
+          `getComputedStyle(...).height/.width`, which — under this app's
+          `border-box` reset — INCLUDES the parent's border but not xterm's
+          own padding. A border on the mount div would nudge cols/rows up a
+          fraction of a cell and clip the last row/column. Keeping the mount
+          div itself borderless (h-full/w-full) keeps the measurement exact
+          in both normal and maximized layout. */}
       <div className="relative min-h-0 flex-1 overflow-hidden border border-border bg-black p-2">
         <div ref={hostRef} className="h-full w-full" />
-        {/* A dead shell otherwise looks exactly like a live one — same text,
-            same cursor — and the only tell is a line of small print in the
-            header. Blurring the scrollback makes "this is over" the first
-            thing you see, and puts both next moves on the thing you are
+        {/* A dead shell looks exactly like a live one — same text, same
+            cursor — so blurring the scrollback makes "this is over" the
+            first thing you see, with both next moves on what you're
             looking at.
 
-            Absolutely positioned so it never enters FitAddon's measurement:
-            it sizes from this wrapper's computed box, which an out-of-flow
-            child does not affect.
+            Absolutely positioned so it never enters FitAddon's measurement
+            (see the wrapper's comment above) — it sizes from this
+            wrapper's computed box, which an out-of-flow child doesn't
+            affect.
 
-            Deliberately NOT themed. Everything under it is the terminal's
-            `bg-black` surface in light mode and dark mode alike, so the
-            contrast this needs is against black in both — a scrim keyed to
-            `--background` would be near-invisible in dark mode and would
-            fight the black surface in light mode. */}
+            Deliberately NOT themed: everything under it is the terminal's
+            `bg-black` in both modes, so a `--background`-keyed scrim would
+            be near-invisible in dark mode and fight the black surface in
+            light mode. */}
         {closed && !dismissed && (
           <div className="absolute inset-0 z-10 flex flex-col items-center justify-center gap-4 bg-black/60 backdrop-blur-[3px]">
             <span className="font-mono text-xs uppercase tracking-widest text-white/90">

@@ -1,8 +1,6 @@
 // Ctrl/Cmd+K palette: machines and their tabs, plus static routes. Entirely
-// client-side over the cached fleet list — nothing is fetched on open beyond
-// what the fleet page already polls. The fleet query here is enabled only
-// while the dialog is open, so mounting the palette app-wide does not add a
-// permanent background poll on pages that don't otherwise need the fleet.
+// client-side over the cached fleet list (see useFleet's `enabled` doc for
+// why the query only runs while the dialog is open).
 import { useEffect } from "react";
 import { useNavigate } from "react-router-dom";
 import {
@@ -46,15 +44,12 @@ export default function CommandPalette({
   const entries = paletteEntries(rows);
   return (
     <CommandDialog open={open} onOpenChange={onOpenChange}>
-      {/* The explicit <Command> root is LOAD-BEARING, not decoration: unlike
-          shadcn's CommandDialog, rnui's passes children straight into
-          DialogContent without providing cmdk's Command context. Every
-          CommandInput/List/Empty/Item below reads that context via
-          useSyncExternalStore(store.subscribe, ...) — with no root, store is
-          undefined and the first open throws "Cannot read properties of
-          undefined (reading 'subscribe')", unmounting the entire app to a
-          black page. Verified against rnui's compiled $i/CommandDialog and
-          cmdk's source; there is no type error either way, only the crash. */}
+      {/* The explicit <Command> root is LOAD-BEARING, not decoration: rnui's
+          CommandDialog (unlike shadcn's) passes children straight into
+          DialogContent without cmdk's Command context, so every
+          CommandInput/List/Empty/Item throws "Cannot read properties of
+          undefined (reading 'subscribe')" on first open — no type error,
+          just a crash to a blank app. */}
       <Command>
         <CommandInput placeholder="Jump to a machine…" />
         <CommandList>
@@ -63,7 +58,9 @@ export default function CommandPalette({
             {entries.map((e) => (
               <CommandItem key={e.key} value={`${e.label} ${e.keywords}`} onSelect={() => go(e.to)}>
                 <span>{e.label}</span>
-                <span className="ml-auto font-mono text-[11px] text-muted-foreground">{e.hint}</span>
+                <span className="ml-auto font-mono text-[11px] text-muted-foreground">
+                  {e.hint}
+                </span>
               </CommandItem>
             ))}
           </CommandGroup>

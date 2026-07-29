@@ -1,0 +1,49 @@
+{
+  "$schema": "./node_modules/oxlint/configuration_schema.json",
+  // "react" added to the default set (typescript, unicorn, oxc) purely to get
+  // react-hooks/rules-of-hooks + react-hooks/exhaustive-deps below. Do NOT
+  // drop it: oxlint 1.76.0 does NOT error on rule keys naming a plugin that
+  // isn't in this list — it silently ignores them (exit 0, no diagnostic, as
+  // if the rules didn't exist). Probe-verified: the same "rules" block below,
+  // run with "react" removed from "plugins", passed a file with a genuine
+  // conditional-hook-call violation with zero output. An unknown RULE name
+  // under a plugin that IS listed does fail loudly (config-parse error), so
+  // this trap is specifically "plugin missing from the list", not "typo'd
+  // rule name" — re-run that check when bumping oxlint versions.
+  "plugins": ["typescript", "unicorn", "oxc", "react"],
+  "categories": {
+    "correctness": "error"
+  },
+  "rules": {
+    // Only these two, spelled out explicitly rather than via a react-hooks
+    // recommended preset (oxlint has none to spread here). Rule names use the
+    // "react-hooks/" prefix for ESLint-compat, even though `oxlint --rules`
+    // lists them under scope "react" (react/rules-of-hooks,
+    // react/exhaustive-deps) — both spellings resolve to the same rule;
+    // "react-hooks/" is what the ported inline disable comments use too.
+    // Probe-verified on oxlint@1.76.0.
+    "react-hooks/rules-of-hooks": "error",
+    "react-hooks/exhaustive-deps": "error"
+    // No `@typescript-eslint/no-unused-vars` / argsIgnorePattern entry here:
+    // oxlint's built-in eslint/no-unused-vars (on by default via the
+    // "correctness" category above) already treats a leading-underscore
+    // parameter as intentionally unused with zero config — probe-verified
+    // against TimeSeriesChart.tsx's `(_u: uPlot, vals: ...)` callback params
+    // (clean) and a non-underscore unused param (flagged). Nothing to carry
+    // over from the old `argsIgnorePattern: "^_"` eslint option.
+  },
+  "env": {
+    "builtin": true
+  }
+  // eqeqeq is intentionally NOT enabled (oxlint's `eslint/eqeqeq` is off by
+  // default in every category above, so this is a no-op today, but keep the
+  // note): SystemCard.tsx (`row()`) and MachineDetailPage.tsx (`uptime`,
+  // `error != null`, etc.) use loose `== null` / `!= null` DELIBERATELY —
+  // proto fields added in a slice are additive, so an older/newer
+  // frontend-server pairing sees `undefined` where the other sees `null`, and
+  // strict `!==` would let the mismatched one slip through and render
+  // "undefined" instead of omitting the row. If eqeqeq is ever turned on, it
+  // MUST be configured null-tolerant (oxlint's eqeqeq takes the same
+  // `{ "null": "ignore" }`-shaped option as ESLint's) — never the bare
+  // default, which would flag every one of those checks.
+}

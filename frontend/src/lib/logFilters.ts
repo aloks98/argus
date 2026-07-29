@@ -1,27 +1,21 @@
-// URL-backed log filter state, shared by both log surfaces.
-//
-// The Logs tab and the per-unit dialog read and write the same
-// `?priority=` / `?window=` params, so the read/write pair lives here instead of
-// being hand-rolled in each component — they had drifted into two byte-identical
-// copies of the same six lines.
+// URL-backed log filter state, shared by the Logs tab and per-unit dialog:
+// both read/write the same `?priority=` / `?window=` params, so the pair
+// lives here rather than duplicated in each component.
 import { useCallback } from "react";
 import { useSearchParams } from "react-router-dom";
 import { filtersFromParams } from "../api";
 import type { LogFilters } from "../api";
 
 /**
- * `[filters, setFilters]` backed by the query string, so a filtered view is
- * linkable and survives a reload.
+ * `[filters, setFilters]` backed by the query string — linkable, survives a
+ * reload.
  *
- * `fallback` is the per-surface default and the two differ deliberately: the
- * Logs tab defaults to the current boot, the per-unit dialog to all history.
- * Defaulting per-unit to the current boot would be a regression — `journalctl
- * -b` composes with `--cursor`, so it would silently cap scroll-back at the last
- * reboot on a view that can otherwise page back indefinitely.
+ * `fallback` differs per surface on purpose: Logs tab defaults to current
+ * boot, per-unit dialog to all history. Defaulting per-unit to current boot
+ * would silently cap scroll-back at the last reboot (`journalctl -b` composes
+ * with `--cursor`) on a view that can otherwise page back indefinitely.
  */
-export function useLogFilters(
-  fallback: LogFilters,
-): [LogFilters, (next: LogFilters) => void] {
+export function useLogFilters(fallback: LogFilters): [LogFilters, (next: LogFilters) => void] {
   const [searchParams, setSearchParams] = useSearchParams();
   const filters = filtersFromParams(searchParams, fallback);
 

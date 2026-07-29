@@ -1,12 +1,9 @@
 // Logs as a modal dialog over the machine page. A dialog (not a drawer) on
 // purpose: vaul's drawer disables text selection and captures mouse-drag to
-// dismiss, which made the log text unselectable — a dialog has neither, so
-// native select-and-copy of a few lines just works. One surface, no separate
-// full-page route.
+// dismiss, breaking select-and-copy of log text; a dialog has neither.
 //
-// The open source lives in the URL (`?logs=journal:nginx.service`) so it
-// survives a reload and is linkable, matching the `?tab=` convention. Closing
-// removes the param.
+// The open source lives in the URL (`?logs=journal:nginx.service`, matching
+// `?tab=`) so the view survives a reload and is linkable; closing removes it.
 import { useParams, useSearchParams } from "react-router-dom";
 import {
   Dialog,
@@ -39,10 +36,9 @@ export default function LogDialog() {
 
   return (
     <Dialog open={open} onOpenChange={(next: boolean) => !next && close()}>
-      {/* `sm:max-w-6xl` (not just `max-w-6xl`): DialogContent's default caps
-          width at `sm:max-w-sm`, and tailwind-merge can't dedupe an unprefixed
-          utility against that `sm:` one, so the narrow default would win at
-          ≥640px. Matching the modifier is what lets ours take effect. */}
+      {/* `sm:max-w-6xl` (not just `max-w-6xl`): DialogContent's default caps width
+          at `sm:max-w-sm`, and tailwind-merge can't dedupe an unprefixed utility
+          against that `sm:` one — matching the modifier is what lets ours win. */}
       <DialogContent className="flex h-[85vh] w-[92vw] max-w-6xl flex-col gap-0 p-0 sm:max-w-6xl">
         <DialogHeader className="border-b border-border p-4 text-left">
           <DialogTitle className="font-mono text-sm">{source ?? ""}</DialogTitle>
@@ -51,9 +47,7 @@ export default function LogDialog() {
           </DialogDescription>
         </DialogHeader>
         <div className="flex min-h-0 flex-1 flex-col p-4">
-          {source?.startsWith("journal:") && (
-            <LogFilterBar value={filters} onChange={setFilters} />
-          )}
+          {source?.startsWith("journal:") && <LogFilterBar value={filters} onChange={setFilters} />}
           {open && id !== undefined && source !== null && (
             <div className="min-h-0 flex-1">
               <LogViewer machineId={id} source={source} filters={filters} />

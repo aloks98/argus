@@ -1,6 +1,6 @@
-// Pure fleet-page logic: filtering, grouping, palette entries. No DOM, no
-// fetch — everything here is a plain function of the fleet payload so the
-// behavior is reviewable (and one day testable) without a browser.
+// Pure fleet-page logic, no DOM/fetch: everything here is a plain function
+// of the fleet payload so behavior stays reviewable (and testable) without
+// a browser.
 import type { FleetRow } from "../api";
 import { CAP_DOCKER, CAP_JOURNAL, CAP_SYSTEMD } from "../api";
 
@@ -10,11 +10,10 @@ export function displayName(m: Pick<FleetRow, "display_name" | "hostname">): str
 }
 
 /**
- * Case-insensitive substring match on display name, hostname and tags.
- * (The multi-tag AND filter this once carried was removed with the fleet
- * page's chip row — user decision: search matches tags and the Group-by
- * dropdown shows per-tag groups, so chips were a third path to the same
- * result.)
+ * Case-insensitive substring match on display name, hostname and tags. No
+ * multi-tag AND filter on purpose: search already matches tags, and the
+ * Group-by dropdown covers per-tag views — a chip filter would be a third
+ * path to the same result.
  */
 export function visibleFleet(rows: FleetRow[], q: string): FleetRow[] {
   const needle = q.trim().toLowerCase();

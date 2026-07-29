@@ -1,9 +1,8 @@
 //! The authorization-code + PKCE flow (PRD §9.1).
 //!
-//! Discovery is LAZY and cached, never fetched at startup: agents authenticate
-//! by mTLS and have nothing to do with OIDC, so a provider that is down when
-//! Argus starts must not delay the agent gRPC surface or heartbeats. Only
-//! login degrades.
+//! Discovery is LAZY and cached, never fetched at startup: agents
+//! authenticate by mTLS and have nothing to do with OIDC, so a provider
+//! that's down at boot must not delay the agent gRPC surface. Only login degrades.
 
 use crate::auth::claims::{claim_at_path, claim_keys, is_admitted, merge_claims, roles_from_claim};
 use crate::auth::session;
@@ -47,11 +46,10 @@ pub struct RawClaims {
 }
 impl openidconnect::AdditionalClaims for RawClaims {}
 
-/// This deployment's ID-token fields: `RawClaims` stands in for
-/// `EmptyAdditionalClaims` so a roles claim riding in the ID token (some
-/// providers put it there instead of / as well as userinfo) is readable.
-/// Every other generic mirrors `openidconnect::core`'s own `Core*` aliases
-/// exactly -- there's nothing else provider-specific about this client.
+/// `RawClaims` stands in for `EmptyAdditionalClaims` so a roles claim riding
+/// in the ID token (some providers put it there instead of/as well as
+/// userinfo) is readable. Every other generic mirrors `openidconnect::core`'s
+/// own `Core*` aliases.
 type MyIdTokenFields = IdTokenFields<
     RawClaims,
     EmptyExtraTokenFields,
@@ -63,17 +61,12 @@ type MyTokenResponse = StandardTokenResponse<MyIdTokenFields, CoreTokenType>;
 type MyIdTokenClaims = IdTokenClaims<RawClaims, CoreGenderClaim>;
 type MyUserInfoClaims = UserInfoClaims<RawClaims, CoreGenderClaim>;
 
-/// The concrete `CoreClient` specialization once claims carry `RawClaims`
-/// instead of the hardcoded `EmptyAdditionalClaims` the `core::CoreClient`
-/// alias uses. Resolved -- not guessed -- per the implementer note in the
-/// task brief: `Client::from_provider_metadata(..).set_redirect_uri(..)` was
-/// bound to `let _: () = client;` and the compiler's E0308 printed this exact
-/// type. The six trailing `Endpoint*` parameters are what
-/// `CoreClient::from_provider_metadata` actually produces (auth: set by
-/// discovery; device-auth/introspection/revocation: never set, this crate
-/// never uses them; token/userinfo: "maybe set", present only if the
-/// provider's discovery document advertises them -- which is why
-/// `exchange_code` and `user_info` below return `Result`, not bare values).
+/// The concrete `CoreClient` specialization for `RawClaims` (vs
+/// `core::CoreClient`'s hardcoded `EmptyAdditionalClaims`). The trailing
+/// `Endpoint*` params are what `from_provider_metadata` actually produces:
+/// auth set by discovery; device-auth/introspection/revocation never set
+/// (unused); token/userinfo "maybe set" -- why `exchange_code`/`user_info`
+/// below return `Result`, not bare values.
 type OidcCoreClient = openidconnect::Client<
     RawClaims,
     CoreAuthDisplay,
@@ -102,22 +95,15 @@ pub struct FlowState {
     pub next: String,
 }
 
-/// OIDC Core 3.1.3.7 steps 4-5: when an ID token names more than one audience,
-/// the `azp` (authorized party) claim must be present and must be this client.
+/// OIDC Core 3.1.3.7 steps 4-5: a multi-audience ID token's `azp` (authorized
+/// party) must be present and must be this client. `openidconnect` 4.0.1
+/// deliberately leaves this check commented out ("until a use case becomes
+/// apparent"); Argus is that use case.
 ///
-/// This lives here, and is ours to enforce, because `openidconnect` 4.0.1
-/// deliberately does NOT: its azp verification sits commented out in
-/// `verification/mod.rs` behind a note deferring it "until a use case becomes
-/// apparent". Argus is that use case, because it must accept multi-audience
-/// tokens to work against real providers at all.
-///
-/// The pairing is what matters. Accepting extra audiences without this check
-/// would not relocate the audience guarantee, it would delete it: `aud` alone
-/// stops distinguishing "a token minted for us that also names other parties"
-/// from "a token minted for a DIFFERENT application that happens to name us".
-/// Every app in the same identity provider could then mint a token Argus
-/// accepts. A single-audience token needs no `azp` (the spec only requires it
-/// when `aud` is multi-valued), so the check is scoped to the case that needs it.
+/// Without it, `aud` alone can't distinguish "minted for us, also names
+/// others" from "minted for a DIFFERENT app that happens to name us" -- any
+/// app on the same IdP could mint a token Argus accepts. Single-audience
+/// tokens need no `azp` (spec only requires it when `aud` is multi-valued).
 fn authorized_party_ok(audiences: &[&str], azp: Option<&str>, client_id: &str) -> bool {
     if audiences.len() <= 1 {
         return true;
@@ -125,39 +111,27 @@ fn authorized_party_ok(audiences: &[&str], azp: Option<&str>, client_id: &str) -
     azp == Some(client_id)
 }
 
-/// The `auth.denied` audit `detail` for a role-admission rejection: `subject`
-/// is the non-principal fact design doc §9 requires this row to carry, and
-/// `method` (local-admin design §9) makes the login method explicit rather
-/// than inferred from its absence on the local-admin path.
-///
-/// Extracted to a pure function -- exactly like `authorized_party_ok` above,
-/// and for the same reason: driving `callback` to this point end-to-end
-/// needs a live (or fully mocked) IdP that exercises real ID-token
-/// verification, which this crate has no harness for. Without this
-/// extraction, "does `auth.denied` still carry `method: oidc`" has zero test
-/// coverage and a regression that dropped the field would leave every
-/// existing test green.
+/// `auth.denied` audit `detail` for a role-admission rejection: `subject` is
+/// the non-principal fact design §9 requires; `method` makes the auth method
+/// explicit rather than inferred from its absence on the local-admin path.
+/// Extracted so this shape is unit-testable without a live/mocked IdP.
 fn denied_detail(subject: &str) -> serde_json::Value {
     serde_json::json!({ "subject": subject, "method": "oidc" })
 }
 
-/// The `auth.login` audit `detail` for a successful callback. See
-/// `denied_detail` for why this is its own testable function rather than
-/// an inline literal only reachable through a full callback run.
+/// `auth.login` audit `detail` for a successful callback -- see
+/// `denied_detail` for why this is its own testable function.
 fn login_detail() -> serde_json::Value {
     serde_json::json!({ "method": "oidc" })
 }
 
-/// Reject anything that is not a same-site absolute path. A browser treats
-/// `//host` as protocol-relative and `\` as a separator, so both must go --
-/// and so must ASCII tab/newline: `Query<..>` percent-decodes `%09`/`%0A` to
-/// literal control bytes BEFORE this function ever sees them, `HeaderValue`
-/// happily carries a raw tab into the `Location` header, and the WHATWG URL
-/// parser strips all ASCII tab/newline before parsing a URL -- so
-/// `/<TAB>/evil.example` becomes `//evil.example` in the browser, which is
-/// protocol-relative. A prefix check alone cannot catch this (the tab isn't
-/// at the front), so this rejects on character class instead: only the
-/// printable, non-space ASCII range is allowed through.
+/// Rejects anything that isn't a same-site absolute path: `//host` reads as
+/// protocol-relative, `\` as a separator, and ASCII tab/newline as neither --
+/// `Query<..>` percent-decodes `%09`/`%0A` to literal control bytes before
+/// this ever runs, and the WHATWG URL parser then strips them, turning
+/// `/<TAB>/evil.example` into `//evil.example`. A prefix check alone can't
+/// catch a tab that isn't at the front, so this rejects by character class:
+/// only printable, non-space ASCII gets through.
 pub fn safe_next_path(raw: &str) -> String {
     let ok = raw.starts_with('/')
         && !raw.starts_with("//")
@@ -187,12 +161,10 @@ pub fn open_flow(cipher: &FieldCipher, sealed: &str) -> anyhow::Result<FlowState
     Ok(serde_json::from_slice(&plain)?)
 }
 
-/// Constant-time byte comparison for the CSRF `state` check. Hand-rolled
-/// rather than pulling in `subtle` for one XOR-fold: length is compared
-/// up front because CSRF token length is fixed and public (both sides are
-/// `CsrfToken::new_random`'s output), never secret -- only the *content*
-/// needs to resist a timing side channel, which the fold below does by
-/// touching every byte regardless of where a mismatch occurs.
+/// Constant-time comparison for the CSRF `state` check. Hand-rolled rather
+/// than pulling in `subtle` for one XOR-fold: length is compared up front
+/// because CSRF token length is fixed and public, never secret -- only the
+/// *content* needs to resist a timing side channel.
 fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
     if a.len() != b.len() {
         return false;
@@ -203,15 +175,12 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
         == 0
 }
 
-/// Cached provider metadata + client. Discovery is lazy: the first login
-/// pays for it, later ones read the cache. Held behind an `RwLock` rather
-/// than a `OnceCell` because -- unlike a `OnceCell` -- it needs an
-/// *invalidate* path: `callback` drops the cache and re-discovers once when
-/// ID-token verification fails on an unrecognized JWKS key ID, which is
-/// exactly what happens when the IdP rotates its signing keys (design doc
-/// §10). A FAILED discovery attempt never writes to the lock (the early `?`
-/// in `discover` returns before that point), so the cache stays empty and
-/// the next login retries instead of the outage being cached forever.
+/// Cached provider metadata + client. Lazy: the first login pays for
+/// discovery, later ones read the cache. `RwLock`, not `OnceCell`, because it
+/// needs an *invalidate* path: `callback` drops and re-discovers on an
+/// unrecognized JWKS key ID (an IdP key rotation, design §10). A failed
+/// discovery never writes to the lock, so the cache stays empty rather than
+/// caching the outage forever.
 pub struct OidcClient {
     client: RwLock<Option<Arc<OidcCoreClient>>>,
     http: openidconnect::reqwest::Client,
@@ -277,10 +246,8 @@ impl OidcClient {
         Ok(client)
     }
 
-    /// Drops the cached client so the next `client()` call re-discovers.
-    /// Called on an unrecognized JWKS key ID so a provider's key rotation
-    /// resolves itself without an Argus restart, instead of every login
-    /// failing ID-token verification forever.
+    /// Drops the cached client so the next `client()` call re-discovers (see
+    /// the struct doc's JWKS-rotation note).
     async fn invalidate(&self) {
         *self.client.write().await = None;
     }
@@ -289,10 +256,8 @@ impl OidcClient {
 #[cfg(test)]
 impl OidcClient {
     /// Test-only seam: seeds the cache with a hand-built client so
-    /// `login`/`callback` can be exercised without a live discovery
-    /// endpoint (design doc §11 requires `/auth/login` be covered by a
-    /// unit test). `#[cfg(test)]` keeps this out of the production API --
-    /// nothing outside this module's own tests can skip discovery.
+    /// `login`/`callback` are testable without a live discovery endpoint.
+    /// `#[cfg(test)]` keeps this out of the production API.
     fn seeded(cfg: Arc<OidcConfig>, client: OidcCoreClient) -> anyhow::Result<Self> {
         let this = Self::new(cfg)?;
         *this
@@ -303,13 +268,10 @@ impl OidcClient {
     }
 }
 
-/// `secure` is a plain `bool` rather than `&OidcConfig` so this builder works
-/// with no OIDC config in scope at all: the `Secure` decision is a
-/// `Config`-level fact (derived from `Config.public_url`, local-admin design
-/// §4), not an OIDC-specific one. The OIDC flow below is the only caller
-/// today, and it is only reached once `OidcConfig` is known to be present, but
-/// a local login (later task) sets a session cookie in exactly the state
-/// where no `OidcConfig` exists.
+/// `secure` is a plain `bool`, not `&OidcConfig`, matching `session_cookie`
+/// below: the `Secure` decision is a `Config`-level fact (from
+/// `Config.public_url`, local-admin design §4), not OIDC-specific --
+/// `auth::local::login` sets a session cookie where no `OidcConfig` exists.
 fn flow_cookie(secure: bool, sealed: String) -> Cookie<'static> {
     Cookie::build((argus_common::FLOW_COOKIE, sealed))
         .http_only(true)
@@ -320,10 +282,9 @@ fn flow_cookie(secure: bool, sealed: String) -> Cookie<'static> {
         .build()
 }
 
-/// `pub(crate)`: `auth::local::login` (`POST /auth/local`) builds the
-/// identical session cookie a local login mints, so both auth methods share
-/// exactly one cookie shape rather than a second implementation drifting out
-/// of sync with this one.
+/// `pub(crate)`: `auth::local::login` reuses this to mint the identical
+/// session cookie, so both auth methods share one cookie shape rather than
+/// a second implementation drifting out of sync.
 pub(crate) fn session_cookie(secure: bool, token: String) -> Cookie<'static> {
     Cookie::build((argus_common::SESSION_COOKIE, token))
         .http_only(true)
@@ -340,28 +301,16 @@ fn removed_cookie(name: &'static str) -> Cookie<'static> {
     Cookie::build((name, "")).path("/").build()
 }
 
-/// Callback failures render a small error page with a retry link rather than
-/// a JSON body: the browser navigated here directly (it's a redirect target,
-/// not an API call), and detail is logged server-side rather than returned
-/// (design doc §14). `message` is always a fixed string this module controls,
-/// never request input, so no escaping is needed.
-/// The markup for the auth failures that happen *outside* the SPA, kept in
-/// `templates/error.html` rather than inline in this file. `include_str!`
-/// embeds it at compile time, so there is no runtime file read and no risk of
-/// the binary and its templates drifting apart on a deploy.
-///
-/// One page with two placeholders does not justify a templating engine; the
-/// project's convention is to add a dependency when its slice needs it, and
-/// this one needs `str::replace`.
+/// Callback failures render a small error page with a retry link, not JSON:
+/// the browser navigated here directly, and detail is logged server-side
+/// (design §14). Markup lives in `templates/error.html`, embedded via
+/// `include_str!` (no runtime file read) -- one page, two placeholders,
+/// `str::replace` is enough.
 const ERROR_TEMPLATE: &str = include_str!("templates/error.html");
 
-/// Escape text before it goes into the template.
-///
-/// Every `message` passed today is a string literal in this file, so nothing
-/// is injectable right now. This exists so that stays true: the obvious future
-/// edit is to surface a provider's `error_description`, which is attacker-
-/// influenced, and a `str::replace` template has no escaping of its own to
-/// catch it. Cheaper to be correct now than to remember later.
+/// Nothing passed today is attacker-influenced (every `message` is a string
+/// literal here), but the obvious future edit is surfacing a provider's
+/// `error_description`, which is -- this exists now rather than later.
 fn escape_html(raw: &str) -> String {
     let mut out = String::with_capacity(raw.len());
     for c in raw.chars() {
@@ -377,10 +326,8 @@ fn escape_html(raw: &str) -> String {
     out
 }
 
-/// Render a standalone auth error page.
-/// The heading follows the status, because not every one of these is a failed
-/// sign-in: a 404 is "this server has no SSO configured", which is a statement
-/// about the deployment rather than about the attempt.
+/// Not every status here is a failed sign-in: a 404 means "no SSO
+/// configured", a statement about the deployment, not the attempt.
 fn error_heading(status: StatusCode) -> &'static str {
     match status {
         StatusCode::NOT_FOUND => "Not available",
@@ -389,9 +336,8 @@ fn error_heading(status: StatusCode) -> &'static str {
     }
 }
 
-/// Substitute into the template. Split from `error_page` so the rendering can
-/// be asserted on directly — a `Response` body is awkward to inspect from a
-/// sync test, and "did the escaping actually happen" is the part worth pinning.
+/// Split from `error_page` so rendering is asserted directly -- a `Response`
+/// body is awkward to inspect from a sync test.
 fn render_error_page(heading: &str, message: &str) -> String {
     ERROR_TEMPLATE
         .replace("{{heading}}", &escape_html(heading))
@@ -408,13 +354,10 @@ pub struct LoginQuery {
     next: Option<String>,
 }
 
-/// `GET /auth/login?next=` -- redirect to the provider's authorization
-/// endpoint, having sealed `state`/`nonce`/the PKCE verifier/`next` into the
-/// flow cookie.
-///
-/// Degrades to 404 rather than panicking when OIDC is not configured
-/// (local-admin design §4): SSO is simply one of possibly zero configured
-/// login methods, not something every deployment must have.
+/// `GET /auth/login?next=` -- redirects to the provider's authorization
+/// endpoint, sealing `state`/`nonce`/the PKCE verifier/`next` into the flow
+/// cookie. Degrades to 404 rather than panicking when OIDC isn't configured
+/// (local-admin design §4): SSO is one of possibly zero login methods.
 pub async fn login(
     State(state): State<AppState>,
     Query(q): Query<LoginQuery>,
@@ -485,16 +428,13 @@ pub struct CallbackQuery {
     error: Option<String>,
 }
 
-/// `GET /auth/callback` -- exchange the code, verify the ID token, resolve
-/// and check the role, mint a session, and redirect back into the app.
+/// `GET /auth/callback` -- exchanges the code, verifies the ID token,
+/// resolves and checks the role, mints a session, and redirects into the app.
 ///
 /// Fails closed throughout: any error in state validation, token exchange,
-/// ID-token verification, or role admission returns an error page instead of
-/// ever falling through to a session.
-///
-/// Degrades to 404 rather than panicking when OIDC is not configured
-/// (local-admin design §4) -- see `login`'s doc comment; the same guard
-/// applies here for the same reason.
+/// ID-token verification, or role admission returns an error page, never
+/// falls through to a session. Degrades to 404 when OIDC isn't configured --
+/// see `login`'s doc.
 pub async fn callback(
     State(state): State<AppState>,
     Query(q): Query<CallbackQuery>,
@@ -631,11 +571,9 @@ pub async fn callback(
         SignatureVerificationError::NoMatchingKey,
     )) = &verify_result
     {
-        // The JOSE header's `kid` matched none of our cached JWKS keys. This
-        // is exactly what happens right after a provider rotates its
-        // signing keys, so re-discover once and retry before giving up --
-        // design doc §10 requires key rotation to resolve itself without an
-        // Argus restart. Bounded to one retry: this must not become a loop.
+        // Matched no cached JWKS key -- exactly what happens right after a
+        // provider rotates signing keys, so re-discover once and retry
+        // (design §10). Bounded to one retry: must not become a loop.
         tracing::warn!("oidc callback: no matching JWKS key id; re-discovering once");
         oidc_client.invalidate().await;
         client = match oidc_client.client().await {
@@ -673,25 +611,11 @@ pub async fn callback(
                 .into_response();
         }
     };
-    // OIDC Core 3.1.3.7 steps 4-5, implemented HERE because `openidconnect`
-    // 4.0.1 deliberately does not: its azp verification sits commented out in
-    // `verification/mod.rs` behind a note deferring it "until a use case
-    // becomes apparent". This is that use case.
-    //
-    // We had to relax the audience check above (`set_other_audience_verifier_fn`)
-    // because real providers list additional audiences in the ID token --
-    // Zitadel names sibling applications from the same project, Auth0 names API
-    // identifiers, Keycloak names whatever its audience mappers add. Rejecting
-    // those outright would mean Argus only works against a provider whose
-    // tokens name exactly one audience, which is not "any spec-compliant
-    // provider".
-    //
-    // But relaxing it without this check would REMOVE the guarantee rather than
-    // relocate it: `aud` alone would no longer distinguish "a token minted for
-    // us that also names other parties" from "a token minted for a DIFFERENT
-    // application that happens to name us". `azp` is precisely the claim the
-    // spec provides for that, and it must be us. A single-audience token needs
-    // no azp, so the check is scoped to the multi-audience case.
+    // See `authorized_party_ok`'s doc for why this check exists. The audience
+    // check above is relaxed (`set_other_audience_verifier_fn`) because real
+    // providers list extra audiences -- Zitadel names sibling apps, Auth0 API
+    // identifiers, Keycloak whatever its mappers add -- and `authorized_party_ok`
+    // is what keeps that relaxation safe.
     {
         let auds: Vec<&str> = id_claims.audiences().iter().map(|a| a.as_str()).collect();
         let azp = id_claims.authorized_party().map(|p| p.as_str());
@@ -715,22 +639,15 @@ pub async fn callback(
 
     let subject = id_claims.subject().as_str().to_string();
 
-    // Userinfo enriches the claims (and, per provider, is sometimes the ONLY
-    // place roles live -- design doc §4.2) but is not required: not every
-    // provider exposes it, so a fetch failure here degrades to ID-token-only
-    // claims rather than failing the login. This IS the authenticated
-    // userinfo response -- fetched just now, with the access token this
-    // exchange just returned, never an earlier or untrusted value.
+    // Userinfo enriches claims (sometimes the ONLY place roles live, design
+    // §4.2) but is optional: a fetch failure degrades to ID-token-only claims
+    // rather than failing the login.
     //
-    // `Some(id_claims.subject().clone())` pins the expected subject: OIDC
-    // Core 5.3.2 makes checking userinfo's `sub` against the ID token's a
-    // MUST, and it's not decorative here -- userinfo claims are merged OVER
-    // the ID token's and feed role admission plus the audit identity, so a
-    // confused or compromised userinfo endpoint would otherwise grant roles
-    // under someone else's `sub`. A mismatch surfaces as
-    // `UserInfoError::ClaimsVerification` below and is handled the same as
-    // any other userinfo failure: log and continue with ID-token claims
-    // only, never with the mismatched claims.
+    // `Some(id_claims.subject().clone())` pins the expected subject (OIDC
+    // Core 5.3.2 MUST): merged OVER the ID token's claims and feeds role
+    // admission plus the audit identity, so a compromised userinfo endpoint
+    // can't grant roles under someone else's `sub` -- a mismatch degrades to
+    // ID-token-only claims rather than admitting.
     let userinfo: Option<MyUserInfoClaims> = match client.user_info(
         token.access_token().clone(),
         Some(id_claims.subject().clone()),
@@ -793,16 +710,10 @@ pub async fn callback(
             available_claims = ?claim_keys(&merged),
             "login denied: required role not held"
         );
-        // `result` is a fixed-vocabulary column (`ok|error|denied`, read as a
-        // status by ~10 other call sites across grpc.rs/http.rs/repo.rs), so
-        // the rejected subject -- a non-principal fact design doc §9
-        // requires this row to carry -- goes in `detail` via
-        // `audit_with_detail`, exactly like `grpc.rs` already does for
-        // enrollment denials (`result = "denied"`, the extra fact in
-        // `detail`). `method` rides alongside it (local-admin design §9) so
-        // every `auth.denied`/`auth.login` row states which auth method
-        // produced it explicitly, rather than it being inferred from the
-        // absence of a field on the local-admin path.
+        // `result` is a fixed-vocabulary column (`ok|error|denied`) read by
+        // many call sites, so the subject goes in `detail` instead --
+        // matching `grpc.rs`'s enrollment-denial pattern. `method` rides
+        // alongside it (design §9) so rows state which auth method produced them.
         if let Err(e) = repo::audit_with_detail(
             &state.pool,
             Actor::System,
@@ -845,12 +756,9 @@ pub async fn callback(
             .into_response();
     }
 
-    // Fail closed (CLAUDE.md: every verb goes through the audit log from the
-    // start): if the row can't be written, revoke the session we just
-    // created rather than let anyone sign in unaudited. `detail` carries
-    // `method` (local-admin design §9) so `auth.login` rows are explicit
-    // about which auth method produced them, matching `auth::local::login`'s
-    // own `auth.login` write.
+    // Fail closed (CLAUDE.md's audit rule): if this write fails, revoke the
+    // session just created rather than let anyone sign in unaudited --
+    // matches `auth::local::login`'s own write.
     if let Err(e) = repo::audit_with_detail(
         &state.pool,
         Actor::User(&identity),
@@ -879,11 +787,9 @@ pub async fn callback(
         crate::config::cookie_secure(&state.public_url),
         token_value,
     ));
-    // Re-run the guard here rather than trust the sealed cookie blindly: the
-    // cookie is AEAD-sealed and `login` is its only writer, so this is safe
-    // either way today, but it keeps `safe_next_path` from being a single
-    // point of failure for the property that produced this branch's only
-    // Critical finding (an open redirect).
+    // Re-run the guard rather than trust the sealed cookie blindly: it's
+    // AEAD-sealed and `login` is its only writer, so this is safe either way,
+    // but keeps `safe_next_path` from being a single point of failure.
     (jar, Redirect::to(&safe_next_path(&flow.next))).into_response()
 }
 
@@ -902,19 +808,13 @@ pub async fn logout(State(state): State<AppState>, jar: CookieJar) -> Response {
     let hash = session::hash_token(&token);
 
     // Resolve identity BEFORE deleting: this also tells us whether a real
-    // session existed for this cookie. Gating the audit write on that (below)
-    // means an unauthenticated caller sending an arbitrary/junk cookie value
-    // cannot spam one `auth.logout` row per request into the security record
-    // -- this route has no session and no rate limit in front of it, so
-    // nothing else stops that.
+    // session existed, gating the audit write below to stop an
+    // unauthenticated caller with a junk cookie from spamming `auth.logout`
+    // rows (no rate limit in front of this route).
     //
-    // `Err` and `Ok(None)` are NOT the same thing and must not be collapsed
-    // (CLAUDE.md: every verb goes through the audit log from the start): a
-    // transient lookup failure on a REAL session must not fall through to the
-    // "no session" path below, or the delete that follows can still revoke
-    // it with no `auth.logout` row written -- the audit trail would then show
-    // a session created and then simply vanishing. Fail closed here exactly
-    // as the `delete_session` call below already does.
+    // `Err` and `Ok(None)` must NOT be collapsed: a transient lookup failure
+    // on a REAL session must not fall through to "no session", or the delete
+    // that follows revokes it with no `auth.logout` row written.
     let identity = match repo::lookup_session(&state.pool, &hash).await {
         Ok(identity) => identity,
         Err(e) => {
@@ -952,32 +852,20 @@ pub async fn logout(State(state): State<AppState>, jar: CookieJar) -> Response {
 mod tests {
     use super::*;
 
-    /// The open-redirect guard. Without it, /auth/login?next=https://evil
-    /// bounces an authenticated operator off-site, and it looks like a working
-    /// login the entire way through.
-    /// Regression: found only by running against a real Zitadel, which names a
-    /// sibling application from the same project as a second audience. The
-    /// obvious fix — trusting extra audiences — would have removed the audience
-    /// guarantee entirely, because `openidconnect` 4.0.1 has its azp check
-    /// commented out. These cases pin the pairing.
     #[test]
     fn error_template_substitutes_both_placeholders() {
         let html = render_error_page("Not available", "Single sign-on is not configured.");
         assert!(html.contains("<h1>Not available</h1>"));
         assert!(html.contains("<p>Single sign-on is not configured.</p>"));
         assert!(html.contains("<title>Not available — Argus</title>"));
-        // A renamed or misspelled placeholder would otherwise ship a page with
-        // a literal `{{heading}}` on it and nothing would fail.
+        // A misspelled placeholder would ship a literal `{{heading}}` with nothing failing.
         assert!(
             !html.contains("{{"),
             "every placeholder must be substituted, found a leftover in:\n{html}"
         );
     }
 
-    /// `str::replace` templating has no escaping of its own. Every message
-    /// passed today is a literal in this file, so nothing is injectable now --
-    /// this is what keeps that true when someone surfaces a provider's
-    /// `error_description`, which is attacker-influenced.
+    /// Pins `escape_html`'s rationale with actual script/quote input.
     #[test]
     fn rendered_messages_are_html_escaped() {
         let html = render_error_page("Sign-in failed", "<script>alert('x')</script> & \"quoted\"");
@@ -993,8 +881,6 @@ mod tests {
 
     #[test]
     fn error_heading_follows_the_status() {
-        // A 404 here means "no SSO on this deployment", which is not a failed
-        // attempt -- it used to read "Sign-in failed" over text saying so.
         assert_eq!(error_heading(StatusCode::NOT_FOUND), "Not available");
         assert_eq!(
             error_heading(StatusCode::SERVICE_UNAVAILABLE),
@@ -1012,35 +898,26 @@ mod tests {
         // The real shape from Zitadel: us plus a sibling app, azp names us.
         assert!(authorized_party_ok(&[US, SIBLING], Some(US), US));
 
-        // The attack this check exists to stop: a token minted for a DIFFERENT
-        // application that merely happens to list us as an audience.
         assert!(
             !authorized_party_ok(&[US, SIBLING], Some(SIBLING), US),
             "a token authorized for another client must be rejected"
         );
 
-        // Multi-audience with no azp at all: the spec requires it here, so
-        // absence is a rejection, not a pass.
         assert!(
             !authorized_party_ok(&[US, SIBLING], None, US),
             "multi-audience tokens must carry azp"
         );
 
-        // Single audience needs no azp — the spec only requires it when `aud`
-        // is multi-valued, so demanding it would break ordinary providers.
+        // Single audience needs no azp -- demanding it would break ordinary providers.
         assert!(authorized_party_ok(&[US], None, US));
         assert!(authorized_party_ok(&[US], Some(US), US));
 
-        // Degenerate: no audiences at all. The library's own aud check rejects
-        // this before we run; assert our helper does not itself admit it.
+        // Degenerate: the library's own aud check rejects an empty audience
+        // list before we'd run; assert our helper doesn't itself admit it.
         assert!(authorized_party_ok(&[], None, US));
     }
 
-    /// Pins design §9's "`method` rides alongside [`subject`]" for the
-    /// role-denied path. Exercised directly (`callback` itself needs a live
-    /// or fully mocked IdP to reach this line -- see `denied_detail`'s doc
-    /// comment) so a regression that dropped the field is still caught,
-    /// rather than every other test staying green around it.
+    /// Pins design §9's "`method` rides alongside [`subject`]" for the role-denied path.
     #[test]
     fn denied_detail_names_the_method_and_carries_the_subject() {
         let v = denied_detail("some-subject");
@@ -1048,8 +925,7 @@ mod tests {
         assert_eq!(v["subject"], "some-subject");
     }
 
-    /// Same rationale as `denied_detail_names_the_method_and_carries_the_subject`,
-    /// for the success path's `auth.login` detail.
+    /// Same rationale, for the success path's `auth.login` detail.
     #[test]
     fn login_detail_names_the_method() {
         assert_eq!(login_detail()["method"], "oidc");
@@ -1074,22 +950,15 @@ mod tests {
         assert_eq!(safe_next_path("/\\evil.example"), "/");
     }
 
-    /// Regression coverage for the tab-bypass finding: a prefix check alone
-    /// (`starts_with("//")`) does not catch a control byte that isn't at the
-    /// front of the string but still gets treated as a separator by the
-    /// browser after the `Location` header round-trips through it.
+    /// Regression: a prefix check alone doesn't catch a control byte that
+    /// isn't at the front (see `safe_next_path`'s doc for the attack chain).
     #[test]
     fn next_path_rejects_control_bytes_that_url_parsers_treat_as_separators() {
-        // `?next=/%09/evil.example` -- `Query<..>` percent-decodes `%09` to a
-        // literal tab BEFORE this function ever sees it. `HeaderValue`
-        // permits a raw tab, and the WHATWG URL parser strips all ASCII
-        // tab/newline before parsing, turning `/<TAB>/evil.example` into
-        // `//evil.example` -- protocol-relative, then `https://evil.example`.
+        // `?next=/%09/evil.example` decodes to a literal tab.
         assert_eq!(safe_next_path("/\t/evil.example"), "/");
         // `?next=/%0A//evil` -- same story with a literal newline (%0A).
         assert_eq!(safe_next_path("/\n//evil.example"), "/");
-        // A backslash anywhere, not just immediately after the leading
-        // slash (the original check only rejected `starts_with("/\\")`).
+        // A backslash anywhere, not just after the leading slash, is rejected.
         assert_eq!(safe_next_path("/x\\y"), "/");
         // DEL and other non-printable/control bytes.
         assert_eq!(safe_next_path("/abc\u{7f}def"), "/");
@@ -1113,13 +982,10 @@ mod tests {
         assert_eq!(opened.csrf, "csrf-token");
         assert_eq!(opened.next, "/machines/x");
 
-        // Flip a byte in the MIDDLE of the sealed blob rather than appending
-        // one: appending changes the base64 length's mod-4 class, so a test
-        // built that way can pass on `DecodeError::InvalidLength` -- before
-        // the cipher ever runs -- purely by arithmetic accident (this
-        // fixture's `next` happened to make the appended-form length valid).
-        // A same-length mid-string flip is guaranteed to reach the GCM tag
-        // check, and asserting on the message pins down THAT is what failed.
+        // Flip a byte in the MIDDLE, not appended: appending changes the
+        // base64 length's mod-4 class, which can trip `DecodeError::InvalidLength`
+        // before the cipher ever runs, by arithmetic accident. A same-length
+        // mid-string flip is guaranteed to reach the GCM tag check instead.
         let mut bad: Vec<u8> = sealed.into_bytes();
         let mid = bad.len() / 2;
         bad[mid] = if bad[mid] == b'a' { b'b' } else { b'a' };
@@ -1153,11 +1019,9 @@ mod tests {
         }
     }
 
-    /// Design §11: "Cookie attribute construction for both `http` and
-    /// `https` public URLs" is a required unit test in its own right --
-    /// `SameSite=Lax` is the product's entire CSRF story for the verb
-    /// endpoints, so a change to it must not be able to slip through with a
-    /// green suite.
+    /// Design §11: required in its own right -- `SameSite=Lax` is the
+    /// product's entire CSRF story for the verb endpoints, so a change to it
+    /// must not slip through with a green suite.
     #[test]
     fn flow_and_session_cookies_carry_the_required_security_attributes() {
         for (public_url, want_secure) in [
@@ -1213,10 +1077,8 @@ mod tests {
     }
 
     /// Hand-builds `CoreProviderMetadata` (no network call) so `OidcClient`
-    /// can be seeded without a live discovery endpoint. Mirrors the pattern
-    /// in `openidconnect`'s own doc example for constructing provider
-    /// metadata (`src/lib.rs`'s "OpenID Connect Provider (Server) Interface"
-    /// section).
+    /// can be seeded without live discovery -- mirrors `openidconnect`'s own
+    /// doc example for constructing provider metadata.
     fn test_provider_metadata() -> openidconnect::core::CoreProviderMetadata {
         openidconnect::core::CoreProviderMetadata::new(
             IssuerUrl::new("https://idp.invalid".into()).expect("issuer url"),
@@ -1283,11 +1145,9 @@ mod tests {
         }
     }
 
-    /// The property the global boot-rule constraint rests on: with OIDC
-    /// absent, hitting the SSO entry points must not panic and must not
-    /// pretend to start a flow -- it must say plainly that SSO isn't
-    /// configured, so a local-admin-only deployment's sign-in view can tell
-    /// the two states apart.
+    /// The property the boot-rule constraint rests on: with OIDC absent, the
+    /// SSO entry points must not panic or pretend to start a flow -- must say
+    /// plainly SSO isn't configured, so the sign-in view can tell states apart.
     #[sqlx::test]
     async fn login_and_callback_degrade_to_404_when_oidc_is_not_configured(
         pool: sqlx::PgPool,
@@ -1317,14 +1177,11 @@ mod tests {
         Ok(())
     }
 
-    /// Design §11: "`/auth/login` returns 302 with `state`, `nonce` and a
-    /// PKCE challenge present, and sets a sealed flow cookie." (axum's
-    /// `Redirect::to` actually emits 303 See Other, not literally 302, but
-    /// this is the redirect design §11 is describing -- an authorization
-    /// redirect carrying the flow parameters.) Drives `login` directly
-    /// (no router/oneshot needed: the handler takes its extractors as plain
-    /// arguments) against an `OidcClient` seeded via the test-only seam, so
-    /// no live discovery endpoint is required.
+    /// Design §11 says "302"; axum's `Redirect::to` actually emits 303 See
+    /// Other -- this is the redirect §11 describes, an authorization
+    /// redirect carrying `state`/`nonce`/PKCE. Drives `login` directly
+    /// against an `OidcClient` seeded via the test-only seam, no live
+    /// discovery needed.
     #[sqlx::test]
     async fn login_redirects_with_state_nonce_pkce_and_sets_the_flow_cookie(
         pool: sqlx::PgPool,

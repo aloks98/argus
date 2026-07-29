@@ -1,15 +1,9 @@
-//! Local admin password generation and argon2id hashing.
-//!
 //! Passwords are always generated, never chosen (design §7): 24 random
-//! characters is arithmetically unguessable online, which is what demotes rate
-//! limiting to a backstop rather than the primary control.
+//! characters is unguessable online, demoting rate limiting to a backstop.
 //!
-//! `generate_password`/`hash_password` are wired in via
-//! `auth::local::reset_local_admin` (the CLI). `verify_password` and the
-//! dummy-hash helpers below are wired in via `auth::local::login` (`POST
-//! /auth/local`), which is what pays the argon2id cost on every path --
-//! including "no admin configured" -- so response timing never reveals
-//! whether a local admin exists.
+//! `verify_password`'s dummy-hash path (wired via `auth::local::login`) pays
+//! the argon2id cost even with "no admin configured", so response timing
+//! never reveals whether a local admin exists.
 use anyhow::{anyhow, Result};
 use argon2::{
     password_hash::{rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString},
@@ -51,11 +45,10 @@ pub fn verify_password(password: &str, phc: &str) -> bool {
     }
 }
 
-/// A real argon2id hash of a value nobody can present, used when no local admin
-/// row exists so the handler still pays the verification cost. Without this,
-/// "no local admin configured" returns in microseconds while a wrong password
-/// takes ~100ms, and that difference tells an attacker whether the credential
-/// exists at all.
+/// A real argon2id hash of a value nobody can present -- paid on the
+/// no-admin path so it costs the same ~100ms as a real verification;
+/// without it, "no local admin configured" returns in microseconds, telling
+/// an attacker the credential doesn't exist.
 pub const DUMMY_PHC: &str = "$argon2id$v=19$m=19456,t=2,p=1$9tkWNBxDNecw0mDcgXHBVA$9+5x76AgJroS3Mf4jCcOxF3tUuUhPjpIpon0meok1b4";
 
 pub fn verify_against_dummy(password: &str) {
@@ -72,15 +65,14 @@ mod tests {
         let b = generate_password();
         assert_ne!(a, b, "every generated password must be fresh");
         assert_eq!(a.chars().count(), PASSWORD_LEN);
-        // Every character must come from the declared alphabet -- a bug that
-        // silently narrowed it would otherwise pass unnoticed.
+        // Catches a bug that silently narrowed the alphabet.
         assert!(a.chars().all(|c| PASSWORD_ALPHABET.contains(c)));
     }
 
     #[test]
     fn hash_verifies_the_right_password_and_rejects_others() {
         let phc = hash_password("correct horse battery staple").expect("hash");
-        // A PHC string, not the password: a bug that stored the plaintext must fail here.
+        // Must be a PHC string, not the plaintext password.
         assert!(
             phc.starts_with("$argon2id$"),
             "expected argon2id PHC, got {phc}"
@@ -111,30 +103,19 @@ mod tests {
 
     #[test]
     fn the_dummy_hash_is_valid_and_matches_nothing_usable() {
-        // The no-admin-configured path verifies against this so that response
-        // timing cannot distinguish "no local admin exists" from "wrong
-        // password". If it were malformed, verification would return early and
-        // the timing signal would reappear.
+        // A malformed DUMMY_PHC would return early and reopen the timing signal.
         assert!(DUMMY_PHC.starts_with("$argon2id$"));
         assert!(!verify_password("", DUMMY_PHC));
         assert!(!verify_password("admin", DUMMY_PHC));
     }
 
-    /// What actually makes the no-admin path cost the same as a real
-    /// verification: the argon2 PARAMETERS (`m`/`t`/`p`) must match, not
-    /// merely "some argon2id string". `verify_password` only needs a
-    /// well-formed PHC to run -- it would happily "succeed" (return `false`,
-    /// same as today) against a hash with WEAKER parameters, at a fraction of
-    /// the cost, and every existing status/body/cookie assertion in
-    /// `http.rs` would stay green while the timing gap design §11 exists to
-    /// close quietly reopened. This pins the parameters segment of
-    /// `DUMMY_PHC` to always match a freshly generated hash's, so a future
-    /// argon2 version/parameter bump that updates one and not the other
-    /// fails loudly here instead of only in production timing.
+    /// Pins `DUMMY_PHC`'s argon2 PARAMETERS (`m`/`t`/`p`) to a freshly
+    /// generated hash's -- `verify_password` would happily return `false`
+    /// against a weaker, cheaper dummy with every other test still green,
+    /// silently reopening the timing side-channel.
     #[test]
     fn the_dummy_hash_shares_argon2_parameters_with_a_freshly_generated_hash() {
-        // PHC layout: "$argon2id$v=19$m=..,t=..,p=..$salt$hash" -- the
-        // parameters are the 4th '$'-delimited field (index 3).
+        // PHC layout: "$argon2id$v=19$m=..,t=..,p=..$salt$hash" -- parameters are field index 3.
         fn params(phc: &str) -> Option<&str> {
             phc.split('$').nth(3)
         }

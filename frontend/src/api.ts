@@ -1,16 +1,13 @@
-// Thin fetch wrapper around the control plane's read-only fleet endpoint
-// (crates/server, Task 9). Kept dependency-free — no client library needed
-// for a single GET.
+// Thin fetch wrapper around the control plane's HTTP API (crates/server).
+// Dependency-free by design — no client library for a handful of endpoints.
 import type { LogLine } from "./lib/logs";
 import { Unauthenticated } from "./lib/session";
 
 /**
- * Every helper below funnels its response through this before touching the
- * body. A 401 means the session died mid-visit, not a fetch bug -- mapping it
- * to the same `Unauthenticated` type `/api/me` throws lets the `QueryCache`
- * handler in `main.tsx` react to it uniformly (flip to the sign-in gate)
- * instead of each poller rendering its own "request failed: 401" banner
- * forever on a dead session.
+ * A 401 here means the session died mid-visit, not a fetch bug — mapping it
+ * to the same `Unauthenticated` type `/api/me` throws lets main.tsx's
+ * QueryCache handler react uniformly instead of every poller rendering its
+ * own dead-session error.
  */
 function unauthenticatedOr(r: Response): Response {
   if (r.status === 401) throw new Unauthenticated();
@@ -18,10 +15,9 @@ function unauthenticatedOr(r: Response): Response {
 }
 
 /**
- * Thrown by `localLogin` when the server's global limiter (design §10) is
- * throttling attempts. Distinct from the generic sign-in failure: telling the
- * operator "you're being rate-limited" reveals nothing about whether the
- * account exists, so it is safe to surface on its own.
+ * Thrown when the server's global limiter (design §10) throttles login
+ * attempts — kept distinct from a generic failure because "you're
+ * rate-limited" is safe to show without revealing whether the account exists.
  */
 export class RateLimited extends Error {
   retryAfterSeconds: number;
@@ -33,19 +29,13 @@ export class RateLimited extends Error {
 }
 
 /**
- * `POST /auth/local` -- the break-glass login (design §8). Public: this is a
- * plain fetch, not routed through `unauthenticatedOr`, because a 401 HERE
- * means "wrong username or password", not "session died mid-visit" -- mapping
- * it to `Unauthenticated` would be wrong on both counts (there is no session
- * yet, and the global `MutationCache` handler in `main.tsx` treats that type
- * as a signal to flip the gate).
+ * `POST /auth/local` — break-glass login (design §8). Bypasses
+ * `unauthenticatedOr` on purpose: a 401 HERE means wrong credentials, not a
+ * dead session, and must not resolve to `Unauthenticated`.
  *
- * Resolves on success (the server already set the session cookie via
- * `Set-Cookie`; the caller just needs to invalidate `["me"]`). On any
- * failure other than rate-limiting, throws a plain `Error` with a
- * deliberately generic message -- the server makes wrong-username,
- * wrong-password, and no-admin-configured indistinguishable (design §11),
- * and surfacing anything more specific here would undo that.
+ * Resolves on success (cookie set via `Set-Cookie`). Other failures throw a
+ * deliberately generic `Error` — the server makes wrong-user/wrong-password/
+ * no-admin-configured indistinguishable (design §11).
  */
 export async function localLogin(username: string, password: string): Promise<void> {
   const r = await fetch("/auth/local", {
@@ -63,13 +53,12 @@ export async function localLogin(username: string, password: string): Promise<vo
 }
 
 /**
- * `POST /api/local-admin/rotate` -- authenticated in-app rotation (design
- * §5.2). Behind `require_auth` like every other `/api/*` verb, so a 401 here
- * really does mean the session died mid-visit -- `unauthenticatedOr` is the
- * right call, unlike in `localLogin` above.
+ * `POST /api/local-admin/rotate` — authenticated rotation (design §5.2).
+ * Behind `require_auth` like other `/api/*` verbs, so `unauthenticatedOr` is
+ * correct here (unlike `localLogin`, where a 401 means bad credentials).
  *
- * Returns the new password for one-time display. The caller is responsible
- * for never persisting it anywhere but a transient UI state.
+ * Returns the new password for one-time display; never persist it beyond
+ * transient UI state.
  */
 export async function rotateLocalAdmin(): Promise<string> {
   const r = unauthenticatedOr(await fetch("/api/local-admin/rotate", { method: "POST" }));
@@ -128,10 +117,9 @@ export type MachineDetail = {
   virt: string | null;
 };
 
-// Capability strings the agent may report in `MachineDetail.capabilities`.
-// Mirrors argus_common::{CAP_SYSTEMD, CAP_DOCKER, CAP_JOURNAL} — named here
-// (rather than spelled as literals at each gating call site) so drift between
-// the Rust and TS sides has exactly one place to fix.
+// Capability strings the agent may report (`MachineDetail.capabilities`),
+// mirroring argus_common::{CAP_SYSTEMD, CAP_DOCKER, CAP_JOURNAL} — named
+// here so Rust/TS drift has exactly one place to fix.
 export const CAP_SYSTEMD = "systemd";
 export const CAP_DOCKER = "docker";
 export const CAP_JOURNAL = "journal";
@@ -156,10 +144,7 @@ export async function getMachine(id: string): Promise<MachineDetail> {
   return r.json();
 }
 
-export async function getMetrics(
-  id: string,
-  range: "1h" | "6h" | "24h",
-): Promise<MetricPoint[]> {
+export async function getMetrics(id: string, range: "1h" | "6h" | "24h"): Promise<MetricPoint[]> {
   const r = unauthenticatedOr(await fetch(`/api/machines/${id}/metrics?range=${range}`));
   if (!r.ok) throw new Error(`metrics ${r.status}`);
   return r.json();
@@ -192,17 +177,10 @@ export type VerbResult = {
 /**
  * POST a verb and resolve only if it actually succeeded.
  *
- * The failure of a verb that *reached* the agent lives in the body, not the
- * status line: the control plane answers HTTP 200 with `ok:false` (e.g.
- * `"systemd job result: failed"` for a unit whose ExecStart died). Checking
- * only `r.ok` would render that identically to a success — which would throw
- * away the whole reason the agent waits for the real job outcome instead of
- * reporting that systemd merely accepted the request.
- *
- * So: reject on `ok:false` (the message is the agent's own), and leave
- * `ok:null` — the 202 "pending" case, where the agent hasn't answered within
- * the control plane's wait — resolved, so callers can render it as the
- * distinct *unknown* it is rather than as either outcome.
+ * A verb that *reached* the agent can still fail with HTTP 200 + `ok:false`
+ * (the message is the agent's own) — checking only `r.ok` would hide that.
+ * `ok:null` (202, still pending) resolves rather than rejects, so callers can
+ * render the distinct *unknown* instead of either outcome.
  */
 async function postVerb(url: string): Promise<VerbResult> {
   const r = unauthenticatedOr(await fetch(url, { method: "POST" }));
@@ -220,9 +198,7 @@ export async function containerAction(
   container: string,
   action: ContainerAction,
 ): Promise<VerbResult> {
-  return postVerb(
-    `/api/machines/${id}/docker/${encodeURIComponent(container)}/${action}`,
-  );
+  return postVerb(`/api/machines/${id}/docker/${encodeURIComponent(container)}/${action}`);
 }
 
 export type Unit = {
@@ -246,9 +222,7 @@ export async function unitAction(
   unit: string,
   action: UnitAction,
 ): Promise<VerbResult> {
-  return postVerb(
-    `/api/machines/${id}/units/${encodeURIComponent(unit)}/${action}`,
-  );
+  return postVerb(`/api/machines/${id}/units/${encodeURIComponent(unit)}/${action}`);
 }
 
 /** A log source: `journal:<unit>` or `docker:<container>`. */
@@ -273,22 +247,16 @@ export const SYSTEM_JOURNAL = "journal:@system";
  * or invalid — the same forgiving guard `?tab=typo` gets, so a bad link renders
  * the default view instead of nothing.
  */
-export function filtersFromParams(
-  params: URLSearchParams,
-  fallback: LogFilters,
-): LogFilters {
+export function filtersFromParams(params: URLSearchParams, fallback: LogFilters): LogFilters {
   const rawPStr = params.get("priority");
   const rawP = rawPStr === null ? NaN : Number(rawPStr);
   const priority = Number.isInteger(rawP) && rawP >= 0 && rawP <= 7 ? rawP : fallback.priority;
   const rawW = params.get("window");
   const window: LogWindow =
-    rawW === "boot" || rawW === "1h" || rawW === "24h" || rawW === "all"
-      ? rawW
-      : fallback.window;
+    rawW === "boot" || rawW === "1h" || rawW === "24h" || rawW === "all" ? rawW : fallback.window;
   return { priority, window };
 }
 
-/** Shared query params for both log endpoints. */
 function filterParams(f: LogFilters): Record<string, string> {
   const p: Record<string, string> = { window: f.window };
   if (f.priority > 0) p.priority = String(f.priority);
@@ -315,7 +283,6 @@ export function logStreamUrl(
   return `/api/machines/${id}/logs/stream?${params.toString()}`;
 }
 
-/** WebSocket URL for an interactive terminal to a machine. */
 export function terminalWsUrl(id: string): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${window.location.host}/api/machines/${id}/terminal`;

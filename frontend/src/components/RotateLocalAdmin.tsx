@@ -1,12 +1,10 @@
 // Authenticated in-app rotation for the local-admin break-glass credential
-// (design doc §5.2). Available while signed in by EITHER method -- there is
-// exactly one operator in this deployment shape, so this is not gated on the
-// current session having come from `local:admin` specifically.
+// (design doc §5.2). Available while signed in by EITHER method — there is
+// exactly one operator in this deployment shape, so it's not gated on the
+// session having come from `local:admin` specifically.
 //
-// Lives beside the sign-out control in AppShell's sidebar footer; the parent
-// owns the error banner (rail width can't show inline text -- see AppShell's
-// `accountError`), so failures are reported up via `onError` rather than
-// rendered here.
+// The parent (AppShell) owns the error banner — rail width can't show
+// inline text — so failures report up via `onError` rather than render here.
 import { useMutation } from "@tanstack/react-query";
 import {
   Alert,
@@ -65,8 +63,7 @@ export default function RotateLocalAdmin({
           <DialogHeader>
             <DialogTitle>New local admin password</DialogTitle>
             <DialogDescription>
-              Shown once, right now. Argus does not display or store it anywhere
-              else.
+              Shown once, right now. Argus does not display or store it anywhere else.
             </DialogDescription>
           </DialogHeader>
 
@@ -80,8 +77,7 @@ export default function RotateLocalAdmin({
           <Alert variant="warning">
             <AlertTitle>This will not be shown again</AlertTitle>
             <AlertDescription>
-              Copy it into a password manager now -- closing this dialog discards
-              it for good.
+              Copy it into a password manager now -- closing this dialog discards it for good.
             </AlertDescription>
           </Alert>
         </DialogContent>

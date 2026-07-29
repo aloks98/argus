@@ -1,58 +1,23 @@
-//! Host metrics sampler (Metrics slice, task 5): reads CPU/mem/swap/load/disk/
-//! net/uptime via `sysinfo` and fills a proto `MetricsSample`. Sending it over
-//! the Session (multiplexed as an `AgentFrame::metrics` payload) is task 6's
-//! job -- this module only produces the sample.
+//! Host metrics sampler: reads CPU/mem/swap/load/disk/net/uptime via
+//! `sysinfo` into a proto `MetricsSample`; sending happens elsewhere.
 //!
-//! ## Spike: confirmed `sysinfo` 0.39 API
+//! `refresh_cpu_usage` reports a *delta* since the last call (min
+//! `MINIMUM_CPU_UPDATE_INTERVAL`, ~200ms); `Sampler::new` takes a throwaway
+//! reading so the first real `sample()` has one to diff against.
+//! `load_average()`/`uptime()` read fresh OS state regardless of refresh
+//! state. Network counters are cumulative; deltas are computed
+//! control-plane side (see the proto's `net_rx_bytes` comment).
 //!
-//! Read from the vendored source (`cargo fetch`'d into
-//! `~/.cargo/registry/src/index.crates.io-*/sysinfo-0.39.5/src/common/{system,disk,network}.rs`)
-//! since the `sysinfo` surface has shifted across versions:
-//!
-//! - `System::new() -> Self` is an instance constructor equivalent to
-//!   `new_with_specifics(RefreshKind::nothing())` -- nothing is populated until
-//!   you refresh. `System::new_all()` refreshes everything up front.
-//! - `System::refresh_cpu_usage(&mut self)` / `refresh_memory(&mut self)` are
-//!   instance methods. CPU usage is a *delta* between two `refresh_cpu_usage`
-//!   calls at least `MINIMUM_CPU_UPDATE_INTERVAL` (~200ms) apart; the very
-//!   first call after construction has no prior reading to diff against and is
-//!   unreliable -- hence `Sampler::new` takes one throwaway reading so the
-//!   *next* `sample()` call gets a real delta.
-//! - `System::global_cpu_usage(&self) -> f32`.
-//! - `System::used_memory` / `total_memory` / `used_swap` /
-//!   `total_swap(&self) -> u64` (bytes).
-//! - `System::load_average() -> LoadAvg` and `System::uptime() -> u64` are
-//!   **associated functions** (no `&self` -- they read fresh OS state, e.g.
-//!   `/proc`, on every call, independent of any `System` instance's refresh
-//!   state). `LoadAvg { one, five, fifteen }`, all `f64`.
-//! - `Networks::new_with_refreshed_list() -> Self`; `Networks::refresh(&mut
-//!   self, remove_not_listed_interfaces: bool)` updates an existing instance in
-//!   place (so we don't re-enumerate interfaces every tick). `Networks` derefs
-//!   to `HashMap<String, NetworkData>`, so `.values()` iterates interfaces.
-//!   `NetworkData::total_received` / `total_transmitted(&self) -> u64` are
-//!   cumulative counters -- deltas are computed control-plane-side per the
-//!   proto's comment on `net_rx_bytes`/`net_tx_bytes`.
-//! - `Disks::new_with_refreshed_list() -> Self`; `Disks::refresh(&mut self,
-//!   remove_not_listed_disks: bool)`; `Disks` derefs to `[Disk]`, so `.iter()`
-//!   walks the list. `Disk::total_space` / `available_space(&self) -> u64`.
-//! - Default features (`system`, `disk`, `network`, `component`, `user`)
-//!   already cover everything above -- no `features = [...]` override needed
-//!   in `Cargo.toml`.
-//!
-//! Note: the proto `MetricsSample` has **no `agent_version` field** -- that
-//! lives on `AgentInfo`, sent once in the `Hello` frame at connect time (see
-//! `info.rs::gather` and `session.rs`). So `sample()` takes no such parameter;
-//! threading one through here would just be dead weight with nowhere to land
-//! in the proto.
-//!
+//! `agent_version` lives on `AgentInfo` (sent once in `Hello`), not on
+//! `MetricsSample` -- `sample()` takes no such parameter.
+
 use argus_proto::v1::MetricsSample;
 use std::time::{SystemTime, UNIX_EPOCH};
 use sysinfo::{Disks, Networks, System};
 
-/// Long-lived host sampler. Keeps `System`/`Networks`/`Disks` around across
-/// calls so repeated samples reuse refresh state -- most importantly, so
-/// CPU-usage deltas are accurate -- instead of re-enumerating hardware every
-/// tick.
+/// Long-lived host sampler: keeps `System`/`Networks`/`Disks` across calls
+/// so repeated samples reuse refresh state, most importantly for accurate
+/// CPU-usage deltas.
 pub struct Sampler {
     sys: System,
     nets: Networks,
@@ -60,9 +25,9 @@ pub struct Sampler {
 }
 
 impl Sampler {
-    /// Construct the sampler and take an initial CPU/memory reading so the
-    /// *next* `sample()` call's CPU-usage delta is meaningful (see the module
-    /// doc comment on why the first `refresh_cpu_usage` call is unreliable).
+    /// Takes an initial CPU/memory reading so the *next* `sample()`'s delta
+    /// is meaningful (module doc: why the first `refresh_cpu_usage` is
+    /// unreliable).
     pub fn new() -> Sampler {
         let mut sys = System::new();
         sys.refresh_cpu_usage();
@@ -72,7 +37,6 @@ impl Sampler {
         Sampler { sys, nets, disks }
     }
 
-    /// Refresh all sources and fill a `MetricsSample` snapshot.
     pub fn sample(&mut self) -> MetricsSample {
         self.sys.refresh_cpu_usage();
         self.sys.refresh_memory();
@@ -122,10 +86,9 @@ impl Default for Sampler {
     }
 }
 
-/// Current wall-clock time in milliseconds since the Unix epoch. Saturates
-/// rather than panicking in the pathological case of a clock set before 1970
-/// (`duration_since` failing) -- this is telemetry, not a place to crash the
-/// agent.
+/// Wall-clock ms since epoch. Saturates rather than panicking if the clock
+/// is set before 1970 (`duration_since` failing) -- telemetry is not worth
+/// crashing the agent over.
 fn unix_ms_now() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)

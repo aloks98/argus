@@ -1,6 +1,5 @@
 // Docker container list + start/stop/restart verbs for a single machine.
-// Extracted out of MachineDetailPage so the Containers tab owns its own file;
-// keeps the mutation wiring (Task 3's useContainerAction) local to itself.
+// Owns its own mutation wiring (`useContainerAction`).
 import { Link } from "react-router-dom";
 import {
   Alert,
@@ -73,9 +72,8 @@ export default function ContainersCard({
         <Alert variant="warning" className="mb-4">
           <AlertTitle>Outcome unconfirmed</AlertTitle>
           <AlertDescription>
-            The command was dispatched, but the agent did not report a result in
-            time. The container may still be starting or stopping — this table
-            refreshes as new state arrives.
+            The command was dispatched, but the agent did not report a result in time. The container
+            may still be starting or stopping — this table refreshes as new state arrives.
           </AlertDescription>
         </Alert>
       )}
@@ -88,8 +86,7 @@ export default function ContainersCard({
               : `Container ${VERB_DONE[action.variables.action]}`}
           </AlertTitle>
           <AlertDescription>
-            The daemon reported the action completed. The row below updates on
-            the next snapshot.
+            The daemon reported the action completed. The row below updates on the next snapshot.
           </AlertDescription>
         </Alert>
       )}
@@ -120,12 +117,14 @@ export default function ContainersCard({
             <TableBody>
               {containers.map((c) => {
                 const running = c.state === "running";
-                const rowBusy =
-                  action.isPending && action.variables?.container === c.id;
+                const rowBusy = action.isPending && action.variables?.container === c.id;
                 return (
                   <TableRow key={c.id}>
                     <TableCell className="font-medium" title={c.name}>
-                      <AssetTag tone={containerTone(c.state)} className="max-w-[16ch] md:max-w-[30ch]">
+                      <AssetTag
+                        tone={containerTone(c.state)}
+                        className="max-w-[16ch] md:max-w-[30ch]"
+                      >
                         <span className="min-w-0 truncate">{c.name}</span>
                       </AssetTag>
                     </TableCell>
@@ -144,10 +143,9 @@ export default function ContainersCard({
                       {c.status}
                     </TableCell>
                     <TableCell className="whitespace-nowrap text-right">
-                      {/* One loading state for the row rather than a "…" on
-                          every button, and otherwise all three verbs with the
-                          inapplicable ones disabled — kept identical to
-                          UnitsCard so the two tabs behave the same way. */}
+                      {/* One loading state per row rather than a spinner per button; the
+                          three verbs render with inapplicable ones disabled — kept
+                          identical to UnitsCard so both tabs behave the same way. */}
                       {rowBusy ? (
                         <span
                           role="status"
@@ -165,7 +163,11 @@ export default function ContainersCard({
                           <Button
                             size="sm"
                             variant="outline"
-                            render={<Link to={`?tab=containers&logs=${encodeURIComponent(`docker:${c.id}`)}`} />}
+                            render={
+                              <Link
+                                to={`?tab=containers&logs=${encodeURIComponent(`docker:${c.id}`)}`}
+                              />
+                            }
                             nativeButton={false}
                           >
                             Logs
@@ -175,9 +177,7 @@ export default function ContainersCard({
                             variant="outline"
                             disabled={running}
                             title={running ? "Already running" : undefined}
-                            onClick={() =>
-                              action.mutate({ container: c.id, action: "start" })
-                            }
+                            onClick={() => action.mutate({ container: c.id, action: "start" })}
                           >
                             Start
                           </Button>
@@ -186,18 +186,14 @@ export default function ContainersCard({
                             variant="outline"
                             disabled={!running}
                             title={!running ? "Not running" : undefined}
-                            onClick={() =>
-                              action.mutate({ container: c.id, action: "stop" })
-                            }
+                            onClick={() => action.mutate({ container: c.id, action: "stop" })}
                           >
                             Stop
                           </Button>
                           <Button
                             size="sm"
                             variant="outline"
-                            onClick={() =>
-                              action.mutate({ container: c.id, action: "restart" })
-                            }
+                            onClick={() => action.mutate({ container: c.id, action: "restart" })}
                           >
                             Restart
                           </Button>

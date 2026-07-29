@@ -1,11 +1,6 @@
-//! Systemd collection + unit verb execution (systemd slice). Talks to the local
-//! D-Bus **system bus** via zbus — no network, no TLS, so the musl-static build
-//! stays clean. Mapping and policy are factored into pure functions so they are
-//! unit-testable without a running bus (mirrors `docker.rs`).
-//!
-//! Wired into `session.rs`: a fresh `SystemdClient` is dialed per session
-//! attempt and its `list_units`/`run_verb` drive the `SystemdState` snapshot
-//! and unit-verb routing.
+//! Systemd collection + unit verb execution via zbus, talking only to the
+//! local D-Bus **system bus** -- no network, no TLS, keeping the musl-static
+//! build clean.
 
 use argus_proto::v1::{CommandResult, Unit as ProtoUnit, Verb};
 use futures_util::StreamExt;
@@ -13,12 +8,11 @@ use std::time::Duration;
 use zbus::proxy;
 use zvariant::OwnedObjectPath;
 
-/// One row of `ListUnitsByPatterns` — systemd's `(ssssssouso)` unit struct.
+/// One row of `ListUnitsByPatterns` -- systemd's `(ssssssouso)` unit struct.
 /// `zvariant`'s positional-tuple decoding requires every field the wire type
-/// carries; `record_to_unit` only consumes 5 of the 10. The rest are real
-/// dead code (never read), not a false positive -- allowed here, scoped to
-/// the struct rather than the module, because dropping them would break
-/// deserialization of the D-Bus reply.
+/// carries, even though `record_to_unit` only consumes 5 of 10 -- the rest
+/// are real dead code, `#[allow]`'d here because dropping them breaks
+/// deserialization.
 #[derive(Debug, Clone, serde::Deserialize, zvariant::Type)]
 #[allow(dead_code)]
 pub struct UnitRecord {
@@ -52,11 +46,10 @@ pub trait Manager {
     fn stop_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
     fn restart_unit(&self, name: &str, mode: &str) -> zbus::Result<OwnedObjectPath>;
 
-    // The explicit `name` is load-bearing: zbus derives `GetUnitByPid` from the
-    // snake_case fn, but systemd's method is `GetUnitByPID`. Without this the
-    // call fails with `UnknownMethod` on every host, self-unit discovery
-    // silently falls back to the compiled-in name, and the self-preservation
-    // guard quietly stops being the runtime check it is meant to be.
+    // The explicit `name` is load-bearing: zbus would derive `GetUnitByPid`
+    // from the snake_case fn, but systemd's method is `GetUnitByPID`.
+    // Without it every call fails `UnknownMethod`, silently falling back to
+    // the compiled-in self-unit name.
     #[zbus(name = "GetUnitByPID")]
     fn get_unit_by_pid(&self, pid: u32) -> zbus::Result<OwnedObjectPath>;
 
@@ -95,7 +88,7 @@ const UNIT_SUFFIXES: &[&str] = &[
     ".scope",
 ];
 
-/// Map a systemd `ListUnitsByPatterns` row onto the proto's five fields. Pure.
+/// Maps a systemd `ListUnitsByPatterns` row onto the proto's five fields.
 fn record_to_unit(r: UnitRecord) -> ProtoUnit {
     ProtoUnit {
         name: r.name,
@@ -167,18 +160,17 @@ fn result(command_id: String, ok: bool, message: &str) -> CommandResult {
 /// heartbeat/metrics sender. Matches `docker.rs`'s OP_TIMEOUT.
 const OP_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Verb jobs get far longer than a listing round-trip: this bounds a systemd
-/// *job*, not a bus call, and systemd's own DefaultTimeoutStartSec is 90s. The
-/// control plane's own bounded wait (10s) independently returns "pending" to the
-/// browser, and the late CommandResult still resolves the audit row — so waiting
-/// here costs the user nothing and avoids reporting real successes as failures.
+/// Bounds a systemd *job*, not a bus call -- DefaultTimeoutStartSec is 90s.
+/// The control plane's own 10s wait independently returns "pending" to the
+/// browser, and the late CommandResult still resolves the audit row, so
+/// waiting this long costs nothing and avoids reporting real successes as
+/// failures.
 const JOB_TIMEOUT: Duration = Duration::from_secs(90);
 
-/// Fallback name for the agent's own unit, used only when `GetUnitByPID` fails
-/// (i.e. the agent isn't running under systemd, where the guard is moot anyway).
-/// Nothing in this repo pins the deployed unit name — the provisioning template
-/// owns it (PRD §5.1) — which is exactly why the real value is discovered at
-/// runtime rather than hard-coded here.
+/// Fallback for the agent's own unit name, used only when `GetUnitByPID`
+/// fails (i.e. not running under systemd, where the guard is moot anyway).
+/// Nothing in this repo pins the deployed unit name -- the provisioning
+/// template owns it (PRD §5.1) -- hence discovering it at runtime.
 const FALLBACK_SELF_UNIT: &str = "argus-agent.service";
 
 /// A cheaply-cloneable handle to the local systemd. `inner` is `None` on hosts
@@ -190,29 +182,22 @@ pub struct SystemdClient {
     /// The unit hosting this agent, discovered at connect. Verbs against it are
     /// refused: stopping it severs the session the result would return on.
     self_unit: Option<String>,
-    /// Whether `Manager.Subscribe()` succeeded at connect. When false, systemd
-    /// emits no job signals and every verb will burn `JOB_TIMEOUT` reporting
-    /// "unconfirmed" — surfaced in that message so it's self-explaining rather
-    /// than relying on the one startup warn.
+    /// Whether `Manager.Subscribe()` succeeded at connect. When false, no
+    /// job signals arrive and every verb burns `JOB_TIMEOUT` reporting
+    /// "unconfirmed" (surfaced in the message, not just a startup warn).
     subscribed: bool,
 }
 
 impl SystemdClient {
     /// Whether a system-bus connection was established for this session.
-    ///
-    /// Consumed by `capabilities::probe()`, called once per session from
-    /// `session::connect_and_serve` immediately before `Hello`.
     pub fn is_available(&self) -> bool {
         self.inner.is_some()
     }
 
-    /// Best-effort connect to the system bus. Never fails.
-    ///
-    /// Every bus round-trip here is bounded by `OP_TIMEOUT`. This is called
-    /// once per session attempt from the reconnect loop (see `session::run`
-    /// for why: a `zbus::Connection` does not self-heal, so each attempt
-    /// re-dials). Worst case — bus connect + `Subscribe` + self-unit
-    /// discovery, each timing out — this costs roughly 15s before that
+    /// Best-effort connect to the system bus; never fails. Every round-trip
+    /// is bounded by `OP_TIMEOUT`; re-dialed fresh each session attempt
+    /// since `zbus::Connection` doesn't self-heal (see `session::run`).
+    /// Worst case (all three steps timing out) costs ~15s before the
     /// attempt proceeds.
     pub async fn connect() -> SystemdClient {
         let conn = match tokio::time::timeout(OP_TIMEOUT, zbus::Connection::system()).await {
@@ -275,24 +260,18 @@ impl SystemdClient {
         }
     }
 
-    /// Loaded `*.service` units plus any failed unit of any type, deduplicated.
+    /// Loaded `*.service` units plus any failed unit, deduplicated.
     ///
-    /// Returns `Some(units)` when collection succeeded — `Some(vec![])` is a
-    /// legitimate "this host really has no matching units" — and `None` when
-    /// it could not be collected at all: no bus, a query error, or a timeout.
-    /// Callers must treat `None` as "unknown, do not overwrite the control
-    /// plane's cache": reporting an empty list on a collection failure would
-    /// render as "nothing is wrong on this host", the one wrong answer this
-    /// slice must never give. A partial list that dropped the failed query
-    /// would give the same wrong answer, which is why any error here discards
-    /// the whole attempt rather than returning what was gathered so far.
+    /// `Some(vec![])` = "really no matching units"; `None` = collection
+    /// failed entirely (no bus, query error, timeout) and must NOT overwrite
+    /// the control plane's cache -- reporting empty here would render as
+    /// "nothing is wrong on this host", which this slice must never claim.
+    /// A partial list on error would give the same wrong answer, so any
+    /// error discards the whole attempt.
     ///
-    /// Residual limitation: this only protects a bus that dies *mid-session*,
-    /// where the control plane still has a prior snapshot to keep. If the bus
-    /// is already dead when the agent starts, there is no prior snapshot, so
-    /// that host still shows an empty unit list. Closing that gap would need
-    /// a proto change (e.g. an explicit "unknown" state), and the proto is
-    /// frozen for this slice.
+    /// Only protects a bus dying *mid-session*: if it's already dead at
+    /// startup there's no prior snapshot to keep, so that host still shows
+    /// empty. Fixing that needs a proto "unknown" state; out of scope here.
     pub async fn list_units(&self) -> Option<Vec<ProtoUnit>> {
         let Some(conn) = &self.inner else {
             return None;
@@ -389,11 +368,10 @@ async fn list_units_inner(conn: &zbus::Connection) -> zbus::Result<Vec<ProtoUnit
     Ok(merge_units(services, failed))
 }
 
-/// Dispatch the verb and wait for ITS job to complete, returning systemd's own
-/// result string. Unsupported verbs are rejected before any bus call — matching
-/// `docker.rs` — but once we proceed, the signal stream is opened BEFORE the
-/// start/stop/restart call — a fast job can otherwise complete before we are
-/// listening, and that ordering must not move.
+/// Dispatches the verb and waits for ITS job, returning systemd's own
+/// result string. The signal stream is opened BEFORE the start/stop/restart
+/// call -- a fast job could otherwise complete before we're listening; that
+/// ordering must not move.
 async fn run_verb_inner(conn: &zbus::Connection, verb: Verb, unit: &str) -> zbus::Result<String> {
     if !matches!(verb, Verb::UnitStart | Verb::UnitStop | Verb::UnitRestart) {
         return Err(zbus::Error::Failure(format!("unsupported verb {verb:?}")));
@@ -570,8 +548,6 @@ mod tests {
         );
     }
 
-    /// Live-bus unit listing. Ignored by default like the repo's other
-    /// live-dependency tests; run with `--ignored` on a systemd host.
     #[tokio::test]
     #[ignore = "needs a live D-Bus system bus"]
     async fn live_bus_lists_units() {
@@ -590,10 +566,9 @@ mod tests {
         );
     }
 
-    /// Live-bus verb execution: proves Subscribe + stream-before-call ordering +
-    /// job-path correlation end to end. `paths.target` is already active, so
-    /// starting it is a no-op for the host, but systemd still creates a real job
-    /// that completes with result "done".
+    /// Proves Subscribe + stream-before-call ordering + job-path correlation
+    /// end to end. `paths.target` is already active, so starting it is a
+    /// host no-op, but systemd still creates a real job that completes "done".
     #[tokio::test]
     #[ignore = "needs a live D-Bus system bus + root; polkit denies the verb otherwise"]
     async fn live_bus_run_verb_reports_a_real_job_result() {

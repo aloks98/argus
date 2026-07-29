@@ -30,10 +30,9 @@ export function useMe() {
 
 export async function logout(): Promise<void> {
   const r = await fetch("/auth/logout", { method: "POST" });
-  // The server fails closed: on a DB error it returns 500 and deliberately
-  // does NOT clear the cookie, so the session is still live. If we don't
-  // check this, the caller flips the SPA to the sign-in view anyway -- the
-  // operator believes they signed out and walks away with a still-valid
-  // cookie sitting in the browser.
+  // Fails closed: a 500 here means the cookie was deliberately NOT cleared,
+  // so the session is still live. Skipping this check would flip the SPA to
+  // sign-in anyway — the operator believes they're out with a still-valid
+  // cookie in the browser.
   if (!r.ok) throw new Error(`/auth/logout failed: ${r.status}`);
 }

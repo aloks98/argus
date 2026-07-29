@@ -3,18 +3,17 @@ import type { Tone } from "../lib/status";
 import { cn } from "../lib/cn";
 
 /**
- * A hostname (or container name) rendered as a solid stencilled asset tag whose
- * fill is its status — the design's signature element.
+ * A hostname (or container name) rendered as a solid stencilled asset tag,
+ * fill = status.
  *
- * Built on rnui's `Badge`. Text colour is black on every fill, verified against
- * WCAG AA 4.5:1: ok #00E676 12.58:1 · warn #FF6D00 7.44:1 · fail #FF1744 5.46:1 ·
- * idle #8A8A8A 6.08:1. (White on fail would be only 3.85:1 — saturated reds read
- * better with black.) `Badge`'s own `success`/`warning`/`destructive` variants
- * render white text (`text-white`), so `text-black` is forced via `className` on
- * every tone to hold that contrast rule regardless of the base variant's default.
- * `idle` additionally forces its theme-invariant `--idle` fill rather than relying
- * on any variant's built-in background, since `--muted-foreground` differs per
- * theme and could not pass contrast in both.
+ * Text is forced black on every fill via `className`, overriding `Badge`'s
+ * own white-text `success`/`warning`/`destructive` variants: black clears
+ * WCAG AA (4.5:1) on all four fills, where white on `fail` would not
+ * (3.85:1 vs black's 5.46:1).
+ *
+ * `idle` also forces its own theme-invariant `--idle` fill rather than a
+ * variant background, since `--muted-foreground` differs per theme and
+ * couldn't pass contrast in both.
  */
 export default function AssetTag({
   tone,
@@ -25,7 +24,14 @@ export default function AssetTag({
   children: React.ReactNode;
   className?: string;
 }) {
-  const variant = tone === "ok" ? "success" : tone === "warn" ? "warning" : tone === "fail" ? "destructive" : "secondary";
+  const variant =
+    tone === "ok"
+      ? "success"
+      : tone === "warn"
+        ? "warning"
+        : tone === "fail"
+          ? "destructive"
+          : "secondary";
 
   return (
     <Badge

@@ -1,23 +1,19 @@
-//! Host facts sent as `AgentInfo` (PRD §5.2). `gather()` runs both at
-//! enrollment AND again on every session (re)connect -- `session.rs`'s sender
-//! task calls it fresh on each attempt (not just once at startup) so a
-//! resent `Hello` lets the fleet view self-heal after a reconnect.
+//! Host facts sent as `AgentInfo` (PRD §5.2). `gather()` runs at enrollment
+//! AND fresh on every session (re)connect, so a resent `Hello` lets the
+//! fleet view self-heal after a reconnect.
 //!
-//! Everything here is best-effort: a field the host doesn't expose (e.g. no
-//! `/etc/os-release`, no default route) is reported as an empty string rather
-//! than failing enrollment. `machine_id` is the one field the control plane
-//! requires to be non-empty (`grpc.rs` rejects enrollment without it).
+//! Everything here is best-effort: a field the host doesn't expose is
+//! reported empty rather than failing enrollment, EXCEPT `machine_id`,
+//! which the control plane requires non-empty (`grpc.rs` rejects enrollment
+//! without it).
 
 use anyhow::{Context, Result};
 use argus_proto::v1::AgentInfo;
 use std::sync::OnceLock;
 
-/// CPU model/cores, boot time, and detected virtualization: all
-/// process-lifetime-stable, so they're computed once (first `gather()` call)
-/// and cached, rather than every call. Without this, a flapping connection --
-/// at the reconnect loop's 500ms backoff floor, up to ~2 attempts/sec --
-/// would turn into a `/proc` scan plus a `systemd-detect-virt` fork+exec on
-/// every single attempt.
+/// CPU model/cores, boot time, and virt: process-lifetime-stable, so cached
+/// after the first `gather()` rather than recomputed every reconnect (up to
+/// ~2 attempts/sec) -- avoiding a `/proc` scan + fork/exec on each attempt.
 struct ProcessInventory {
     cpu_model: String,
     cpu_cores: u32,
@@ -27,7 +23,6 @@ struct ProcessInventory {
 
 static INVENTORY: OnceLock<ProcessInventory> = OnceLock::new();
 
-/// Compute (once) and return the cached process-lifetime inventory facts.
 fn process_inventory() -> &'static ProcessInventory {
     INVENTORY.get_or_init(|| {
         let (cpu_model, cpu_cores) = cpu_info();
@@ -40,9 +35,8 @@ fn process_inventory() -> &'static ProcessInventory {
     })
 }
 
-/// Gather this host's facts for the `Enroll` RPC and for every `Hello`.
-/// `agent_version` is passed in (baked into the binary at build time) rather
-/// than read from the environment.
+/// Gathers this host's facts for the `Enroll` RPC and every `Hello`.
+/// `agent_version` is passed in (baked in at build time), not read from env.
 pub fn gather(agent_version: &str) -> Result<AgentInfo> {
     let uname = rustix::system::uname();
     let inventory = process_inventory();
@@ -55,10 +49,9 @@ pub fn gather(agent_version: &str) -> Result<AgentInfo> {
         primary_ip: primary_ip(),
         arch: uname.machine().to_string_lossy().into_owned(),
         agent_version: agent_version.to_string(),
-        // The session layer overwrites these with the real probed values
-        // after every gather() call (see session.rs's sender task) -- gather()
-        // itself has no access to the docker/systemd clients needed to probe
-        // them, so it always reports the "unknown" defaults here.
+        // Overwritten with real probed values by session.rs's sender task --
+        // gather() has no access to the docker/systemd clients needed to
+        // probe these, so it reports the "unknown" defaults here.
         capabilities: Vec::new(),
         capabilities_reported: false,
         cpu_model: inventory.cpu_model.clone(),
@@ -69,8 +62,8 @@ pub fn gather(agent_version: &str) -> Result<AgentInfo> {
 }
 
 /// CPU brand + logical core count via sysinfo (already a dependency for the
-/// metrics sampler). Best-effort: an empty brand string is simply reported
-/// empty and becomes NULL server-side. Called once, from `process_inventory`.
+/// metrics sampler). An empty brand is reported empty, which becomes NULL
+/// server-side.
 fn cpu_info() -> (String, u32) {
     let mut sys = sysinfo::System::new();
     sys.refresh_cpu_all();
@@ -82,12 +75,9 @@ fn cpu_info() -> (String, u32) {
     (model, cpus.len() as u32)
 }
 
-/// `systemd-detect-virt` stdout, trimmed. CAREFUL: the command exits
-/// NON-ZERO for its most interesting answer -- "none" (bare metal) -- so
-/// failure is judged on spawn error / empty output, never on exit status.
-/// A host without the binary (Alpine, containers without systemd) reports
-/// empty -> NULL server-side. Called once, from `process_inventory` (a
-/// fork+exec per reconnect would be wasteful -- see that struct's doc).
+/// `systemd-detect-virt` stdout, trimmed. CAREFUL: it exits NON-ZERO for
+/// its most interesting answer, "none" (bare metal) -- judge failure on
+/// spawn error/empty output, never on exit status. Empty -> NULL server-side.
 fn detect_virt() -> String {
     match std::process::Command::new("systemd-detect-virt").output() {
         Ok(out) => String::from_utf8_lossy(&out.stdout).trim().to_string(),
@@ -117,10 +107,9 @@ fn read_os_pretty_name() -> String {
     String::new()
 }
 
-/// The local address that would be used to reach the outside world, via the
-/// classic UDP-connect trick (no packets are actually sent since UDP is
-/// connectionless -- this just asks the kernel to pick a route). Empty string
-/// on any failure; this is best-effort informational data, not load-bearing.
+/// The address that would reach the outside world, via the classic
+/// UDP-connect trick (no packets sent, UDP is connectionless -- this just
+/// asks the kernel to pick a route). Empty on any failure; best-effort only.
 fn primary_ip() -> String {
     (|| -> std::io::Result<String> {
         let socket = std::net::UdpSocket::bind("0.0.0.0:0")?;

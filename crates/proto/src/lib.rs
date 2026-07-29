@@ -1,7 +1,6 @@
-//! Generated gRPC contract for the Argus agent protocol.
-//!
-//! The source of truth is `proto/argus.proto`; `build.rs` regenerates this module
-//! at compile time via `protox` + `tonic-prost-build` (no `protoc` required).
+//! Generated gRPC contract for the Argus agent protocol. Source of truth is
+//! `proto/argus.proto`; `build.rs` regenerates this at compile time (no
+//! `protoc` required).
 
 // This crate is almost entirely tonic/prost-generated code; don't hold generated
 // doc comments to clippy's doc-formatting lints.

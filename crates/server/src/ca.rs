@@ -1,57 +1,6 @@
-//! Internal certificate authority.
-//!
 //! The CA private key is persisted in Postgres (`ca_material`), AES-256-GCM
 //! encrypted with the field key from env, so a stateless pod can reschedule
-//! without losing the fleet's identity root (PRD §2.3, §5). This is build slice #1
-//! and the highest-risk component -- build and manually verify it first.
-//!
-//! ## rcgen 0.14 API spike
-//!
-//! Confirmed by reading the vendored `rcgen-0.14.8` source (`~/.cargo/registry/src/
-//! .../rcgen-0.14.8/src/{lib,certificate,csr,key_pair,error}.rs`) and cross-checked
-//! against docs.rs/rcgen/0.14, since the exact call names are the highest-risk part
-//! of this slice:
-//!
-//! - `KeyPair::generate() -> Result<KeyPair, Error>` and
-//!   `KeyPair::from_pem(pem_str: &str) -> Result<KeyPair, Error>`;
-//!   `key_pair.serialize_pem() -> String`. `KeyPair` implements both `SigningKey`
-//!   and `PublicKeyData`.
-//! - `CertificateParams::new(sans: impl Into<Vec<String>>) -> Result<Self, Error>`
-//!   builds params with `subject_alt_names` parsed from strings (IP vs DNS).
-//! - `CertificateParams::self_signed(&self, signing_key: &impl SigningKey)
-//!   -> Result<Certificate, Error>` -- mints the CA's own self-signed root.
-//! - `CertificateParams::signed_by(&self, public_key: &impl PublicKeyData,
-//!   issuer: &Issuer<'_, impl SigningKey>) -> Result<Certificate, Error>` -- used
-//!   for the server leaf (the leaf's own key pair supplies the public key).
-//! - `Issuer::from_ca_cert_pem(pem_str: &str, signing_key: S) -> Result<Self, Error>`
-//!   (requires the `pem` + `x509-parser` cargo features, both enabled here) builds
-//!   an issuer from the CA's cert PEM plus a freshly-loaded, owned `KeyPair`
-//!   (`KeyPair` isn't `Clone`, so this is re-derived from the stored PEM per call).
-//! - `CertificateSigningRequestParams::from_pem(pem_str: &str) -> Result<Self, Error>`
-//!   parses + verifies a CSR's self-signature and exposes a mutable `.params:
-//!   CertificateParams` plus `.public_key`.
-//! - `CertificateSigningRequestParams::signed_by(&self, issuer: &Issuer<impl
-//!   SigningKey>) -> Result<Certificate, Error>` signs the CSR's embedded public
-//!   key with the issuer, producing the leaf `Certificate`.
-//! - `Certificate::pem(&self) -> String`, `Certificate::der(&self) -> &CertificateDer<'static>`.
-//! - `CertificateParams::distinguished_name: DistinguishedName`, mutated via
-//!   `.push(DnType::CommonName, impl Into<DnValue>)` (insert-or-update semantics)
-//!   -- this is how the CSR's CN is overwritten with the agent id.
-//! - `SerialNumber::from_slice(&[u8]) -> SerialNumber`: rcgen DER-encodes the bytes
-//!   as a positive bignum (yasna's `write_bigint_bytes(_, true)` prepends `0x00` if
-//!   the top bit is set), so a random serial needs no manual top-bit masking.
-//! - `IsCa::Ca(BasicConstraints::Unconstrained)` plus `KeyUsagePurpose::{KeyCertSign,
-//!   CrlSign}` mark the root as a CA; `ExtendedKeyUsagePurpose::ServerAuth` marks
-//!   the server leaf.
-//! - `rcgen::Error` implements `std::error::Error`, so `?` converts it straight
-//!   into `anyhow::Error`.
-//!
-//! For the decimal serial and the (re-derived) validity window returned in
-//! `SignedCert`, the signed certificate's DER is re-parsed with
-//! `x509_parser::parse_x509_certificate`: `tbs_certificate.serial` is a `BigUint`
-//! whose `Display` impl is decimal, and `validity().not_before/not_after
-//! .to_datetime()` yields a `time::OffsetDateTime` -- the same approach rcgen's own
-//! (test-only) `CertificateParams::from_ca_cert_der` helper uses internally.
+//! without losing the fleet's identity root (PRD §2.3, §5).
 
 use crate::crypto::FieldCipher;
 use anyhow::{Context, Result};
@@ -85,17 +34,14 @@ pub struct SignedCert {
     pub not_after: OffsetDateTime,
 }
 
-/// The internal CA: an in-memory root cert + key, persisted (encrypted) in
-/// `ca_material` so a stateless pod can reschedule without regenerating the
-/// fleet's identity root.
 pub struct CertAuthority {
     cert_pem: String,
     key_pem: String,
 }
 
 impl CertAuthority {
-    /// Load the singleton CA from `ca_material`, or generate + persist one on
-    /// first boot (`rcgen`, encrypting the key with the field key).
+    /// Loads the singleton CA (`ca_material.id = 1`), or generates + persists
+    /// one on first boot.
     pub async fn load_or_init(pool: &PgPool, cipher: &FieldCipher) -> Result<Self> {
         let existing = sqlx::query!(
             "SELECT cert_pem, key_ciphertext, key_nonce FROM ca_material WHERE id = 1"
@@ -134,21 +80,18 @@ impl CertAuthority {
         Ok(Self { cert_pem, key_pem })
     }
 
-    /// Build a CA purely in memory (no DB) -- for tests.
     #[cfg(test)]
     fn self_signed_for_test() -> Self {
         let (cert_pem, key_pem) = Self::generate().expect("generate CA for test");
         Self { cert_pem, key_pem }
     }
 
-    /// The CA's own certificate, PEM-encoded -- served to agents so they can
-    /// verify the server's leaf and pin the fleet's identity root.
+    /// Served to agents so they can verify the server's leaf and pin the
+    /// identity root.
     pub fn ca_cert_pem(&self) -> &str {
         &self.cert_pem
     }
 
-    /// Generate a fresh self-signed CA root: `is_ca = Ca(Unconstrained)` with
-    /// `KeyCertSign`/`CrlSign` usages, per the rcgen 0.14 API spiked above.
     fn generate() -> Result<(String, String)> {
         let key_pair = KeyPair::generate().context("generating CA key pair")?;
         let mut params = CertificateParams::new(Vec::<String>::new())
@@ -166,15 +109,14 @@ impl CertAuthority {
         Ok((cert.pem(), key_pair.serialize_pem()))
     }
 
-    /// Build an `Issuer` from the persisted CA cert + key. `KeyPair` isn't
-    /// `Clone`, so it's re-derived from the stored PEM on every call.
+    /// `KeyPair` isn't `Clone`, so it's re-derived from the stored PEM on every call.
     fn issuer(&self) -> Result<Issuer<'static, KeyPair>> {
         let key_pair = KeyPair::from_pem(&self.key_pem).context("parsing CA private key")?;
         Issuer::from_ca_cert_pem(&self.cert_pem, key_pair).context("building issuer from CA cert")
     }
 
-    /// Sign an agent CSR, embedding `agent_id` as the cert's CN (PRD §5.3). The
-    /// caller records the `agent_certs` row and the audit entry.
+    /// Embeds `agent_id` as the cert's CN (PRD §5.3). Caller records the
+    /// `agent_certs` row and the audit entry.
     pub fn sign_csr(&self, csr_pem: &str, agent_id: Uuid) -> Result<SignedCert> {
         let mut csr =
             CertificateSigningRequestParams::from_pem(csr_pem).context("parsing/verifying CSR")?;
@@ -187,12 +129,9 @@ impl CertAuthority {
         // extension asking for CA rights; an agent client cert must never be
         // treated as a CA regardless of what the CSR asked for.
         csr.params.is_ca = IsCa::ExplicitNoCa;
-        // `CertificateSigningRequestParams::from_pem` copies the CSR's requested
-        // SANs/keyUsages/EKU into `csr.params` verbatim. Left unchecked, an
-        // enrolled agent could request `EKU = serverAuth` plus a SAN matching
-        // the control plane's hostname and receive a CA-chained cert usable to
-        // impersonate the server to other agents. Agent client certs must be
-        // pinned to client-only use regardless of what the CSR asked for.
+        // `from_pem` copies the CSR's SANs/keyUsages/EKU verbatim; unchecked, an
+        // agent could request `EKU=serverAuth` + a SAN matching the control
+        // plane's hostname and mint a server-impersonation cert. Client-only, always.
         csr.params.subject_alt_names = Vec::new();
         csr.params.key_usages = vec![KeyUsagePurpose::DigitalSignature];
         csr.params.extended_key_usages = vec![ExtendedKeyUsagePurpose::ClientAuth];
@@ -240,19 +179,17 @@ impl CertAuthority {
     }
 }
 
-/// Generate a random 16-byte serial number. rcgen/yasna encode it as a
-/// positive DER INTEGER regardless of the top bit (see module docs above), so
-/// no manual masking is needed.
+/// rcgen/yasna DER-encode this as a positive bignum regardless of the top
+/// bit, so no manual masking is needed.
 fn random_serial_bytes() -> [u8; 16] {
     let mut bytes = [0u8; 16];
     rand::rng().fill_bytes(&mut bytes);
     bytes
 }
 
-/// Re-parse a freshly-signed certificate's DER to read back the fields the
-/// caller needs in a form independent of what we asked rcgen for: the decimal
-/// serial (`agent_certs.serial` is `numeric`), the SHA-256 fingerprint of the
-/// DER, and the actual (possibly rcgen-normalized) validity window.
+/// Re-parses the signed DER rather than trusting what we asked rcgen for --
+/// rcgen may normalize the validity window, and the caller needs the decimal
+/// serial (`agent_certs.serial` is `numeric`) plus the DER's SHA-256 fingerprint.
 fn describe_cert(
     cert: &rcgen::Certificate,
 ) -> Result<(String, String, String, OffsetDateTime, OffsetDateTime)> {
@@ -272,7 +209,6 @@ mod tests {
     use rcgen::{CertificateParams, KeyPair};
     use uuid::Uuid;
 
-    // A helper that mimics the agent making a CSR.
     fn make_csr() -> String {
         let kp = KeyPair::generate().unwrap();
         let params = CertificateParams::new(vec!["ignored".into()]).unwrap();
@@ -285,10 +221,8 @@ mod tests {
         let agent_id = Uuid::from_u128(0x1234);
         let signed = ca.sign_csr(&make_csr(), agent_id).unwrap();
 
-        // `::pem::` (leading `::`) forces resolution to the extern `pem` crate:
-        // `use x509_parser::prelude::*` re-exports `crate::*`, which brings
-        // x509-parser's own internal `pem` submodule into scope and shadows the
-        // `pem` crate name otherwise available via the 2018+ extern prelude.
+        // Leading `::pem::` forces the extern `pem` crate: `x509_parser::prelude::*`
+        // re-exports its own internal `pem` submodule, which otherwise shadows it.
         let pem = ::pem::parse(signed.cert_pem.as_bytes()).unwrap();
         let (_, cert) = X509Certificate::from_der(pem.contents()).unwrap();
         let cn = cert
@@ -300,16 +234,13 @@ mod tests {
             .unwrap();
         assert_eq!(cn, agent_id.to_string());
 
-        // Chains to the CA: the leaf's issuer field must equal the CA's
-        // subject. (Full cryptographic chain verification would need
-        // x509-parser's `verify` feature, which isn't enabled in this
-        // workspace; the issuer/subject match plus a successful `signed_by`
-        // call is the check available without adding that feature.)
+        // Issuer must equal the CA's subject. Full crypto chain verification would
+        // need x509-parser's `verify` feature (not enabled here); this plus a
+        // successful `signed_by` call is the available check without it.
         let ca_pem = ::pem::parse(ca.ca_cert_pem().as_bytes()).unwrap();
         let (_, ca_cert) = X509Certificate::from_der(ca_pem.contents()).unwrap();
         assert_eq!(cert.issuer(), ca_cert.subject());
 
-        // Fingerprint matches sha256(DER), and the validity window is ~365 days.
         let expected_fp = hex::encode(Sha256::digest(pem.contents()));
         assert_eq!(signed.fingerprint_hex, expected_fp);
         assert!(signed.not_after - signed.not_before > Duration::days(360));
@@ -338,10 +269,9 @@ mod tests {
         assert!(eku.value.server_auth);
     }
 
-    /// A hostile agent's CSR requests `serverAuth` EKU and a SAN for a
-    /// server hostname it doesn't own -- `sign_csr` must strip these so the
-    /// issued cert can never be presented as a valid server identity (the
-    /// CSR-extension-pinning fix).
+    /// A hostile agent's CSR requests `serverAuth` EKU and a SAN for a server
+    /// hostname it doesn't own -- `sign_csr` must strip these so the issued cert
+    /// can never be presented as a valid server identity.
     #[test]
     fn sign_csr_neutralizes_hostile_csr_extensions() {
         let ca = CertAuthority::self_signed_for_test();
@@ -361,14 +291,12 @@ mod tests {
         let pem = ::pem::parse(signed.cert_pem.as_bytes()).unwrap();
         let (_, cert) = X509Certificate::from_der(pem.contents()).unwrap();
 
-        // EKU must be pinned to clientAuth only -- serverAuth must not survive.
         let eku = cert.extended_key_usage().unwrap().unwrap();
         assert!(!eku.value.server_auth);
         assert!(eku.value.client_auth);
 
-        // The hostile SAN must not survive; with subject_alt_names cleared,
-        // rcgen omits the extension entirely (see `write_subject_alt_names`),
-        // so the extension itself should be absent.
+        // subject_alt_names cleared -> rcgen omits the SAN extension entirely
+        // (see `write_subject_alt_names`), so it must be absent, not empty.
         assert!(cert.subject_alternative_name().unwrap().is_none());
     }
 

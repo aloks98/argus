@@ -1,6 +1,6 @@
-// Shared formatting helpers for both screens. `formatLastSeen` used to exist
-// byte-identically in FleetPage and MachineDetailPage; this is its single
-// home now, renamed `formatRelative` since it's no longer last-seen-specific.
+// Shared formatting helpers for both screens — a single home for logic that
+// would otherwise duplicate across FleetPage and MachineDetailPage, named
+// `formatRelative` since it isn't last-seen-specific.
 const rtf = new Intl.RelativeTimeFormat(undefined, { numeric: "auto", style: "narrow" });
 
 const UNITS: [Intl.RelativeTimeFormatUnit, number][] = [
@@ -70,10 +70,9 @@ export function formatUptime(bootTimeIso: string): string {
 }
 
 /**
- * Absolute local date+time (e.g. "7/29/2026, 3:04:00 PM") for facts where the
- * exact instant matters more than "how long ago" — the System tab's Boot
- * time and Enrolled rows. Returns "" for an unparseable timestamp, same
- * omit-the-row contract as `formatUptime`.
+ * Absolute local date+time (e.g. "7/29/2026, 3:04:00 PM") for facts where
+ * the exact instant matters more than "how long ago" (System tab's Boot
+ * time, Enrolled). Returns "", same omit-the-row contract as `formatUptime`.
  */
 export function formatDateTime(iso: string): string {
   const d = new Date(iso);

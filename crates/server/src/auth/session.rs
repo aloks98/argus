@@ -1,5 +1,3 @@
-//! Session token minting and hashing.
-//!
 //! The cookie carries 32 random bytes; only their sha256 reaches the database.
 //! A database read -- a backup, a replica, a leaked dump -- therefore yields no
 //! usable session tokens. Mirrors `enrollment_tokens.token_hash`.
@@ -17,8 +15,6 @@ pub fn new_session_token() -> (String, Vec<u8>) {
     (token, hash)
 }
 
-/// Consumed by the `require_auth` middleware (`crate::auth::require_auth`),
-/// which hashes the incoming cookie value before looking it up.
 pub fn hash_token(token: &str) -> Vec<u8> {
     Sha256::digest(token.as_bytes()).to_vec()
 }

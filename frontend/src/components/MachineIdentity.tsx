@@ -1,10 +1,6 @@
 // Identity editing for one machine: display name, tags, notes. All three
 // commit through PATCH /api/machines/:id with an explicit Save — nothing
-// saves on blur, so a stray edit can't persist silently (design "Machine
-// detail"). Tags use an autocomplete-suggested free-text input with the
-// fleet-wide vocabulary as suggestions; free entry stays allowed (this is a
-// free-form tag field, not a curated list) — see the note on `TagsField`
-// below for why this isn't rnui's Combobox chips surface.
+// saves on blur, so a stray edit can't persist silently.
 import { useEffect, useRef, useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm } from "react-hook-form";
@@ -77,7 +73,7 @@ export default function MachineIdentity({
   // would silently discard whatever the operator is typing.
   useEffect(() => {
     form.reset(defaultsFrom(machine));
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [machine.id]);
 
   const mutation = useUpdateMachine(machine.id);
@@ -91,9 +87,9 @@ export default function MachineIdentity({
       },
       {
         onSuccess: (data) => {
-          // `useUpdateMachine` already wrote this same payload into the
-          // query cache; resetting here just brings the FORM's local state
-          // back in sync with the server's (possibly normalized) values.
+          // `useUpdateMachine` already wrote this into the query cache;
+          // resetting here syncs the FORM's local state with the server's
+          // (possibly normalized) values.
           form.reset(defaultsFrom(data));
           onSaved?.();
         },
@@ -102,11 +98,9 @@ export default function MachineIdentity({
   };
 
   return (
-    // No Card here — this component is dialog-only (MachineDetailPage.tsx
-    // mounts it inside DialogContent, which already supplies the frame and
-    // the visible heading via DialogTitle/DialogDescription). A Card wrapper
-    // previously nested its own border inside the dialog's, rendering as a
-    // visible double border.
+    // No Card here — this is dialog-only (MachineDetailPage.tsx mounts it
+    // inside DialogContent, which already supplies the frame). A Card
+    // wrapper would nest its own border, rendering as a double border.
     <>
       {mutation.error !== null && (
         <Alert variant="destructive" className="mb-4">
@@ -118,11 +112,7 @@ export default function MachineIdentity({
       {/* `noValidate`: without it the browser's own bubble validation
           fires first and FieldError never gets a chance to render — see
           SignIn.tsx's LocalSignInForm for the same note. */}
-      <form
-        noValidate
-        onSubmit={form.handleSubmit(onSubmit)}
-        className="flex flex-col gap-4"
-      >
+      <form noValidate onSubmit={form.handleSubmit(onSubmit)} className="flex flex-col gap-4">
         <FieldGroup>
           <Controller
             name="display_name"
@@ -201,40 +191,17 @@ export default function MachineIdentity({
 }
 
 /**
- * A tags chip field built from `Badge` + rnui's `Autocomplete` rather than
- * `Combobox`'s chips surface (`ComboboxChips`/`ComboboxChipsInput`).
- *
- * Why: `Combobox`'s multi-select chips are built on selecting *items from
- * `items`* — base-ui's own docs (`@base-ui/react/docs/react/components/
- * combobox.md`, "Creatable items") show that committing text which doesn't
- * match any item requires a bespoke creation flow (a confirmation `Dialog`,
- * a `creatable` sentinel item, pending-query plumbing) — there's no
- * `freeSolo`-style prop. That's real weight for a field whose whole point is
- * "type anything, autocomplete is just a shortcut," and it's not
- * verifiable from types alone — the compiled-probe lesson this task calls
- * out.
- *
- * `Autocomplete.Root` is the better fit for that exact job: `value` IS the
- * raw input text (no selection model to fight), `items` only drive the
- * suggestion popup, and free text is the default rather than an opt-in.
- * Base UI's `AutocompleteRoot` defaults `fillInputOnItemPress: true`
- * (verified in the compiled `AutocompleteRoot.mjs`, not just the `.d.ts`),
- * so picking a suggestion fires `onValueChange` with `reason: "item-press"` —
- * that's the signal this component uses to commit immediately.
+ * Chips built on `Badge` + rnui's `Autocomplete`, not `Combobox` (its chips
+ * select only from `items`, no freeSolo path for arbitrary typed text).
+ * `Autocomplete`'s `value` IS the raw input text; picking a suggestion fires
+ * `onValueChange` with `reason: "item-press"` (Base UI's
+ * `fillInputOnItemPress` default) — the signal this component commits on.
  *
  * Enter must never commit something other than what's visibly
- * highlighted/typed, so this does NOT unconditionally intercept Enter.
- * `ComboboxInput.js` (which `Autocomplete.Input` is built on) already does
- * exactly the right thing on its own: when an item is highlighted it calls
- * `stopEvent` and clicks that item (firing the `item-press` path above); when
- * nothing is highlighted its own comment says "Allow form submission when no
- * item is highlighted" and it deliberately does NOT preventDefault. So this
- * component only needs to cover that second case — commit the raw typed text
- * and preventDefault so Enter doesn't submit the surrounding form — and
- * tracks "is anything highlighted right now" itself via `onItemHighlighted`
- * (a ref, not state: it has to be current at the moment the Enter keydown is
- * read, not delayed a render). When a highlight exists, this component's
- * `onKeyDown` does nothing at all and lets Base UI's own path run.
+ * highlighted/typed. `ComboboxInput` already selects a highlighted item and
+ * skips `preventDefault` otherwise (to allow submit) — so this only handles
+ * that second case: commit typed text via `highlightedRef` (a ref, since
+ * Enter's keydown needs the value synchronously, not a render later).
  */
 function TagsField({
   id,
@@ -250,17 +217,14 @@ function TagsField({
   invalid?: boolean;
 }) {
   const [query, setQuery] = useState("");
-  // The currently keyboard-highlighted suggestion, if any. A ref (not
-  // state): `onKeyDown`'s Enter handler needs the value AS OF that keydown,
-  // and arrow-key highlight changes must be visible to it synchronously,
-  // not a render later.
+  // Keyboard-highlighted suggestion, if any — see the doc comment above for
+  // why this is a ref, not state.
   const highlightedRef = useRef<string | undefined>(undefined);
 
   const commit = (raw: string) => {
-    // Lowercase up front so the chip shown here always matches what the
-    // server will actually store (tags are lowercased server-side per
-    // constraints.md) — otherwise a typed "Infra" would render as "Infra"
-    // until save silently swapped it to "infra".
+    // Lowercase up front so the chip matches what the server stores (tags
+    // are lowercased server-side, constraints.md) — otherwise a typed
+    // "Infra" would flash then silently swap to "infra" after save.
     const tag = raw.trim().toLowerCase();
     if (tag === "") return;
     if (value.includes(tag)) {
@@ -275,10 +239,9 @@ function TagsField({
   const remove = (tag: string) => onChange(value.filter((t) => t !== tag));
 
   // Suggestions already carried by this machine are noise in its own list.
-  // Both sides are server-canonical lowercase (`machine.tags` and
-  // `fleetTags()` come straight from the API) plus whatever this component
-  // itself has committed, which `commit` already lowercases — so a plain
-  // `includes` is enough, no case-folding needed here.
+  // Both sides are already lowercase (server-canonical `machine.tags`/
+  // `fleetTags()`, and `commit` lowercases what this component adds) —
+  // plain `includes` is enough, no case-folding needed.
   const options = suggestions.filter((t) => !value.includes(t));
 
   return (
@@ -307,10 +270,8 @@ function TagsField({
         onValueChange={(next, details) => {
           setQuery(next);
           // Base UI's reason strings are kebab-case at runtime
-          // (`REASONS.itemPress === "item-press"`, see
-          // `@base-ui/react/internals/reason-parts.mjs`) even though the
-          // exported identifier reads camelCase — easy to get backwards
-          // since the type alias name doesn't hint at the literal value.
+          // (`REASONS.itemPress === "item-press"`) even though the exported
+          // identifier reads camelCase — easy to get backwards.
           if (details.reason === "item-press") commit(next);
         }}
         onItemHighlighted={(highlighted) => {
@@ -322,12 +283,8 @@ function TagsField({
           placeholder="Add a tag…"
           aria-invalid={invalid}
           onKeyDown={(e) => {
-            // Only handle Enter ourselves when NOTHING is highlighted.
-            // When something IS highlighted, do nothing here — Base UI's own
-            // Enter handling (in ComboboxInput.js) selects it, which fires
-            // `onValueChange` with reason "item-press" above. Committing the
-            // raw `query` in that case would add whatever's literally typed
-            // instead of the visibly-selected suggestion.
+            // Only handle Enter when nothing is highlighted — see this
+            // component's doc comment above for why.
             if (e.key === "Enter" && highlightedRef.current === undefined) {
               e.preventDefault();
               commit(query);

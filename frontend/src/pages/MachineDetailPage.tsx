@@ -1,8 +1,7 @@
-// The machine detail page (Metrics slice, Task 9). Polls GET /api/machines/:id
-// and GET /api/machines/:id/metrics?range=... every 10s and renders a header
-// (hostname/os/ip/status/tags/last-seen) plus cpu%/mem%/load1/net-rate charts
-// for the selected time range, tabbed against the container list. Mirrors
-// FleetPage's polling idioms.
+// The machine detail page. Polls GET /api/machines/:id and GET
+// /api/machines/:id/metrics?range=... every 10s; header plus cpu%/mem%/
+// load1/net-rate charts for the selected range, tabbed against containers/
+// units/logs/terminal. Mirrors FleetPage's polling idioms.
 import { useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import {
@@ -103,10 +102,7 @@ function MetricChartCard({
       </CardHeader>
       <CardContent>
         {timestamps.length === 0 ? (
-          <EmptyState
-            title="No data yet"
-            description="Waiting for metrics to accumulate."
-          />
+          <EmptyState title="No data yet" description="Waiting for metrics to accumulate." />
         ) : (
           <TimeSeriesChart
             timestamps={timestamps}
@@ -126,19 +122,14 @@ export default function MachineDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [range, setRange] = useState<Range>("1h");
 
-  // The identity editor lives in a Dialog, not inline in the Overview tab
-  // (Task 8 fix round 1 — the user rejected the inline-card placement).
   const [editOpen, setEditOpen] = useState(false);
 
-  // The active tab lives in the URL (`?tab=units`) rather than component state,
-  // so a reload keeps the tab and a link to "the units on this box" is
-  // shareable. `replace` because switching tabs isn't a navigation step worth
-  // stacking — Back should return to wherever you came from, not walk you back
-  // through each tab you looked at.
+  // The active tab lives in the URL (`?tab=units`), not component state, so
+  // a reload keeps it and a link to "the units on this box" is shareable.
+  // `replace`: switching tabs isn't a navigation step worth stacking — Back
+  // should return to wherever you came from, not walk through each tab.
   const [searchParams, setSearchParams] = useSearchParams();
 
-  // The whole journal defaults to the current boot — the cheapest and most
-  // relevant read for "what has this box been doing since it came up".
   const [logFilters, setLogFilters] = useLogFilters(BOOT_LOGS);
 
   const machineQuery = useMachine(id as string);
@@ -152,8 +143,7 @@ export default function MachineDetailPage() {
   const units = systemdQuery.data ?? [];
   const isPending = machineQuery.isPending;
   const notFound = machineQuery.error?.message === "machine 404";
-  const error =
-    machineQuery.error ?? metricsQuery.error ?? dockerQuery.error ?? systemdQuery.error;
+  const error = machineQuery.error ?? metricsQuery.error ?? dockerQuery.error ?? systemdQuery.error;
 
   // `null` capabilities means the agent predates capability reporting: gate
   // NOTHING rather than blanking a working machine. An explicit (possibly
@@ -187,11 +177,10 @@ export default function MachineDetailPage() {
     { key: "terminal", label: "Terminal" },
   ];
 
-  // Fall back for an unknown value too, not just a missing one: `?tab=typo`
-  // would otherwise select no tab and render no panel — a blank page from a
-  // hand-edited URL. The same guard covers a tab that's disabled: a
-  // bookmarked `?tab=units` for a host with no systemd renders the overview
-  // instead of a blank panel.
+  // Falls back for an unknown value too, not just a missing one: `?tab=typo`
+  // would otherwise select no tab and render a blank page. The same guard
+  // covers a disabled tab: a bookmarked `?tab=units` for a host with no
+  // systemd renders overview instead of a blank panel.
   const requestedTab = searchParams.get("tab");
   const requested = TABS.find((t) => t.key === requestedTab);
   const tab = requested && !requested.disabled ? (requestedTab as string) : "overview";
@@ -211,9 +200,7 @@ export default function MachineDetailPage() {
     return (
       <Alert variant="destructive">
         <AlertTitle>Invalid machine id</AlertTitle>
-        <AlertDescription>
-          No machine id was provided in the URL.
-        </AlertDescription>
+        <AlertDescription>No machine id was provided in the URL.</AlertDescription>
       </Alert>
     );
   }
@@ -258,20 +245,17 @@ export default function MachineDetailPage() {
   const resources = latestResources(metrics);
   const loadPoints = buildLoadSeries(metrics);
   const netPoints = buildNetRateSeries(metrics);
-  const latestNet =
-    netPoints.length > 0 ? netPoints[netPoints.length - 1] : null;
+  const latestNet = netPoints.length > 0 ? netPoints[netPoints.length - 1] : null;
 
   // `!= null` (not `!==`): boot_time is an additive proto column, so a
-  // frontend newer than the server it's talking to sees `undefined` here,
-  // not `null` — strict equality would let that slip through to
-  // formatUptime and render "up NaNm". Same reasoning applies wherever this
-  // page and SystemCard read the inventory/resource fields added this slice.
+  // newer frontend may see `undefined` from an older server — strict
+  // equality would let that slip through to formatUptime and render "up
+  // NaNm".
   const uptime = machine.boot_time != null ? formatUptime(machine.boot_time) : "";
 
-  // Slimmed to five items (live review: the nine-item version was too
-  // crowded) — Kernel/Arch/Agent/Processor/Virtualization/Disk/Memory/Swap
-  // moved to the System tab (SystemCard). Uptime stays: tiny and ops-useful
-  // at a glance.
+  // Five items only — Kernel/Arch/Agent/Processor/Virtualization/Disk/Memory/Swap
+  // moved to the System tab (SystemCard). Uptime stays: tiny and ops-useful at a
+  // glance.
   const specItems: SpecItem[] = [
     {
       label: "Status",
@@ -310,22 +294,15 @@ export default function MachineDetailPage() {
           </BreadcrumbList>
         </Breadcrumb>
 
-        {/* Renamed machines show the operator-set name as the headline, with
-            the hostname demoted to a muted mono line beneath — same pairing
-            FleetPage's Name column uses (AssetTag + hostname), so a renamed
-            machine reads the same way whether you're scanning the fleet
-            table or looking at its detail page. Un-renamed machines (the
-            common case) show just the hostname, unchanged from before. The
-            Edit control sits in this same row rather than in SpecStrip —
-            editing identity isn't "a fact about the machine" the way OS/IP/
-            kernel are.
+        {/* Renamed machines show the operator-set name as headline, hostname
+            demoted beneath — same pairing as FleetPage's Name column, so a
+            renamed machine reads the same way in both places. Edit sits in
+            this row, not SpecStrip: editing identity isn't "a fact about
+            the machine" the way OS/IP/kernel are.
 
-            Tags live here too, as chips, rather than comma-joined in
-            SpecStrip (browser-review decision) — same `Badge
-            variant="outline"` FleetPage's Tags column uses, so a machine's
-            tags read identically whether you're scanning the fleet table or
-            its own detail page. Omitted entirely when the machine has none,
-            same as every other conditional line in this block. */}
+            Tags live here as chips (same `Badge variant="outline"` as
+            FleetPage's Tags column), not comma-joined in SpecStrip, and
+            are omitted entirely when the machine has none. */}
         <div className="mt-2 mb-3">
           <div className="flex flex-wrap items-center gap-3">
             <h1 className="font-display text-2xl uppercase tracking-tight">
@@ -337,9 +314,7 @@ export default function MachineDetailPage() {
             </Button>
           </div>
           {machine.display_name !== null && (
-            <p className="mt-1 font-mono text-[11px] text-muted-foreground">
-              {machine.hostname}
-            </p>
+            <p className="mt-1 font-mono text-[11px] text-muted-foreground">{machine.hostname}</p>
           )}
           {machine.tags.length > 0 && (
             <div className="mt-2 flex flex-wrap gap-1">
@@ -355,19 +330,15 @@ export default function MachineDetailPage() {
         <SpecStrip items={specItems} />
       </div>
 
-      {/* Identity editing lives in a Dialog rather than inline on the page
-          (Task 8 fix round 1) — LogDialog is the in-repo precedent for a
-          Dialog whose content depends on this page's own state/params.
-          `MachineIdentity` itself is otherwise unchanged by this; only its
-          host is — `onSaved` is the one seam added so the dialog can close
-          itself on a successful PATCH, while staying open on a validation/
-          server error so the Alert inside it is visible.
+      {/* Identity editing lives in a Dialog, not inline — LogDialog is the
+          precedent for a Dialog whose content depends on this page's own
+          state. `MachineIdentity` is otherwise unchanged; `onSaved` is the
+          one seam added so the dialog closes itself on a successful PATCH,
+          staying open on error so the Alert inside stays visible.
 
-          The dialog owns the ONE heading (Task 8 fix round 2): `MachineIdentity`
-          no longer renders its own Card/CardHeader — nesting a bordered Card
-          inside DialogContent's own bordered popup rendered as a visible
-          double border, and two headings ("Identity" from the Card, an
-          sr-only one here) was one too many anyway. */}
+          The dialog owns the ONE heading: `MachineIdentity` doesn't render
+          its own Card/CardHeader — nesting a bordered Card inside
+          DialogContent would double the border AND the heading. */}
       <Dialog open={editOpen} onOpenChange={setEditOpen}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
@@ -390,15 +361,11 @@ export default function MachineDetailPage() {
               // Only the selected colour is overridden — rnui's sizing, spacing
               // and disabled treatment are kept.
               //
-              // The `dark:` copies are NOT redundant. rnui's base carries BOTH
-              // `data-active:bg-background` AND `dark:data-active:bg-input/30`.
-              // tailwind-merge only dedupes classes whose modifier chains match,
-              // so a bare `data-active:bg-primary` beats the first and loses to
-              // the second — the override would work in light mode and silently
-              // do nothing in dark. The tokens themselves already flip per mode
-              // (`--primary` is hazard yellow in dark, near-black in light), so
-              // the same utility is correct in both; it just has to be spelled
-              // once per modifier chain the library uses.
+              // The `dark:` copies are NOT redundant: rnui's base carries both
+              // `data-active:bg-background` and `dark:data-active:bg-input/30`,
+              // and tailwind-merge only dedupes when modifier chains match — a
+              // bare `data-active:bg-primary` would lose to the dark: variant,
+              // working in light mode and silently doing nothing in dark.
               className={cn(
                 "data-active:bg-primary data-active:text-primary-foreground",
                 "dark:data-active:bg-primary dark:data-active:text-primary-foreground",
@@ -409,16 +376,13 @@ export default function MachineDetailPage() {
             </TabsTrigger>
           ))}
         </TabsList>
-        {/*
-         * Rendered outside TabsList (a role="tablist" should contain only
-         * tabs) and outside each trigger (nesting would fold the reason into
-         * the trigger's accessible name and double-announce it). `title`
-         * covers pointer users; this sr-only span + aria-describedby covers
-         * keyboard/screen-reader users regardless of whether the library
-         * renders disabled tabs with the native `disabled` attribute (which
-         * suppresses `title` tooltips in Chromium and drops the control from
-         * the focus order) or with `aria-disabled`.
-         */}
+        {/* Rendered outside TabsList (role="tablist" should hold only tabs)
+            and outside each trigger (nesting would fold the reason into the
+            trigger's accessible name, double-announcing it). `title` covers
+            pointer users; this sr-only span + aria-describedby covers
+            keyboard/screen-reader users regardless of whether disabled tabs
+            use native `disabled` (suppresses `title` in Chromium, drops
+            focus order) or `aria-disabled`. */}
         {TABS.map((t) =>
           t.disabled && t.reason ? (
             <span key={t.key} id={`tab-reason-${t.key}`} className="sr-only">
@@ -536,19 +500,14 @@ export default function MachineDetailPage() {
         </TabsContent>
 
         <TabsContent value="logs" className="mt-4">
-          {/* The sizing chain lives on this inner div, not on TabsContent.
-              LazyLog is virtua-backed and derives its height from its parent,
-              so it collapses to zero rows if any link in the chain does not
-              resolve to a real height — putting the flex column on the panel
-              itself left the viewer rendered but empty. */}
+          {/* The sizing chain lives on this inner div, not TabsContent: LazyLog
+              is virtua-backed and derives height from its parent, so it
+              collapses to zero rows if any link in the chain doesn't resolve
+              to a real height. */}
           <div className="flex h-[70vh] min-h-0 flex-col">
             <LogFilterBar value={logFilters} onChange={setLogFilters} />
             <div className="min-h-0 flex-1">
-              <LogViewer
-                machineId={id}
-                source={SYSTEM_JOURNAL}
-                filters={logFilters}
-              />
+              <LogViewer machineId={id} source={SYSTEM_JOURNAL} filters={logFilters} />
             </div>
           </div>
         </TabsContent>

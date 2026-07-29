@@ -1,9 +1,6 @@
 // The System tab's full inventory: everything the strip doesn't have room
-// for (Task 4 redesign — the strip slimmed to five items after live review
-// found the original nine-item version too crowded). Pure/presentational —
-// no fetching, no local state — so it's a plain function of the same
-// `machine`/`resources`/`memNow` values MachineDetailPage already derives
-// for the strip and the Memory chart.
+// for. Pure/presentational, a plain function of the same `machine`/
+// `resources`/`memNow` values MachineDetailPage already derives.
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@e412/rnui-react";
 import type { MachineDetail } from "../api";
 import { formatBytes, formatDateTime, formatUptime } from "../lib/format";
@@ -12,12 +9,10 @@ import type { latestMem, latestResources } from "../lib/metrics";
 type Row = { label: string; value: string };
 
 /**
- * The card's ONE omission rule, as a function: a nullish or empty value
- * means no row — never a blank or an "undefined" pretending to be a fact.
- * `== null` (loose) is deliberate: these are additive proto fields, so a
- * frontend newer than its server sees `undefined`, not `null`, and strict
- * equality would let it through (this rendered "undefined · undefined
- * cores" live during this slice's own rollout).
+ * The card's ONE omission rule: nullish or empty means no row. `== null`
+ * (loose) on purpose — these are additive proto fields, so a newer
+ * frontend may see `undefined` from an older server; strict equality would
+ * let it through and render a literal "undefined".
  */
 function row(label: string, value: string | null | undefined): Row | null {
   return value == null || value === "" ? null : { label, value };
@@ -57,7 +52,7 @@ export default function SystemCard({
         ? `${formatBytes(swap.used)} / ${formatBytes(swap.total)}`
         : null,
     ),
-    // Identity facts, always present (predate this slice).
+    // Identity facts, always present.
     row("Machine ID", machine.machine_id),
     row("Enrolled", formatDateTime(machine.enrolled_at)),
   ].filter((r): r is Row => r !== null);
@@ -70,9 +65,8 @@ export default function SystemCard({
       </CardHeader>
       <CardContent>
         {/* Bordered surface + the strip's label treatment (SpecStrip.tsx) —
-            mono uppercase muted labels — so this reads as the same family of
-            fact-display as the strip above it, just laid out as rows instead
-            of columns. */}
+            mono uppercase muted labels — so this reads as the same family
+            of fact-display as the strip, just laid out as rows not columns. */}
         <dl className="divide-y divide-border border border-border">
           {rows.map((row) => (
             <div

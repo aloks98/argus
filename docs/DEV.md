@@ -19,7 +19,7 @@ one machine.
 
 ## Build
 ```bash
-npm --prefix frontend ci && npm --prefix frontend run build   # dist/ embedded by the server
+pnpm --dir frontend install --frozen-lockfile && pnpm --dir frontend run build   # dist/ embedded by the server
 cargo build --workspace
 ```
 
@@ -234,7 +234,7 @@ worth knowing if you edit it:
   `--muted-foreground` differs per theme and could not pass contrast in both.
 
 **Overriding an rnui class: match its modifier exactly.** This has bitten twice,
-and neither `tsc` nor `npm run build` can see it — the CSS compiles, it just
+and neither `tsc` nor `pnpm run build` can see it — the CSS compiles, it just
 never wins:
 
 - rnui styles its sidebar button's selected state with Tailwind's *presence*
@@ -912,7 +912,7 @@ the provider's app registration needs **both** as allowed redirect URIs:
 - `http://localhost:8080/auth/callback` — running the server directly
   (`cargo run -p argus-server`), which serves the built `frontend/dist`.
 - `http://localhost:5173/auth/callback` — running the frontend under
-  `npm --prefix frontend run dev` (Vite), which proxies `/api` and `/auth` to
+  `pnpm --dir frontend run dev` (Vite), which proxies `/api` and `/auth` to
   `:8080`.
 
 An unregistered redirect URI fails either the initial authorize redirect or the

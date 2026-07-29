@@ -9,7 +9,6 @@ const HEIGHT = 20;
 
 /** Inline trend for a fleet row. Decorative — the numeric value sits beside it. */
 export default function Sparkline({ values }: { values: number[] }) {
-  // Called before the early return to satisfy the Rules of Hooks.
   const themeVersion = useThemeVersion();
   if (values.length === 0) return <span className="text-muted-foreground">—</span>;
 

@@ -1,22 +1,13 @@
 // Priority + time-window controls, shared by the Logs tab and the per-unit
 // dialog so there is one control and one code path for both journal surfaces.
-import {
-  Select,
-  SelectContent,
-  SelectItem,
-  SelectTrigger,
-  SelectValue,
-} from "@e412/rnui-react";
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@e412/rnui-react";
 import type { LogFilters, LogWindow } from "../api";
 
 /**
- * Syslog severities. Lower is MORE severe: `-p 4` returns 4,3,2,1,0. All eight
- * accepted values (0-7) need an entry here, or a URL/filter carrying a value
- * this list doesn't list (e.g. `?priority=2`) renders a blank Select trigger
- * while the filter is silently still active. `0` is the odd one out: it means
- * UNSET (no `-p` at all), not "emerg only" — nobody wants emerg-only — so it
- * keeps its "all severities" no-filter label rather than gaining a real
- * `emerg` entry.
+ * Syslog severities (0-7, lower = more severe: `-p 4` returns 4,3,2,1,0).
+ * All eight need an entry, or a filter value this list omits renders a
+ * blank Select trigger while still silently active. `0` means UNSET (no
+ * `-p` at all), not "emerg only" — so it keeps its "all severities" label.
  */
 const PRIORITIES: { value: string; label: string }[] = [
   { value: "0", label: "all severities" },
@@ -45,16 +36,13 @@ export default function LogFilterBar({
 }) {
   return (
     <div className="flex items-center gap-2 pb-2">
-      {/* `items` is what makes the closed trigger show the LABEL. Without it
-          base-ui's SelectValue renders the raw value, so the trigger read "5"
-          instead of "notice and worse". A `{value, label}` array is used
-          automatically. */}
+      {/* `items` is what makes the closed trigger show the LABEL, not the raw
+          value ("5" instead of "notice and worse") — base-ui's SelectValue
+          needs the `{value, label}` array to resolve it. */}
       <Select
         items={PRIORITIES}
         value={String(value.priority)}
-        onValueChange={(v: string | null) =>
-          onChange({ ...value, priority: Number(v ?? "0") })
-        }
+        onValueChange={(v: string | null) => onChange({ ...value, priority: Number(v ?? "0") })}
       >
         <SelectTrigger size="sm" className="w-48 font-mono text-xs">
           <SelectValue />

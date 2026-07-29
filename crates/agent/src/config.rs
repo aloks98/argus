@@ -1,17 +1,13 @@
 use anyhow::{Context, Result};
 use std::collections::HashMap;
 
-/// Agent configuration, sourced from environment variables (baked into the
-/// Ignition/cloud-init template alongside the join token and CA cert -- PRD
-/// §5.1) or, via `--config <path>`, from an env-file -- the one-shot
-/// `sudo -n env VAR=... ./argus-agent` recipe the enroll page hands out does
-/// not survive a restart, but a file on disk does.
+/// Agent config, sourced from env vars (baked into the Ignition/cloud-init
+/// template with the join token + CA cert -- PRD §5.1) or, via `--config
+/// <path>`, an env-file -- the `sudo -n env VAR=... ./argus-agent` one-shot
+/// recipe doesn't survive a restart, but a file does.
 ///
-/// **Real environment variables always win.** The file is a fallback source,
-/// consulted only for keys the real environment does not already set -- so
-/// an operator can override a single value at the shell (e.g. to point one
-/// run at a different endpoint) without touching the file. Proven by
-/// [`tests::real_env_var_overrides_the_same_key_in_the_config_file`].
+/// **Real env vars always win** over the same key in the file, letting an
+/// operator override one value at the shell without touching it.
 #[derive(Clone)]
 pub struct Config {
     pub endpoint: String,
@@ -21,25 +17,16 @@ pub struct Config {
 }
 
 impl Config {
-    /// Build from real environment variables only. Unchanged behavior for
-    /// callers that never pass `--config`.
     pub fn from_env() -> Result<Self> {
         Self::from_sources(&HashMap::new())
     }
 
-    /// Build from `argv`: if `--config <path>` is present, parse that file
-    /// and use it as a fallback source (env vars still win per key, see the
-    /// struct doc comment); otherwise this is identical to
-    /// [`Config::from_env`].
+    /// Build from `argv`: `--config <path>` if present, else
+    /// [`Config::from_env`]. Env vars still win per key over the file.
     ///
-    /// A `--config` path that cannot be read is a hard startup error, not a
-    /// silent fallback to bare env vars -- an operator who pointed at a file
-    /// wants that file. Same for a DANGLING `--config` (the flag present with
-    /// no path after it): an operator who typed `--config` and forgot the
-    /// path believes their file is in use, so this must not quietly resolve
-    /// to env-only either -- unlike `argus`'s `--username` flag (whose
-    /// "absent or dangling" is one case because the caller has a safe
-    /// default either way), `--config` has no such default to fall back to.
+    /// An unreadable or DANGLING (no path) `--config` is a hard startup
+    /// error, never a silent fallback to bare env vars -- an operator who
+    /// pointed at a file wants that file.
     pub fn load(args: &[String]) -> Result<Self> {
         match config_file_path(args)? {
             Some(path) => {
@@ -71,11 +58,9 @@ impl Config {
     }
 }
 
-/// Look for `--config <path>` anywhere in the trailing args (mirrors
-/// `argus`'s `--username` flag parsing in `crates/server/src/main.rs`, except
-/// a DANGLING `--config` -- present with nothing after it -- is an error
-/// rather than treated the same as the flag being absent; see
-/// [`Config::load`]'s doc comment for why).
+/// Finds `--config <path>` in the trailing args (mirrors `argus`'s
+/// `--username` parsing), except a DANGLING `--config` is a hard error --
+/// see [`Config::load`].
 fn config_file_path(args: &[String]) -> Result<Option<String>> {
     let mut iter = args.iter();
     while let Some(arg) = iter.next() {
@@ -89,11 +74,9 @@ fn config_file_path(args: &[String]) -> Result<Option<String>> {
     Ok(None)
 }
 
-/// Keys `--config` recognizes. Anything else in the file is ignored (with a
-/// warning) rather than rejected: a hard error on an unknown key would break
-/// the file's other purpose as a systemd `EnvironmentFile=`, which also
-/// tolerates stray keys, and an operator's typo shouldn't stop the agent from
-/// starting on every OTHER key it got right.
+/// Keys `--config` recognizes. Unknown keys are warned-and-ignored, not
+/// rejected: a hard error would break the file's dual use as a systemd
+/// `EnvironmentFile=`, which also tolerates stray keys.
 const KNOWN_KEYS: &[&str] = &[
     argus_common::env::AGENT_ENDPOINT,
     argus_common::env::JOIN_TOKEN,
@@ -101,16 +84,10 @@ const KNOWN_KEYS: &[&str] = &[
     argus_common::env::DATA_DIR,
 ];
 
-/// Parse an `EnvironmentFile=`-compatible env-file: one `KEY=VALUE` per line;
-/// blank lines and `#`-comment lines ignored; split on the FIRST `=` so a
-/// value may itself contain `=`; keys trimmed; a value's surrounding matching
-/// quotes (single OR double) stripped. This is deliberately a subset of
-/// systemd's `EnvironmentFile=` syntax so the same file `--config` reads can
-/// later be dropped in unchanged as a unit's `EnvironmentFile=`.
-///
-/// Keys not in [`KNOWN_KEYS`] are logged via `tracing::warn!` naming the key
-/// (typo detection) and otherwise ignored -- see [`KNOWN_KEYS`]'s doc comment
-/// for why that is a warning and not a hard error.
+/// Parses a subset of systemd's `EnvironmentFile=` syntax (`KEY=VALUE`
+/// lines, `#` comments, quote-stripping) -- deliberately so the same file
+/// `--config` reads can later be dropped in unchanged as a unit's
+/// `EnvironmentFile=`.
 fn parse_env_file(contents: &str) -> HashMap<String, String> {
     let mut vars = HashMap::new();
     for raw_line in contents.lines() {
@@ -134,11 +111,9 @@ fn parse_env_file(contents: &str) -> HashMap<String, String> {
     vars
 }
 
-/// Strip one layer of surrounding quotes from `value` IF the first and last
-/// byte are the same quote character (both `"` or both `'`). Anything else --
-/// no quotes, mismatched quotes, or a single stray quote character -- is
-/// returned unchanged, matching `EnvironmentFile=`'s tolerance of unquoted
-/// values that happen to contain a quote byte.
+/// Strips one layer of matching surrounding quotes; anything else is left
+/// unchanged, matching `EnvironmentFile=`'s tolerance of unquoted values
+/// that contain a quote byte.
 fn strip_matching_quotes(value: &str) -> String {
     let bytes = value.as_bytes();
     if bytes.len() >= 2 {
@@ -155,13 +130,10 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
 
-    // `std::env::var`/`set_var` are process-global, so tests that touch real
-    // env vars must not run concurrently with each other -- otherwise one
-    // test's `set_var` leaks into another's `from_sources` lookup and the
-    // failure is nondeterministic (flaky depending on `cargo test`'s thread
-    // interleaving, not on the code under test). A single mutex serializes
-    // just this module's env-touching tests; every other agent test module is
-    // unaffected.
+    // `std::env::var`/`set_var` are process-global: tests that touch real
+    // env vars must not run concurrently, or one test's `set_var` leaks into
+    // another's lookup, producing flakiness that depends on `cargo test`'s
+    // thread interleaving, not the code under test.
     static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     #[test]
@@ -192,9 +164,8 @@ mod tests {
 
     #[test]
     fn splits_on_the_first_equals_only() {
-        // A join token or endpoint URL can itself contain `=` (e.g. a query
-        // string or base64-ish token); only the FIRST `=` may be the
-        // key/value separator.
+        // A join token/URL can itself contain `=`; only the FIRST `=` is
+        // the separator.
         let vars = parse_env_file("ARGUS_JOIN_TOKEN=abc=def=ghi\n");
         assert_eq!(
             vars.get("ARGUS_JOIN_TOKEN").map(String::as_str),
@@ -225,8 +196,6 @@ mod tests {
 
     #[test]
     fn leaves_mismatched_or_partial_quotes_alone() {
-        // Mismatched quote characters, and a single stray quote byte, are not
-        // a matching pair -- left exactly as written rather than guessed at.
         let vars = parse_env_file(
             "ARGUS_JOIN_TOKEN=\"mismatched'\n\
              ARGUS_CA_CERT=\"\n",
@@ -261,10 +230,8 @@ mod tests {
 
     #[test]
     fn unknown_keys_are_dropped_not_stored() {
-        // The warning itself is only observable via tracing output, which
-        // this unit test does not capture -- but the structural half of "warn
-        // and ignore" (the key never reaches the returned map, so it can
-        // never masquerade as a known field) is exactly what this asserts.
+        // Only the structural half of "warn and ignore" is asserted here --
+        // the warning itself is tracing output, not captured by this test.
         let vars = parse_env_file(
             "ARGUS_AGENT_ENDPOIN=https://typo.example\n\
              ARGUS_JOIN_TOKEN=devtoken\n",
@@ -307,11 +274,8 @@ mod tests {
         );
     }
 
-    /// The fix this test guards: `--config` with nothing after it must be a
-    /// hard error, not silently treated the same as the flag being absent --
-    /// see [`Config::load`]'s doc comment for why that distinction matters
-    /// (an operator who typed `--config` and forgot the path believes their
-    /// file is in use).
+    /// See [`Config::load`] for why a dangling `--config` must be a hard
+    /// error rather than treated as absent.
     #[test]
     fn config_file_path_errors_when_the_flag_is_dangling() {
         let args: Vec<String> = ["argus-agent", "--config"]
@@ -326,10 +290,6 @@ mod tests {
         );
     }
 
-    /// The precedence rule this module exists to guarantee: a real
-    /// environment variable for a key beats a config-file value for the SAME
-    /// key, even when the file also sets it. Serialized on `ENV_LOCK` (see
-    /// its doc comment) since it mutates real process env vars.
     #[test]
     fn real_env_var_overrides_the_same_key_in_the_config_file() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
@@ -353,9 +313,6 @@ mod tests {
         unsafe { std::env::remove_var(key) };
     }
 
-    /// The complementary half of the same precedence rule: when the real
-    /// environment does NOT set a key, the file value is used as the
-    /// fallback rather than the lookup failing outright.
     #[test]
     fn file_value_is_used_when_the_real_env_var_is_absent() {
         let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());

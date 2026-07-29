@@ -1,6 +1,6 @@
 // systemd unit list + start/stop/restart verbs for a single machine. A host
-// reports far more units than containers, so this table leads with failures and
-// carries its own filter — see lib/units.ts for the (pure) ordering rules.
+// reports far more units than containers, so this table leads with
+// failures and carries its own filter (ordering in lib/units.ts).
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import {
@@ -48,10 +48,10 @@ export default function UnitsCard({
   machineId: string;
   units: Unit[];
   /**
-   * Whether this host has journald. Gated separately from the Units tab
-   * itself, which is gated on `systemd`: the two are independent capabilities,
-   * so a host can run systemd with no readable journal — and then every
-   * per-unit Logs link would open a dialog that silently fails.
+   * Whether this host has journald, gated separately from the Units tab
+   * (gated on `systemd`) — a host can run systemd with no readable journal,
+   * and then every per-unit Logs link would open a dialog that silently
+   * fails.
    */
   canReadJournal?: boolean;
 }) {
@@ -76,11 +76,10 @@ export default function UnitsCard({
         </span>
       </div>
 
-      {/* The outcome of the most recent verb, as one status line covering all
-          three cases. Success is stated EXPLICITLY rather than left implicit:
-          the snapshot is agent-pushed on a 15s cadence, so the table usually
-          has not changed yet, and silence after a successful click reads as
-          "nothing happened". */}
+      {/* One status line covering all three verb outcomes. Success is stated
+          EXPLICITLY, not left implicit: the snapshot is agent-pushed on a 15s
+          cadence, so the table usually hasn't changed yet, and silence after
+          a successful click reads as "nothing happened". */}
       {actionError != null && (
         <Alert variant="destructive" className="mb-4">
           <AlertTitle>Action failed</AlertTitle>
@@ -95,10 +94,9 @@ export default function UnitsCard({
         <Alert variant="warning" className="mb-4">
           <AlertTitle>Outcome unconfirmed</AlertTitle>
           <AlertDescription>
-            <span className="font-mono">{action.variables?.unit}</span> was
-            dispatched, but the agent did not report a result in time. It may
-            still be starting or stopping — this table refreshes as new state
-            arrives.
+            <span className="font-mono">{action.variables?.unit}</span> was dispatched, but the
+            agent did not report a result in time. It may still be starting or stopping — this table
+            refreshes as new state arrives.
           </AlertDescription>
         </Alert>
       )}
@@ -106,25 +104,20 @@ export default function UnitsCard({
       {action.isSuccess && action.data.status !== "pending" && (
         <Alert variant="success" className="mb-4">
           <AlertTitle>
-            {action.variables === undefined
-              ? "Done"
-              : `Unit ${VERB_DONE[action.variables.action]}`}
+            {action.variables === undefined ? "Done" : `Unit ${VERB_DONE[action.variables.action]}`}
           </AlertTitle>
           <AlertDescription>
-            <span className="font-mono">{action.variables?.unit}</span> —
-            systemd reported the job completed. The row below updates on the next
-            snapshot.
+            <span className="font-mono">{action.variables?.unit}</span> — systemd reported the job
+            completed. The row below updates on the next snapshot.
           </AlertDescription>
         </Alert>
       )}
 
-      {/* A real `form` rather than a bare div: these two controls are a search,
-          `role="search"` exposes them as a landmark, and the explicit
-          `preventDefault` makes Enter a deliberate no-op instead of an
-          incidental one. Filtering is live on change, so there is nothing to
-          submit — but a text field that silently swallows Enter reads as broken
-          unless the element it sits in says why. Keeping the same flex classes
-          means the layout is unchanged; `form` is a block box like the div was. */}
+      {/* A real `form`, not a bare div: these two controls are a search —
+          `role="search"` exposes them as a landmark, and explicit
+          `preventDefault` makes Enter a deliberate no-op (filtering is live
+          on change) instead of a silently-broken-feeling one. `form` is a
+          block box like the div was, so layout is unchanged. */}
       <form
         role="search"
         className="flex flex-wrap items-center gap-3 pb-2"
@@ -153,14 +146,11 @@ export default function UnitsCard({
         </div>
       </form>
 
-      {/* 129 units is a very tall table, and without a height bound the page
-          takes the scroll — the machine header, tabs and filter all disappear
-          while you're reading rows, and you lose the column headers too.
-          The cap has to go on rnui's OWN `data-slot="table-container"` (its
-          `overflow-x-auto` already makes it the scroll container; a wrapper
-          here would just nest a second one, and `sticky` would then resolve
-          against the inner container and never move). With the height on that
-          element, the header below can stick to it. */}
+      {/* A tall table needs a height bound or the page scrolls, hiding the
+          machine header/tabs/filter and the column headers with it. The cap
+          must go on rnui's OWN `data-slot="table-container"` (already the
+          scroll container via `overflow-x-auto`) — a wrapper here would
+          nest a second scroll container and break `sticky` below. */}
       <div className="border border-border [&>[data-slot=table-container]]:max-h-[65vh]">
         {units.length === 0 ? (
           <EmptyState
@@ -168,10 +158,7 @@ export default function UnitsCard({
             description="This host reported no systemd units (or has no systemd)."
           />
         ) : rows.length === 0 ? (
-          <EmptyState
-            title="No matching units"
-            description="No unit matches the current filter."
-          />
+          <EmptyState title="No matching units" description="No unit matches the current filter." />
         ) : (
           <Table>
             {/* Pinned while the body scrolls — at this row count the column
@@ -180,10 +167,9 @@ export default function UnitsCard({
             <TableHeader className="sticky top-0 z-10 [&_th]:bg-background">
               <TableRow>
                 <TableHead>Name</TableHead>
-                {/* Hidden on phones with the same reasoning as Sub/Description: the
-                    AssetTag's tone already encodes active-vs-failed, and the
-                    ~110px this column costs is exactly what pushed Restart off
-                    a 390px screen (measured). */}
+                {/* Hidden on phones (same reasoning as Sub/Description): tone
+                    already encodes active-vs-failed, and this column's
+                    ~110px is what pushed Restart off a 390px screen. */}
                 <TableHead className="hidden md:table-cell">Active</TableHead>
                 <TableHead className="hidden md:table-cell">Sub</TableHead>
                 <TableHead className="hidden md:table-cell">Description</TableHead>
@@ -193,16 +179,13 @@ export default function UnitsCard({
             <TableBody>
               {rows.map((u) => {
                 const active = u.active_state === "active";
-                const rowBusy =
-                  action.isPending && action.variables?.unit === u.name;
+                const rowBusy = action.isPending && action.variables?.unit === u.name;
                 return (
                   <TableRow key={u.name}>
                     {/* Unit names are unbounded — escaped device names like
                         systemd-fsck@dev-disk-by\x2dpartuuid-….service run ~90
-                        chars and were widening the row until Actions was pushed
-                        out of reach. Cap the tag and truncate; the full name is
-                        the cell's title, and the row is still identifiable
-                        because the escaped tail is the least distinguishing part. */}
+                        chars and pushed Actions out of reach. Cap + truncate;
+                        the full name is the cell's title. */}
                     <TableCell className="font-medium" title={u.name}>
                       <AssetTag
                         tone={unitTone(u.active_state)}
@@ -212,10 +195,7 @@ export default function UnitsCard({
                       </AssetTag>
                     </TableCell>
                     <TableCell className="hidden md:table-cell">
-                      <StatusBadge
-                        tone={unitTone(u.active_state)}
-                        label={u.active_state}
-                      />
+                      <StatusBadge tone={unitTone(u.active_state)} label={u.active_state} />
                     </TableCell>
                     <TableCell className="hidden md:table-cell font-mono text-muted-foreground">
                       {u.sub_state}
@@ -227,19 +207,12 @@ export default function UnitsCard({
                       {u.description}
                     </TableCell>
                     <TableCell className="whitespace-nowrap text-right">
-                      {/* Two rules for this cell:
-                          (1) While a verb runs, ONE loading state for the row —
-                          not a "…" on every button. Which verb is running is the
-                          useful fact, and a unit job can take up to 90s, so this
-                          is on screen a while.
-                          (2) Otherwise all three verbs render in the same order
-                          with the inapplicable ones disabled, rather than
-                          swapping which buttons exist. Buttons then sit at a
-                          fixed position down the column so a click target never
-                          moves between rows, and an unavailable action reads as
-                          unavailable instead of missing. `title` says why — a
-                          disabled control that doesn't explain itself is its own
-                          puzzle. */}
+                      {/* One loading state for the row while a verb runs (not a
+                          spinner per button) — which verb is running is the useful
+                          fact, and a job can take up to 90s. Otherwise all three
+                          verbs render in the same order with inapplicable ones
+                          disabled, not swapped out, so a click target never moves
+                          and `title` explains why a control is disabled. */}
                       {rowBusy ? (
                         <span
                           role="status"
@@ -251,27 +224,28 @@ export default function UnitsCard({
                             : VERB_PROGRESS[action.variables.action]}
                         </span>
                       ) : (
-                        // `ml-auto`, not the cell's `text-right`: ButtonGroup is
-                        // a block-level `flex w-fit`, so text-align never moved
-                        // it and the buttons sat left under a right-aligned
-                        // header. Auto margin is what pushes a fit-width block.
+                        // `ml-auto`, not the cell's `text-right`: ButtonGroup is a
+                        // block-level `flex w-fit`, so text-align doesn't move it —
+                        // auto margin is what pushes a fit-width block right.
                         <ButtonGroup className="ml-auto justify-end">
                           {canReadJournal ? (
                             <Button
                               size="sm"
                               variant="outline"
-                              render={<Link to={`?tab=units&logs=${encodeURIComponent(`journal:${u.name}`)}`} />}
+                              render={
+                                <Link
+                                  to={`?tab=units&logs=${encodeURIComponent(`journal:${u.name}`)}`}
+                                />
+                              }
                               nativeButton={false}
                             >
                               Logs
                             </Button>
                           ) : (
-                            // Rendered as a plain disabled Button rather than a
-                            // Link: `disabled` does nothing to an anchor, so a
-                            // Link here would still navigate and open a dialog
-                            // that cannot load. Matches the Start/Stop buttons
-                            // beside it — shown for consistency, disabled when
-                            // unavailable.
+                            // Disabled Button, not a disabled Link: `disabled` does
+                            // nothing to an anchor, so a Link would still navigate to
+                            // a dialog that can't load. Shown (not hidden) for
+                            // consistency with Start/Stop.
                             <Button
                               size="sm"
                               variant="outline"
@@ -286,9 +260,7 @@ export default function UnitsCard({
                             variant="outline"
                             disabled={active}
                             title={active ? "Already active" : undefined}
-                            onClick={() =>
-                              action.mutate({ unit: u.name, action: "start" })
-                            }
+                            onClick={() => action.mutate({ unit: u.name, action: "start" })}
                           >
                             Start
                           </Button>
@@ -297,18 +269,14 @@ export default function UnitsCard({
                             variant="outline"
                             disabled={!active}
                             title={!active ? "Not running" : undefined}
-                            onClick={() =>
-                              action.mutate({ unit: u.name, action: "stop" })
-                            }
+                            onClick={() => action.mutate({ unit: u.name, action: "stop" })}
                           >
                             Stop
                           </Button>
                           <Button
                             size="sm"
                             variant="outline"
-                            onClick={() =>
-                              action.mutate({ unit: u.name, action: "restart" })
-                            }
+                            onClick={() => action.mutate({ unit: u.name, action: "restart" })}
                           >
                             Restart
                           </Button>

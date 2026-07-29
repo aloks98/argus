@@ -1,21 +1,16 @@
 /**
- * Empty stand-in for echarts.
+ * Empty stand-in for echarts. @e412/rnui-react's barrel imports `echarts/core`
+ * + charts/components/renderers/features and runs a side-effectful
+ * `core.use([...])` at module scope, so Rollup can't tree-shake it out even
+ * unused — ~55% of our bundle. We render with uPlot and no rnui chart
+ * component, so `vite.config.ts` aliases every `echarts*` specifier here.
  *
- * @e412/rnui-react ships one barrel module that does
- * `import * as core from "echarts/core"` + named imports from
- * echarts/{charts,components,renderers,features}, then runs echarts'
- * side-effectful `core.use([...])` registration at module scope. So Rollup
- * cannot tree-shake echarts out even when no chart component is imported — it is
- * ~55% of our bundle. Since we render charts with uPlot and use no rnui chart
- * component, `vite.config.ts` aliases every `echarts*` specifier to this file.
+ * MUST export every name the barrel imports (or Rollup errors on a missing
+ * export); all are safe no-ops since chart components — which would call the
+ * rest — are never rendered.
  *
- * It MUST export every name the barrel imports, or Rollup errors on a missing
- * export. The barrel calls only `use`/`registerTheme`/`init`/`graphic` on the
- * core namespace, and all of these are no-ops because chart components — which
- * would call the rest — are never rendered.
- *
- * Remove this (and the alias) once @e412/rnui-react declares
- * `"sideEffects": false` and moves the registration inside its chart module.
+ * Remove this (and the alias) once rnui declares `"sideEffects": false` and
+ * moves registration inside its chart module.
  */
 
 // echarts/core namespace API — no-ops; nothing draws.

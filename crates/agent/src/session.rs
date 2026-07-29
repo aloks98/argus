@@ -18,47 +18,40 @@ use tokio_stream::StreamExt;
 use tonic::transport::{Certificate, ClientTlsConfig, Endpoint};
 use tonic::Request;
 
-/// A session that stayed up at least this long counts as "stable" -- its
-/// backoff streak resets. Roughly two heartbeat intervals, long enough that a
-/// connect-then-immediately-die flap (rejected cert, `Hello` never sent, etc.)
-/// can never masquerade as a healthy connection.
+/// A session up at least this long counts "stable" and resets the backoff
+/// streak -- roughly two heartbeat intervals, long enough that a
+/// connect-then-immediately-die flap can't masquerade as healthy.
 const STABLE: Duration = Duration::from_secs(30);
 
-/// How long a single `.connect()` may hang before we give up and treat it as
-/// a failed attempt, so a half-open TLS handshake can't stall the loop
-/// forever.
+/// How long a single `.connect()` may hang before it's treated as a failed
+/// attempt, so a half-open TLS handshake can't stall the loop forever.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
-/// Hold the persistent `Session` stream, multiplexing metrics, docker/systemd
-/// state, log tails, PTY, and command results by `stream_id`. Reconnect with
-/// exponential backoff + jitter; re-send a `Hello` snapshot on reconnect so the
-/// fleet view self-heals (PRD §2.5, §5.4).
+/// Holds the persistent `Session` stream, multiplexing metrics, docker/
+/// systemd state, log tails, PTY, and command results by `stream_id`.
+/// Reconnects with backoff + jitter, re-sending `Hello` so the fleet view
+/// self-heals (PRD §2.5, §5.4).
 ///
-/// Under normal operation this never returns: a broken/ended session just
-/// feeds back into the backoff+reconnect loop. It only returns `Err` if `cfg`
-/// or `identity` are unusable in a way no amount of retrying will fix (there
-/// currently is no such path, but the signature stays fallible for that
-/// future case and to match `main`'s `?`-propagation).
+/// Never returns under normal operation -- a broken session just feeds back
+/// into the reconnect loop. `Err` is reserved for a future unusable-`cfg`
+/// path; none exists today.
 pub async fn run(cfg: &Config, identity: Identity) -> Result<()> {
     let docker = DockerClient::connect();
     let mut attempt = 0u32;
     loop {
-        // Re-dialed fresh on every attempt (unlike `docker`, which is dialed
-        // once above): a `zbus::Connection` does not self-heal. If dbus-daemon
-        // restarts, a client dialed before this loop would keep `inner: Some`
-        // while every call quietly errors, so `list_units()` would report an
-        // empty list forever -- rendering in the UI as "nothing is wrong on
-        // this host". Bollard doesn't share this failure mode: it re-dials its
-        // unix socket per request, so `docker` is safe to hold across attempts.
+        // Re-dialed fresh every attempt (unlike `docker`, dialed once above):
+        // a `zbus::Connection` doesn't self-heal. If dbus-daemon restarts, a
+        // client dialed earlier would keep erroring silently, reporting an
+        // empty unit list forever -- "nothing wrong" in the UI. Bollard
+        // re-dials its socket per request, so `docker` doesn't share this.
         let systemd = SystemdClient::connect().await;
         let started = tokio::time::Instant::now();
         let outcome = connect_and_serve(cfg, &identity, &docker, &systemd).await;
         let lasted = started.elapsed();
 
-        // A session that stayed up a while was healthy -> reset. A fast
-        // connect-then-die (or an outright connect failure) grows backoff, so
-        // a broken or rejected agent backs off instead of hammering the
-        // control plane (PRD §2.5).
+        // A session that stayed up a while was healthy -> reset backoff. A
+        // fast connect-then-die grows it instead, so a broken/rejected agent
+        // backs off rather than hammering the control plane (PRD §2.5).
         if should_reset_backoff(outcome.is_ok(), lasted) {
             attempt = 0;
         } else {
@@ -73,19 +66,13 @@ pub async fn run(cfg: &Config, identity: Identity) -> Result<()> {
     }
 }
 
-/// Pure stability decision, factored out so it's testable without any
-/// network or timing flakiness: only a session that both succeeded *and*
-/// lasted at least `STABLE` counts as healthy enough to reset the backoff
-/// streak.
 fn should_reset_backoff(outcome_ok: bool, lasted: Duration) -> bool {
     outcome_ok && lasted >= STABLE
 }
 
-/// Connect once, hold the bidi stream until it ends (cleanly or with an
-/// error), then return so the caller can measure how long it lasted and back
-/// off accordingly. `Ok(())` means the session was established and later
-/// ended cleanly (server closed its side); `Err` means the connect itself
-/// failed or the stream errored.
+/// Connects once, holds the bidi stream until it ends, then returns so the
+/// caller can measure how long it lasted. `Ok(())` = established and later
+/// ended cleanly; `Err` = the connect failed or the stream errored.
 async fn connect_and_serve(
     cfg: &Config,
     identity: &Identity,
@@ -117,34 +104,28 @@ async fn connect_and_serve(
     let inbound_systemd = systemd.clone();
     let sender_systemd = systemd.clone();
 
-    // request_id -> the task running that tail. A tail must be cancellable by
-    // LogTailStop and must not survive the session that requested it, so every
-    // entry is aborted when this function returns.
+    // request_id -> the task running that tail; must be cancellable by
+    // LogTailStop and must not outlive this session (aborted on return).
     let tails: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, tokio::task::AbortHandle>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let inbound_tails = tails.clone();
     let inbound_docker_logs = docker.clone();
 
-    // session_id -> the live PTY for that terminal. Mirrors `tails`: a PTY
-    // must be closeable by PtyClose and must not survive the session that
-    // opened it, so every entry is closed when this function returns.
+    // session_id -> the live PTY; mirrors `tails` (closeable by PtyClose,
+    // must not outlive this session).
     let ptys: std::sync::Arc<
         std::sync::Mutex<std::collections::HashMap<String, crate::pty::PtyHandle>>,
     > = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashMap::new()));
     let inbound_ptys = ptys.clone();
 
-    // Sender task: Hello first (fresh snapshot, re-sent on every reconnect so
-    // the fleet view self-heals), then a Heartbeat on every tick. It normally
-    // exits on its own once `tx` can no longer deliver, but that only happens
-    // once `rx` is dropped -- which requires this function to return first.
-    // So it's also explicitly `.abort()`'d below on every exit path (success,
-    // stream error, or the RPC never opening at all), rather than relying
-    // solely on drop-timing.
+    // Sender task: Hello first (re-sent each reconnect so the fleet view
+    // self-heals), then Heartbeat per tick. It can't exit on its own until
+    // `rx` drops, which needs this fn to return first -- so it's explicitly
+    // `.abort()`'d below on every exit path instead.
     let sender_agent_id = identity.agent_id.clone();
-    // Probed once per session, not per request. Re-reporting on every reconnect
-    // is what lets a host that gained (or lost) a subsystem be reflected without
-    // an agent restart.
+    // Probed once per session; re-probing each reconnect reflects a gained/
+    // lost subsystem without an agent restart.
     let caps = crate::capabilities::probe(systemd, docker).await;
     let sender = tokio::spawn(async move {
         let mut info = match crate::info::gather(env!("CARGO_PKG_VERSION")) {
@@ -155,9 +136,9 @@ async fn connect_and_serve(
             }
         };
         info.capabilities = caps;
-        // Marks field 8 as authoritative. An agent that never sets this reports
-        // `false`, which the control plane stores as NULL and treats as "unknown,
-        // gate nothing" — the correct reading for a pre-capability agent.
+        // Marks the capability set authoritative. An unset agent reports
+        // `false`, which the control plane stores as NULL / "unknown, gate
+        // nothing" -- correct for a pre-capability agent.
         info.capabilities_reported = true;
 
         if tx
@@ -187,11 +168,9 @@ async fn connect_and_serve(
             return;
         }
 
-        // Initial systemd snapshot alongside the Docker one, so the Units tab
-        // populates promptly rather than a full tick later. `None` means
-        // collection failed (no bus, a query error, or a timeout); skip the
-        // send so the control plane keeps whatever snapshot it already has
-        // instead of being told the host has no units at all.
+        // Initial systemd snapshot alongside Docker's, so Units populates
+        // promptly. `None` means collection failed; skip the send rather
+        // than claim "no units" (see `SystemdClient::list_units`).
         if let Some(units) = sender_systemd.list_units().await {
             if tx
                 .send(AgentFrame {
@@ -209,17 +188,15 @@ async fn connect_and_serve(
         let mut ticker = tokio::time::interval(Duration::from_secs(
             argus_common::DEFAULT_HEARTBEAT_SECS as u64,
         ));
-        // If the sender is briefly backpressured (slow send, tokio scheduling
-        // delay, etc.) don't fire a catch-up burst of missed ticks -- just
-        // delay the next one from whenever we actually got back to polling.
+        // If briefly backpressured, don't fire a catch-up burst of missed
+        // ticks -- delay the next one from whenever polling actually resumes.
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         // The first tick fires immediately; the Hello above already covers
         // "just connected," so skip it and wait for the first real interval.
         ticker.tick().await;
 
-        // Lives across ticks (not constructed per-tick) so its CPU-usage
-        // reading is a real delta between samples rather than the unreliable
-        // first-call reading (see metrics.rs's module doc).
+        // Lives across ticks (not per-tick) so CPU-usage is a real delta
+        // between samples, not the unreliable first-call reading (metrics.rs).
         let mut sampler = crate::metrics::Sampler::new();
 
         loop {
@@ -228,9 +205,9 @@ async fn connect_and_serve(
                 .duration_since(std::time::UNIX_EPOCH)
                 .map(|d| d.as_millis() as i64)
                 .unwrap_or(0);
-            // The Heartbeat's uptime is process uptime and is vestigial -- the
-            // server only uses a Heartbeat to refresh last_seen. Real host uptime
-            // ships in MetricsSample.uptime_secs (via sysinfo, see metrics.rs).
+            // Heartbeat's uptime is process uptime, vestigial -- the server
+            // only uses Heartbeat for last_seen. Real host uptime ships in
+            // MetricsSample.uptime_secs.
             let uptime_secs = start.elapsed().as_secs();
 
             if tx
@@ -291,11 +268,10 @@ async fn connect_and_serve(
         }
     });
 
-    // The fallible RPC-open + drain is captured in its own future so that,
-    // whatever happens -- including the `?` on `.session(...).await` erroring
-    // out immediately (e.g. a revoked/expired/mismatched cert: the server
-    // rejects at RPC-open with `Status::unauthenticated`) -- control always
-    // reaches `sender.abort()` below instead of early-returning around it.
+    // Wrapped in its own future so that whatever happens -- including the
+    // `?` on `.session(...).await` erroring immediately (e.g. a rejected
+    // cert) -- control always reaches `sender.abort()` below instead of
+    // early-returning around it.
     let result = async {
         let mut inbound = AgentServiceClient::new(channel)
             .session(Request::new(ReceiverStream::new(rx)))
@@ -375,16 +351,12 @@ async fn connect_and_serve(
                                         )
                                         .await;
                                     });
-                                    // Abort any tail this request_id was already
-                                    // running before overwriting it: a dropped
-                                    // AbortHandle does NOT abort its task, so a
-                                    // displaced tail would otherwise become
-                                    // unreachable by both LogTailStop and the
-                                    // teardown drain and outlive the session --
-                                    // the exact leak the registry exists to
-                                    // prevent. A correct server won't reuse a
-                                    // request_id, but the agent doesn't trust it
-                                    // to (same posture as parse_source).
+                                    // Aborts any tail this request_id already had:
+                                    // a dropped AbortHandle does NOT abort its
+                                    // task, so a displaced tail would leak,
+                                    // unreachable by LogTailStop or teardown. A
+                                    // correct server won't reuse a request_id,
+                                    // but the agent doesn't trust it to.
                                     if let Some(old) = tails
                                         .lock()
                                         .unwrap()
@@ -430,12 +402,11 @@ async fn connect_and_serve(
                                     if let Some(old) =
                                         inbound_ptys.lock().unwrap().insert(req.session_id, handle)
                                     {
-                                        // `close()` blocks the calling thread joining the
-                                        // reader (which can itself be parked in a
-                                        // `blocking_send` if the outbound channel is
-                                        // full -- see pty.rs's teardown doc). Never run
-                                        // that join on an async worker thread; hand it
-                                        // to the blocking pool instead.
+                                        // `close()` blocks joining the reader thread
+                                        // (which can itself be parked in
+                                        // `blocking_send` against a full channel --
+                                        // see pty.rs). Never run that join inline;
+                                        // hand it to the blocking pool.
                                         tokio::task::spawn_blocking(move || old.close());
                                     }
                                 }
@@ -475,9 +446,8 @@ async fn connect_and_serve(
                         }
                         Some(server_frame::Payload::PtyClose(cl)) => {
                             if let Some(h) = inbound_ptys.lock().unwrap().remove(&cl.session_id) {
-                                // See the PtyOpen arm above: `close()` blocks on a
-                                // thread join, so it must not run inline on the
-                                // async event loop.
+                                // See PtyOpen above: `close()` blocks on a thread
+                                // join, so it must not run inline here either.
                                 tokio::task::spawn_blocking(move || h.close());
                             }
                         }
@@ -495,9 +465,8 @@ async fn connect_and_serve(
     }
     .await;
 
-    // The bidi call is done either way (including if it never opened at
-    // all); make sure the heartbeat sender isn't left running into the next
-    // reconnect attempt.
+    // The bidi call is done either way (even if it never opened); make sure
+    // the sender isn't left running into the next reconnect attempt.
     sender.abort();
 
     // A tail belongs to the session that asked for it. Without this an ended
@@ -506,12 +475,9 @@ async fn connect_and_serve(
         handle.abort();
     }
 
-    // A PTY belongs to the session that opened it too. `close()` blocks the
-    // caller joining its reader thread (which can be parked mid-`blocking_send`
-    // against a full outbound channel -- see pty.rs's teardown doc), so each
-    // teardown runs on the blocking pool rather than inline here: this
-    // function is still on the async event loop, and joining synchronously
-    // could wedge it for as long as the stall lasts.
+    // A PTY belongs to the session that opened it. `close()` blocks joining
+    // the reader thread (see PtyOpen arm above / pty.rs), so teardown runs
+    // on the blocking pool, not inline on this async fn.
     for (_, handle) in ptys.lock().unwrap().drain() {
         tokio::task::spawn_blocking(move || handle.close());
     }
@@ -519,9 +485,7 @@ async fn connect_and_serve(
     result
 }
 
-/// Exponential backoff with a 30s cap and +/-20% jitter, keyed by connection
-/// attempt number. Pure and deterministic-shaped (modulo jitter) so it's
-/// testable without any network.
+/// Exponential backoff: 500ms * 2^attempt, capped at 30s, +/-20% jitter.
 fn next_backoff(attempt: u32) -> Duration {
     let capped = Duration::from_millis(500)
         .saturating_mul(2u32.saturating_pow(attempt.min(6)))
@@ -573,9 +537,8 @@ mod tests {
 
     #[test]
     fn should_not_reset_backoff_on_fast_ok_flap() {
-        // Connects fine but dies almost immediately (e.g. the sender's
-        // `info::gather()` fails, so `Hello` is never sent and the server
-        // closes the session cleanly) -- must NOT reset, or backoff never
+        // Connects fine but dies almost immediately (e.g. `info::gather()`
+        // fails, so `Hello` never sends) -- must NOT reset, or backoff never
         // grows.
         assert!(!should_reset_backoff(true, Duration::from_millis(200)));
     }

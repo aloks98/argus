@@ -109,9 +109,8 @@ export default function TimeSeriesChart({
    *  in the tooltip while the axis stays plain "8.3 GB". */
   tooltipFormat?: (v: number) => string;
   /** When set, a second y-axis renders on the RIGHT relabeling the SAME
-   *  scale — e.g. bytes on the left, the equivalent percentage on the
-   *  right. Only meaningful when the mapping is a constant factor (memory
-   *  against a fixed total); it is a relabeling, not a second scale. */
+   *  scale (e.g. bytes on the left, percentage on the right) — a relabeling,
+   *  not a second scale, so only meaningful for a constant-factor mapping. */
   rightAxisFormat?: (v: number) => string;
 }) {
   const box = useRef<HTMLDivElement>(null);
@@ -157,9 +156,9 @@ export default function TimeSeriesChart({
           ticks: { stroke: axis },
           font: '11px "IBM Plex Mono", monospace',
           // The y labels go through the SAME formatter as the tooltip, so a
-          // bytes chart reads "150 KB/s", not a raw "150,000" (user-reported:
-          // raw values both overflowed the default 50px gutter — clipping to
-          // "00,000" — and meant nothing without units).
+          // bytes chart reads "150 KB/s", not a raw "150,000" — raw values
+          // overflowed the default 50px gutter (clipping to "00,000") and
+          // meant nothing without units.
           values: (_u: uPlot, vals: number[]) => vals.map(format),
           // Size the gutter to the longest label actually rendered instead
           // of uPlot's fixed default: formatted rates ("150.0 KB/s") are far
@@ -196,6 +195,13 @@ export default function TimeSeriesChart({
         ...series.map((s) => ({ label: s.name, stroke: cssVar(s.colorVar, "#F5F5F5"), width: 2 })),
       ],
     }),
+    // exhaustive-deps wants `axis`/`label`/`series` added too, but both
+    // omissions are deliberate: `axis`/`label` only change when the theme's
+    // CSS vars change, which is exactly what bumps `themeVersion` (already
+    // covered); `series` is represented by `seriesKey` above instead (see
+    // that comment) — the raw array would reintroduce the identity churn
+    // `seriesKey` exists to avoid.
+    // oxlint-disable-next-line react-hooks/exhaustive-deps
     [width, height, themeVersion, seriesKey, format, tooltipFormat, rightAxisFormat],
   );
 

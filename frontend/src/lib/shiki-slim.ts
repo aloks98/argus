@@ -1,29 +1,21 @@
-// Drop-in replacement for the top-level `shiki` package, wired in via a
-// vite alias (see vite.config.ts). rnui's CodeBlock imports `codeToHtml`
-// from bare `shiki`, whose bundle auto-registers EVERY grammar and theme —
-// +70 kB gzip on the main chunk and ~12 MB of lazy chunks in dist/, all of
-// it embedded into the `argus` binary by rust-embed. Same treatment echarts
-// got (stubbed to just what's used): this registers only what Argus renders —
-// bash, plus the two themes rnui's CodeBlock defaults to.
+// Alias for bare `shiki` (see vite.config.ts): the real package
+// auto-registers every grammar/theme (~12 MB, embedded into the argus
+// binary via rust-embed). This registers only bash + the two used themes.
 //
-// Everything is imported DYNAMICALLY inside the first call: the only
-// CodeBlock in the app lives in the enroll page's token-minted dialog, so
-// the grammar/engine/themes belong in a lazy chunk fetched on first render,
-// not in the main bundle every page pays for.
+// Imports are DYNAMIC inside the first call, not top-level: the one
+// CodeBlock in the app (enroll page's token dialog) should cost a lazy
+// chunk on first render, not weight on every page's main bundle.
 //
-// Adding a CodeBlock in a NEW language? Register its grammar here, or the
-// block renders as plain text (shiki treats unknown/`text` as plain rather
-// than throwing — so this fails soft, visibly, not with a crash).
+// New language in a CodeBlock? Register its grammar here — unregistered
+// languages render as plain text (shiki fails soft, not with a throw).
 import type { HighlighterCore } from "shiki/core";
 
 let highlighter: Promise<HighlighterCore> | undefined;
 
 function load(): Promise<HighlighterCore> {
-  // On failure the cache is CLEARED before rethrowing: a transient chunk-load
-  // error (dev-server restart, flaky network) must not pin every later
-  // CodeBlock to a cached rejection — CodeBlock's catch renders plain text
-  // with no error surfaced, so a permanently poisoned cache would look
-  // exactly like "highlighting silently stopped working".
+  // Clear the cache before rethrowing: a transient failure (e.g. chunk-load)
+  // must not pin every later call to a cached rejection — CodeBlock hides
+  // errors, so that would look identical to "highlighting silently broke".
   highlighter ??= build().catch((err: unknown) => {
     highlighter = undefined;
     throw err;

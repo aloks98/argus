@@ -38,8 +38,8 @@ docs/PRD.md     the design of record
 ## Build & run
 ```bash
 # Frontend must be built BEFORE the server (rust-embed embeds frontend/dist):
-npm --prefix frontend ci
-npm --prefix frontend run build
+pnpm --dir frontend install --frozen-lockfile
+pnpm --dir frontend run build
 
 cargo check --workspace         # or: cargo build --release
 cargo run -p argus-server        # needs Postgres; see env vars below
