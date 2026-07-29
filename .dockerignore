@@ -15,3 +15,9 @@ docs/
 # excluded here so local builds match CI behavior. Belt-and-suspenders with
 # Dockerfile.server's `ENV SQLX_OFFLINE=true`, which is the real fix.
 .cargo/
+# Mirrors .gitignore's "Local env / secrets" section: these filenames are
+# where secrets land by convention in this repo, and `COPY . .` would bake
+# any that exist on the build host into cached intermediate layers.
+.env
+.env.*
+*.local
