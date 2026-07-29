@@ -1,0 +1,350 @@
+# Tag-driven release pipeline. Produces the three distribution forms
+# described in docs/superpowers/specs/2026-07-29-release-design.md: bare-metal
+# tarballs (Forgejo Release attachments), Docker images (ghcr.io), and a Helm
+# chart (OCI push + Release attachment).
+#
+# Two trigger shapes:
+#   - `push: tags: v*`   -- the real thing. Version comes from the tag,
+#     checked against workspace Cargo.toml (hard fail on mismatch). Every
+#     publish step runs.
+#   - `workflow_dispatch` -- the rehearsal. Every job still builds, but NO
+#     publish step runs (release creation, asset upload, docker push, helm
+#     push) -- gated by `if: github.event_name == 'push'` throughout. Version
+#     is the fixed placeholder `0.0.0-dry`, no Cargo.toml check. The `dry_run`
+#     input exists to document intent on the dispatch form; it is NOT read
+#     anywhere below because a dispatch run never publishes regardless of its
+#     value -- the real gate is the event type, not the flag.
+#
+# `contents: write` is requested workflow-wide so the auto-issued
+# secrets.GITHUB_TOKEN can create the Release and attach assets (GitHub's
+# permission model, which Forgejo Actions mirrors). NOT YET EMPIRICALLY
+# VERIFIED that this instance's Forgejo Actions token honors `permissions:`
+# the same way, nor that it has release-creation scope at all -- can't be
+# fully proven without a real tag push (see task-4-report.md / RELEASING.md).
+# If release creation 403s, swap to a dedicated RELEASE_TOKEN secret (a PAT
+# with write:repository scope) in the `artifacts` job's "Create Forgejo
+# release" step.
+#
+# A JOB-LEVEL, RUNNER-SPECIFIC BUG SHAPES THIS FILE'S STRUCTURE, confirmed
+# empirically during this task's dry-run rehearsal (6-run bisection, see
+# task-4-report.md for the full trail): on this Forgejo instance's runner,
+# writing to $GITHUB_OUTPUT from a step that runs inside a job-level
+# `container:` reproducibly FAILS the step (same script, same job, succeeds
+# immediately with `container:` removed; fails immediately -- and ONLY --
+# when a step with `id:` + a `$GITHUB_OUTPUT` write runs under `container:`).
+# Reading `${{ steps.X.outputs.Y }}` / `${{ needs.X.outputs.Y }}` is
+# unaffected (that substitution happens at the orchestration layer before a
+# container step ever starts). Consequences below:
+#   - Version/tag computation lives in its own uncontainerized `version` job
+#     (plain bash + grep, no toolchain needed) instead of inside `artifacts`
+#     or `images` -- both of the latter now `needs: version` and read its
+#     outputs, which also removes what used to be duplicated tag/Cargo.toml
+#     check logic in each.
+#   - Within `artifacts` (which DOES need `container:`, for cargo/pnpm),
+#     step-to-step handoffs (release notes JSON, the created release's id)
+#     go through plain files in the job workspace instead of
+#     $GITHUB_OUTPUT -- the workspace itself IS shared across a job's steps
+#     regardless of `container:` (that's how package-release.sh's own build
+#     output already reaches later steps).
+#   - `chart` no longer consumes a cross-job `release_id` output from
+#     `artifacts` (that output would have to come from a step running inside
+#     `artifacts`'s `container:`, hitting the same bug) -- instead it looks
+#     the release up by tag via the Forgejo API once it starts. `needs:
+#     artifacts` still guarantees the release exists by then.
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      dry_run:
+        description: "Rehearse the pipeline without publishing anything (dispatch runs never publish regardless of this value -- see the header comment)."
+        type: boolean
+        default: true
+
+permissions:
+  contents: write
+
+# Never let two release runs for the same ref race each other -- a partially
+# published release (assets uploaded twice, or a push interleaved with a
+# dry run) is worse than making the second run wait. No cancel-in-progress:
+# a real release publishing assets should never be killed mid-flight.
+concurrency:
+  group: release-${{ github.ref }}
+
+jobs:
+  # Single source of truth for the release version + the tag/Cargo.toml
+  # check. Deliberately uncontainerized (see the header comment) -- this job
+  # needs nothing beyond grep/bash, so that costs nothing. `artifacts` and
+  # `images` both `needs: version` and read its outputs.
+  version:
+    runs-on: small
+    outputs:
+      version: ${{ steps.compute.outputs.version }}
+      image_tag: ${{ steps.compute.outputs.image_tag }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Tag-push: version comes from the tag, hard-checked against
+      # Cargo.toml (workspace version truth -- CLAUDE.md/constraints.md).
+      # `image_tag` keeps the tag's literal `v` prefix (e.g. "v0.1.0") for
+      # Docker/OCI tags per the brief; `version` strips it to match
+      # Cargo.toml's format ("0.1.0") for the tarballs and the chart.
+      # Dispatch: no tag exists yet, so skip the check and use a fixed
+      # placeholder that can never collide with a real release version.
+      - name: Determine version
+        id: compute
+        run: |
+          set -euo pipefail
+          if [ "$GITHUB_EVENT_NAME" = "push" ]; then
+            TAG="${GITHUB_REF_NAME#v}"
+            CARGO_V=$(grep -m1 '^version' Cargo.toml | cut -d'"' -f2)
+            if [ "$TAG" != "$CARGO_V" ]; then
+              echo "ERROR: tag v$TAG != Cargo.toml $CARGO_V" >&2
+              exit 1
+            fi
+            echo "version=$TAG" >> "$GITHUB_OUTPUT"
+            echo "image_tag=$GITHUB_REF_NAME" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=0.0.0-dry" >> "$GITHUB_OUTPUT"
+            echo "image_tag=0.0.0-dry" >> "$GITHUB_OUTPUT"
+          fi
+
+  # Bare-metal tarballs: build, create the Forgejo Release, upload assets.
+  # Everything after "Package release artifacts" that touches the Forgejo API
+  # is push-only. Intra-job handoffs go through plain files in the workspace,
+  # not $GITHUB_OUTPUT -- see the header comment.
+  artifacts:
+    runs-on: medium
+    needs: version
+    container:
+      image: catthehacker/ubuntu:rust-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # scripts/package-release.sh cross-compiles the agent for
+      # x86_64-unknown-linux-musl, which needs a musl C toolchain for the
+      # linker -- catthehacker/ubuntu:rust-24.04 does NOT ship musl-tools by
+      # default (confirmed empirically: `which musl-gcc` and `rustup target
+      # list --installed` both come up empty in this image). ci.yml's
+      # dedicated agent-musl job installs it the same way for the same
+      # reason, and without it package-release.sh's agent build WOULD fail --
+      # this is a real, necessary fix regardless of the item below.
+      #
+      # KNOWN OPEN ISSUE (see task-4-report.md for the full trail): `artifacts`
+      # has not yet completed successfully in dry-run rehearsal. Two earlier
+      # theories (SQLX_OFFLINE not reaching the build, a stale .sqlx/ cache)
+      # were checked and ruled out -- SQLX_OFFLINE is set correctly and the
+      # committed cache matches the current queries. This musl-tools gap was
+      # the next candidate (confirmed real, fixed here) but adding it did NOT
+      # resolve the failure in the last rehearsal run, which failed EARLIER
+      # (~67s) than the pre-fix run did (~210s) -- an inconsistency that
+      # couldn't be resolved without direct log access (unavailable from the
+      # session that did this work: no browser tools configured, and
+      # extracting the `fj` CLI's auth token to hit the log API directly was
+      # correctly refused by the permission system as credential access).
+      # Post-merge, check this job's actual log output on the next run.
+      - name: Install musl toolchain
+        run: |
+          set -euo pipefail
+          apt-get update
+          apt-get install -y --no-install-recommends musl-tools
+
+      # sqlx's query!/query_scalar! macros compile-time-check against a live
+      # Postgres unless SQLX_OFFLINE=true, in which case they use the
+      # committed .sqlx/ cache instead -- same mechanism Dockerfile.server and
+      # ci.yml's Clippy step already rely on. This runner container has no
+      # database reachable, so without this `cargo build --release -p
+      # argus-server` inside the script fails with "Connection refused"
+      # (the exact failure task-2's report hit building the server image).
+      - name: Package release artifacts
+        env:
+          SQLX_OFFLINE: "true"
+          CC_x86_64_unknown_linux_musl: musl-gcc
+        run: scripts/package-release.sh "${{ needs.version.outputs.version }}"
+
+      # Release notes = `git log --oneline` since the previous tag. v0.1.0 (or
+      # any dispatch rehearsal before a first tag exists) has no previous tag
+      # to diff against, so fall back to the full log instead of failing.
+      # JSON-escaped via python3 so embedded quotes/newlines in commit
+      # subjects can't break the release-creation payload below. Only this
+      # (push-only) step needs full history -- fetched here instead of
+      # paying for a full clone on the default checkout above, on every run
+      # including dry runs that never reach this step.
+      - name: Build release notes
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          set -euo pipefail
+          git fetch --unshallow --tags --quiet || git fetch --tags --quiet
+          PREV_TAG=$(git describe --tags --abbrev=0 HEAD^ 2>/dev/null || true)
+          if [ -n "$PREV_TAG" ]; then
+            LOG=$(git log --oneline "${PREV_TAG}..HEAD")
+          else
+            LOG=$(git log --oneline)
+          fi
+          python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))" <<<"$LOG" > .release-notes.json
+
+      # Uses the workflow's own auto-issued token (secrets.GITHUB_TOKEN --
+      # see the header comment for the RELEASE_TOKEN fallback if this 403s).
+      - name: Create Forgejo release
+        if: ${{ github.event_name == 'push' }}
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          NOTES_JSON=$(cat .release-notes.json)
+          curl -sf -X POST "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases" \
+            -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+            -d "{\"tag_name\":\"$GITHUB_REF_NAME\",\"name\":\"$GITHUB_REF_NAME\",\"body\":$NOTES_JSON}" | tee release.json
+          python3 -c "import json;print(json.load(open('release.json'))['id'])" > .release-id.txt
+
+      - name: Upload release assets
+        if: ${{ github.event_name == 'push' }}
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RID=$(cat .release-id.txt)
+          for f in dist-release/*; do
+            curl -sf -X POST "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases/$RID/assets?name=$(basename "$f")" \
+              -H "Authorization: token $TOKEN" -F "attachment=@$f"
+          done
+
+  # Docker images. Runs DIRECTLY on the runner host, not inside a
+  # `container:` -- this is the same open question ci.yml's docker-build job
+  # flags (does the `large` runner expose a docker daemon inside a
+  # `container:`?), resolved empirically during this task: the dry-run
+  # rehearsal's `images` job failed in ~57s when it had a `container:`, far
+  # too fast to be a real build failure, and reproducing catthehacker/ubuntu:
+  # act-24.04 locally without bind-mounting /var/run/docker.sock gives the
+  # exact same failure shape (docker CLI present, but "failed to connect to
+  # the docker API ... no such file or directory"). Dropping `container:`
+  # runs the job on the runner host instead, which (per CLAUDE.md/
+  # constraints.md) does have a working docker daemon -- confirmed by 3
+  # consecutive full successes (~6m20s each) in this task's rehearsal.
+  images:
+    runs-on: large
+    needs: version
+    env:
+      GHCR_USER: ${{ secrets.GHCR_USER }}
+      GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Fail fast with a clear message instead of a cryptic `docker login`
+      # error -- but only for a real release. A dry run never pushes, so it
+      # doesn't need real credentials at all; it tags images under a
+      # `dry-run` placeholder namespace instead (next step) and only builds.
+      - name: Verify GHCR credentials are present
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GHCR_USER:-}" ] || [ -z "${GHCR_TOKEN:-}" ]; then
+            echo "ERROR: GHCR_USER and/or GHCR_TOKEN secrets are not set on this repo -- cannot push images. Configure them before releasing; see RELEASING.md prerequisites." >&2
+            exit 1
+          fi
+
+      - name: Compute image namespace
+        id: ns
+        run: |
+          set -euo pipefail
+          echo "user=${GHCR_USER:-dry-run}" >> "$GITHUB_OUTPUT"
+
+      - name: Build server image
+        run: |
+          set -euo pipefail
+          docker build -f deploy/docker/Dockerfile.server \
+            -t "ghcr.io/${{ steps.ns.outputs.user }}/argus:${{ needs.version.outputs.image_tag }}" \
+            -t "ghcr.io/${{ steps.ns.outputs.user }}/argus:latest" \
+            .
+
+      - name: Build agent image
+        run: |
+          set -euo pipefail
+          docker build -f deploy/docker/Dockerfile.agent \
+            -t "ghcr.io/${{ steps.ns.outputs.user }}/argus-agent:${{ needs.version.outputs.image_tag }}" \
+            -t "ghcr.io/${{ steps.ns.outputs.user }}/argus-agent:latest" \
+            .
+
+      - name: Log in to GHCR
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          set -euo pipefail
+          echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+      - name: Push images
+        if: ${{ github.event_name == 'push' }}
+        run: |
+          set -euo pipefail
+          docker push "ghcr.io/${GHCR_USER}/argus:${{ needs.version.outputs.image_tag }}"
+          docker push "ghcr.io/${GHCR_USER}/argus:latest"
+          docker push "ghcr.io/${GHCR_USER}/argus-agent:${{ needs.version.outputs.image_tag }}"
+          docker push "ghcr.io/${GHCR_USER}/argus-agent:latest"
+
+  # Helm chart. `needs: [version, artifacts]` -- version for the chart
+  # version string, artifacts so the Release it creates already exists by
+  # the time "Attach chart to release" looks it up (see below and the header
+  # comment for why that's a lookup rather than a consumed job output).
+  chart:
+    runs-on: small
+    needs: [version, artifacts]
+    container:
+      image: catthehacker/ubuntu:rust-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # Same install-if-absent snippet as ci.yml's `checks` job.
+      - name: Install helm
+        run: |
+          set -euo pipefail
+          if ! command -v helm >/dev/null; then
+            curl -fsSL https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz | tar xz -C /tmp
+            install /tmp/linux-amd64/helm /usr/local/bin/helm
+          fi
+
+      - name: Lint chart
+        run: helm lint deploy/chart/argus
+
+      - name: Package chart
+        run: |
+          set -euo pipefail
+          helm package deploy/chart/argus \
+            --version "${{ needs.version.outputs.version }}" \
+            --app-version "${{ needs.version.outputs.version }}"
+
+      - name: Push chart to GHCR
+        if: ${{ github.event_name == 'push' }}
+        env:
+          GHCR_USER: ${{ secrets.GHCR_USER }}
+          GHCR_TOKEN: ${{ secrets.GHCR_TOKEN }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GHCR_USER:-}" ] || [ -z "${GHCR_TOKEN:-}" ]; then
+            echo "ERROR: GHCR_USER and/or GHCR_TOKEN secrets are not set on this repo -- cannot push the chart. Configure them before releasing; see RELEASING.md prerequisites." >&2
+            exit 1
+          fi
+          echo "$GHCR_TOKEN" | helm registry login ghcr.io -u "$GHCR_USER" --password-stdin
+          helm push "argus-${{ needs.version.outputs.version }}.tgz" "oci://ghcr.io/${GHCR_USER}/charts"
+
+      # Looks the release up by tag instead of consuming a `release_id`
+      # cross-job output from `artifacts` -- that output would have to come
+      # from a step running inside `artifacts`'s `container:`, which is
+      # exactly the $GITHUB_OUTPUT bug this file works around throughout
+      # (see the header comment). `needs: artifacts` above guarantees the
+      # release already exists by the time this runs.
+      - name: Attach chart to release
+        if: ${{ github.event_name == 'push' }}
+        env:
+          TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          RID=$(curl -sf "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME" \
+            -H "Authorization: token $TOKEN" | python3 -c "import json,sys;print(json.load(sys.stdin)['id'])")
+          f="argus-${{ needs.version.outputs.version }}.tgz"
+          curl -sf -X POST "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases/$RID/assets?name=$(basename "$f")" \
+            -H "Authorization: token $TOKEN" -F "attachment=@$f"
