@@ -3683,9 +3683,8 @@ mod tests {
         Ok(())
     }
 
-    /// Three PATCH calls, each mutating exactly one thing, each producing its
-    /// own `machine.update` audit row: tags-only leaves `display_name`
-    /// untouched; setting `display_name` then clearing it with an explicit
+    /// Three PATCH calls, each mutating one thing: tags-only leaves
+    /// `display_name` untouched; setting then clearing it with explicit
     /// `null` proves the double-`Option` distinguishes "absent" from "clear".
     #[sqlx::test]
     async fn patch_machine_partial_update_and_audit(pool: PgPool) -> anyhow::Result<()> {
@@ -3749,11 +3748,9 @@ mod tests {
         Ok(())
     }
 
-    /// Every rejection class (bad tag, over-length display name, empty body)
-    /// returns 400 and writes nothing -- neither to `machines` nor
-    /// `audit_log`. An unknown machine id is a well-formed request that
-    /// simply doesn't match anything, so it 404s instead of 400 and likewise
-    /// audits nothing.
+    /// Every rejection class (bad tag, over-length name, empty body) 400s
+    /// and writes nothing. An unknown machine id is well-formed but matches
+    /// nothing, so it 404s instead of 400 -- and likewise audits nothing.
     #[sqlx::test]
     async fn patch_machine_rejects_bad_input(pool: PgPool) -> anyhow::Result<()> {
         let id: Uuid = sqlx::query_scalar!(
@@ -3800,17 +3797,14 @@ mod tests {
     }
 
     /// Fail-closed proof: forces the `machine.update` audit write to fail
-    /// while the machine row it would attach to genuinely exists, then
-    /// asserts the mutation did not survive that failure.
+    /// while the row it attaches to genuinely exists, then asserts the
+    /// mutation didn't survive.
     ///
-    /// Can't reuse `verb_fails_closed_when_the_dispatched_audit_write_fails`'s
-    /// FK-violation trick verbatim: `patch_machine` uses the SAME `id` for
-    /// both the update and the audit row, so reaching the audit write at all
-    /// requires the update to have matched a real row first -- that FK can
-    /// never be what fails here. Instead, a `BEFORE INSERT` trigger scoped to
-    /// this test's own isolated database rejects any `audit_log` insert whose
-    /// `action = 'machine.update'`, the same *class* of injected DB-level
-    /// failure adapted to an ordering where the FK trick doesn't apply.
+    /// Can't reuse the FK-violation trick (`patch_machine` uses the SAME id
+    /// for both the update and the audit row, so reaching the audit write
+    /// requires a real row match -- that FK can never fail here). Instead, a
+    /// `BEFORE INSERT` trigger rejects any `machine.update` audit insert --
+    /// the same class of injected failure, adapted to this ordering.
     #[sqlx::test]
     async fn patch_machine_rolls_back_the_update_when_the_audit_write_fails(
         pool: PgPool,
