@@ -1,0 +1,47 @@
+# Argus Helm chart configuration. See docs/PRD.md §13 for the Kubernetes
+# topology this maps to, and RELEASING.md for how `version`/`appVersion` get
+# stamped at release-package time.
+
+image:
+  repository: ghcr.io/CHANGEME/argus
+  # Empty defaults to the chart's appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+# All runtime config arrives via an EXISTING Secret (never templated from
+# values -- secrets in Helm release history are forever). Create it with:
+#   kubectl create secret generic argus-env \
+#     --from-literal=ARGUS_DATABASE_URL=postgres://... \
+#     --from-literal=ARGUS_FIELD_KEY="$(openssl rand -base64 32)" \
+#     --from-literal=ARGUS_OIDC_ISSUER=... (etc.)
+# See deploy/packaging/argus.env.example for the full variable reference
+# (ARGUS_PUBLIC_URL is also required; OIDC vars are optional as a group).
+existingSecret: argus-env
+
+http:
+  # Browser-facing HTTP surface: health checks, the embedded UI, the OIDC
+  # callback. Fronted by Traefik/Ingress per `ingress.mode` below.
+  port: 8080
+
+grpc:
+  port: 9443
+  # MetalLB-pinned address for the agent mTLS endpoint. mTLS terminates in
+  # the pod; putting an HTTP proxy in front breaks client-cert verification
+  # (PRD 2.4) -- this stays a LoadBalancer. Leave empty to let the
+  # LoadBalancer controller assign an address (agents then need
+  # re-enrolling if it later changes -- pinning is recommended for any real
+  # fleet).
+  loadBalancerIP: ""
+
+ingress:
+  mode: none         # none | traefik | ingress
+  host: argus.example.com
+  # traefik mode also renders a cert-manager Certificate:
+  certManager:
+    issuerRef:
+      name: letsencrypt
+      kind: ClusterIssuer
+
+resources: {}
+nodeSelector: {}
+tolerations: []

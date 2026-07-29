@@ -1,0 +1,24 @@
+{{- /*
+Plain networking.k8s.io/v1 Ingress for clusters without Traefik -- bring
+your own controller and TLS (annotate/override as your controller expects).
+*/ -}}
+{{- if eq .Values.ingress.mode "ingress" }}
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: {{ include "argus.fullname" . }}
+  labels:
+    {{- include "argus.labels" . | nindent 4 }}
+spec:
+  rules:
+    - host: {{ .Values.ingress.host }}
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: {{ include "argus.fullname" . }}-http
+                port:
+                  number: {{ .Values.http.port }}
+{{- end }}

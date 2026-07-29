@@ -1,0 +1,55 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: {{ include "argus.fullname" . }}
+  labels:
+    {{- include "argus.labels" . | nindent 4 }}
+spec:
+  # Control plane is stateless (DB is external, PRD §13) -- one replica.
+  # `Recreate` (not RollingUpdate) so a rollout never has two pods holding
+  # the single agent-facing mTLS Session state / LoadBalancer IP at once.
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      {{- include "argus.selectorLabels" . | nindent 6 }}
+  template:
+    metadata:
+      labels:
+        {{- include "argus.labels" . | nindent 8 }}
+    spec:
+      containers:
+        - name: argus
+          image: {{ include "argus.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # All runtime config (DB DSN, field key, OIDC, ...) comes from an
+          # existing Secret -- never templated from values. See values.yaml.
+          envFrom:
+            - secretRef:
+                name: {{ .Values.existingSecret }}
+          ports:
+            - name: http
+              containerPort: {{ .Values.http.port }}
+              protocol: TCP
+            - name: grpc
+              containerPort: {{ .Values.grpc.port }}
+              protocol: TCP
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: http
+          readinessProbe:
+            httpGet:
+              path: /readyz
+              port: http
+          resources:
+            {{- toYaml .Values.resources | nindent 12 }}
+      {{- with .Values.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

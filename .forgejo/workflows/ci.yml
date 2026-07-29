@@ -39,6 +39,17 @@ jobs:
       - name: Rustfmt
         run: cargo fmt --all --check
 
+      - name: Helm lint + template
+        run: |
+          if ! command -v helm >/dev/null; then
+            curl -fsSL https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz | tar xz -C /tmp
+            install /tmp/linux-amd64/helm /usr/local/bin/helm
+          fi
+          helm lint deploy/chart/argus
+          helm template argus deploy/chart/argus > /dev/null
+          helm template argus deploy/chart/argus --set ingress.mode=traefik --set ingress.host=x.test > /dev/null
+          helm template argus deploy/chart/argus --set ingress.mode=ingress --set ingress.host=x.test > /dev/null
+
   build-test:
     runs-on: medium
     container:

@@ -1,0 +1,20 @@
+{{- /*
+cert-manager Certificate for the browser TLS leaf, consumed by the
+IngressRoute above via the same secretName. Only rendered in traefik mode --
+plain `ingress` mode expects the operator's own controller/TLS setup.
+*/ -}}
+{{- if eq .Values.ingress.mode "traefik" }}
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: {{ include "argus.fullname" . }}-tls
+  labels:
+    {{- include "argus.labels" . | nindent 4 }}
+spec:
+  secretName: {{ include "argus.fullname" . }}-tls
+  dnsNames:
+    - {{ .Values.ingress.host }}
+  issuerRef:
+    name: {{ .Values.ingress.certManager.issuerRef.name }}
+    kind: {{ .Values.ingress.certManager.issuerRef.kind }}
+{{- end }}
