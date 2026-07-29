@@ -1,7 +1,4 @@
 //! Log tailing: journal via a `journalctl` subprocess, Docker via bollard.
-//! Parsing, validation and record mapping are pure functions so they are
-//! testable without a subprocess or a daemon — same shape as `docker.rs`
-//! and `systemd.rs`.
 
 use argus_proto::v1::{agent_frame, AgentFrame, LogChunk};
 use serde::Serialize;
@@ -11,9 +8,8 @@ use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::mpsc;
 
-/// Where a tail reads from. Parsed from the wire `source` string, which is
-/// browser-supplied — see `parse_source` for why validation lives here as well
-/// as on the server.
+/// Where a tail reads from (parsed from the browser-supplied wire `source`
+/// string; see `parse_source`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
     /// One systemd unit: `journalctl -u <unit>`.
@@ -40,9 +36,9 @@ pub struct LogLine {
     pub msg: String,
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub marker: bool,
-    /// journald's opaque `__CURSOR` — the exact backward-paging anchor. `None`
-    /// for docker lines and markers, which are never a paging anchor. Omitted
-    /// from the wire when `None` so those lines stay byte-unchanged.
+    /// journald's opaque `__CURSOR`, the paging anchor. `None` for docker
+    /// lines and markers (never a paging anchor); omitted from the wire
+    /// when `None`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub cursor: Option<String>,
 }
@@ -61,11 +57,9 @@ fn is_docker_char(c: char) -> bool {
     c.is_ascii_alphanumeric() || matches!(c, '_' | '.' | '-')
 }
 
-/// Parse the wire `source` string into a typed target.
-///
-/// The server validates this too. Both sides validate on purpose: the agent
-/// must not depend on a caller having sanitised its input, because this value
-/// becomes a subprocess argument.
+/// Parses the wire `source` string into a typed target. The server
+/// validates too, on purpose -- the agent must not depend on a caller
+/// having sanitised input that becomes a subprocess argument.
 pub fn parse_source(raw: &str) -> Result<Source, SourceError> {
     let (scheme, target) = raw.split_once(':').ok_or(SourceError::UnknownScheme)?;
     if target.is_empty() {
@@ -76,14 +70,9 @@ pub fn parse_source(raw: &str) -> Result<Source, SourceError> {
     }
     match scheme {
         "journal" => {
-            // The whole-journal sentinel, matched HERE, before the unit-charset
-            // check below — so it does not depend on systemd's unit-naming rules
-            // at all. A real unit name always carries a `.<type>` suffix
-            // (`.service`, `.socket`, `.timer`, ...); "@system" has none, so this
-            // exact-match check can never collide with a real unit regardless of
-            // what characters systemd does or doesn't allow around '@' (template
-            // units are `name@instance.type`, with the '@' after a non-empty
-            // template name and before a suffix).
+            // Matched HERE, before the unit-charset check, so it doesn't
+            // depend on systemd's naming rules: a real unit always carries a
+            // `.<type>` suffix, so "@system" (no suffix) can never collide.
             if target == "@system" {
                 return Ok(Source::JournalAll);
             }
@@ -243,13 +232,11 @@ impl Batcher {
         self.dropped = self.dropped.saturating_add(lines);
     }
 
-    /// Flush if the interval has elapsed or the batch is already large.
     pub fn take_if_ready(&mut self, now_ms: i64) -> Option<Vec<u8>> {
         // A backwards NTP step makes `now_ms < last_flush_ms`, so the
-        // subtraction is negative and never clears the `>=` threshold below —
-        // flushing would stay blocked for the duration of the step. Treat a
-        // detected clock-step as due explicitly rather than trusting the
-        // wall-clock delta.
+        // saturating subtraction never clears the `>=` threshold and
+        // flushing would stay blocked -- treat a detected clock-step as due
+        // explicitly.
         let elapsed = now_ms.saturating_sub(self.last_flush_ms);
         let due = elapsed >= FLUSH_INTERVAL.as_millis() as i64 || now_ms < self.last_flush_ms;
         if due || self.buf.len() >= MAX_BATCH_BYTES {
@@ -295,15 +282,12 @@ fn try_emit(
     out.try_send(frame).is_ok()
 }
 
-/// Run one tail to completion, emitting `LogChunk` frames until the source ends
-/// or the task is cancelled. Cancellation happens by aborting this task; the
-/// journal child is killed on drop because `Command` is configured with
-/// `kill_on_drop`.
+/// Runs one tail to completion, emitting `LogChunk` frames until the source
+/// ends or the task is cancelled (aborted); the journal child dies on drop
+/// via `kill_on_drop`.
 ///
-/// 9 parameters, `#[allow(clippy::too_many_arguments)]`: splitting into a
-/// context struct would obscure the straight-line handoff to
-/// `run_journal`/`run_docker` for no benefit (same reasoning as `run_docker`
-/// below).
+/// 9 params, `#[allow(too_many_arguments)]`: a context struct would obscure
+/// the straight-line handoff to `run_journal`/`run_docker` for no benefit.
 #[allow(clippy::too_many_arguments)]
 pub async fn run_tail(
     source: Source,
@@ -316,10 +300,9 @@ pub async fn run_tail(
     request_id: String,
     stream_id: u64,
 ) {
-    // This module's own doc says it must not assume its caller sanitised
-    // anything: the server clamps too, but journalctl parses `--lines` as an
-    // `int`, so a large `u32` is a hard parse error rather than a graceful
-    // clamp on that side.
+    // The server clamps too, but journalctl parses `--lines` as an `int`, so
+    // an unclamped large `u32` would be a hard parse error there, not a
+    // graceful clamp.
     let tail_lines = tail_lines.clamp(1, 1000);
     let mut batcher = Batcher::new(now_ms());
     let result = match source {
@@ -376,12 +359,9 @@ pub async fn run_tail(
         };
         batcher.push(err);
     }
-    // Final flush + EOF so the browser learns the tail is over rather than
-    // hanging on an open stream.
-    //
-    // Best-effort like every other chunk, but retried: without an EOF the
-    // browser's stream never closes. Sleeping (not awaiting a permit) keeps us
-    // behind heartbeats rather than ahead of them.
+    // Final flush + EOF, retried unlike every other chunk: without an EOF
+    // the browser's stream never closes. Sleeping (not awaiting a permit)
+    // keeps this behind heartbeats rather than ahead of them.
     let mut data = batcher.take(now_ms()).unwrap_or_default();
     for attempt in 0..20 {
         if try_emit(
@@ -401,12 +381,10 @@ pub async fn run_tail(
     tracing::warn!(request_id = %request_id, "log tail: gave up sending eof");
 }
 
-/// A missing journalctl (a non-systemd guest, e.g. Alpine) fails at spawn.
-/// This gives that failure a specific "journalctl could not be started" line
-/// instead of falling through to `run_tail`'s generic `log tail ended:
-/// <error>` wrapper text. Both `run_journal` and `run_journal_page` hit this
-/// on `cmd.spawn()` failure and need the identical marker, so it's built
-/// once here.
+/// A missing journalctl (non-systemd guest, e.g. Alpine) fails at spawn.
+/// Gives that a specific marker instead of `run_tail`'s generic wrapper
+/// text; built once here since both `run_journal` and `run_journal_page`
+/// need the identical line.
 fn spawn_failure_marker(e: &std::io::Error) -> LogLine {
     LogLine {
         ts: now_ms(),
@@ -418,8 +396,7 @@ fn spawn_failure_marker(e: &std::io::Error) -> LogLine {
     }
 }
 
-// Same 9-param shape as run_tail above (the `filters` struct, not more
-// scalars), for the same reason.
+// Same 9-param shape as run_tail, same reason (see its doc).
 #[allow(clippy::too_many_arguments)]
 async fn run_journal(
     unit: Option<&str>,
@@ -464,13 +441,9 @@ async fn run_journal(
     let mut lines = BufReader::new(stdout).lines();
 
     // The ticker is what makes an idle tail flush: `journalctl -f` dumps its
-    // backlog in milliseconds and then blocks in follow mode, sometimes for
-    // hours, waiting for the next line. If the flush interval were only
-    // sampled from inside the `Some(raw)` arm below, a quiet unit's backlog
-    // would sit buffered in `Batcher` until the unit happened to log again —
-    // opening the log viewer on a quiet unit would show an empty pane. Do
-    // not "simplify" this back to a flush call at the bottom of a plain
-    // `while let Some(raw) = lines.next_line().await?` loop.
+    // backlog then blocks in follow mode for hours. Without this independent
+    // timer a quiet unit's backlog sits buffered until it logs again -- do
+    // NOT "simplify" this back to a flush at the loop's bottom.
     let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -488,10 +461,9 @@ async fn run_journal(
         flush_ready(batcher, out, request_id, stream_id);
     }
 
-    // A non-zero exit (EACCES on the journal, an out-of-range `-n`, a unit
-    // journalctl rejects) otherwise looks identical to a quiet, healthy unit:
-    // an immediately-closed stream and a clean EOF with no diagnostic. Surface
-    // it as a visible marker line, the same path the drop notice uses.
+    // A non-zero exit (EACCES, an out-of-range `-n`, a rejected unit)
+    // otherwise looks identical to a quiet, healthy unit: closed stream,
+    // clean EOF, no diagnostic. Surface it as a visible marker instead.
     let status = child.wait().await?;
     if !status.success() {
         batcher.push(LogLine {
@@ -506,13 +478,9 @@ async fn run_journal(
     Ok(())
 }
 
-/// A one-shot backward page read: spawn `journalctl --cursor --reverse`, collect
-/// the whole (bounded) page, drop the anchor, re-order oldest-first, and push it
-/// to the batcher. No follow, no ticker — the process exits on its own and the
-/// caller's final flush + eof close the request.
-///
-/// `filters` (the struct, not more scalars) pushed this over clippy's argument
-/// threshold, same reasoning as `run_journal` above.
+/// A one-shot backward page read: spawn `journalctl --cursor --reverse`,
+/// collect the bounded page, drop the anchor, reorder oldest-first, push to
+/// the batcher. No follow/ticker -- the process exits on its own.
 #[allow(clippy::too_many_arguments)]
 async fn run_journal_page(
     unit: Option<&str>,
@@ -551,10 +519,9 @@ async fn run_journal_page(
         flush_ready(batcher, out, request_id, stream_id);
     }
 
-    // Same as the live path: a non-zero exit (a cursor journalctl rejects, an
-    // EACCES, an out-of-range `-n`) otherwise yields an empty page that the
-    // server reports as `reached_start` — indistinguishable from the real start
-    // of the journal. Surface it as a visible marker instead.
+    // A non-zero exit here (rejected cursor, EACCES, out-of-range `-n`)
+    // yields an empty page the server reports as `reached_start` --
+    // indistinguishable from the real start of the journal. Surface a marker.
     let status = child.wait().await?;
     if !status.success() {
         batcher.push(LogLine {
@@ -570,9 +537,8 @@ async fn run_journal_page(
     Ok(())
 }
 
-// One more argument than run_journal because the docker source also needs
-// the `DockerClient` handle to open the stream; splitting these into a
-// context struct would obscure the parallel with run_journal for no benefit.
+// One more param than run_journal (needs the `DockerClient` handle too);
+// same "no benefit to a context struct" reasoning as run_tail's doc.
 #[allow(clippy::too_many_arguments)]
 async fn run_docker(
     docker: &crate::docker::DockerClient,
@@ -587,11 +553,10 @@ async fn run_docker(
     let mut stream = docker.logs(id, tail_lines, follow)?;
     use futures_util::StreamExt;
 
-    // Mirrors run_journal's ticker: dockerd's stream blocks between writes
-    // in follow mode just like `journalctl -f` does, so without an
-    // independent timer here a quiet container's backlog would sit buffered
-    // until the container logs again. Do not "simplify" this back to a plain
-    // `while let Some(item) = stream.next().await` loop.
+    // Mirrors run_journal's ticker: dockerd blocks between writes in follow
+    // mode too, so without this timer a quiet container's backlog sits
+    // buffered until it logs again -- do NOT "simplify" back to a plain
+    // `stream.next()` loop.
     let mut ticker = tokio::time::interval(FLUSH_INTERVAL);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
@@ -600,9 +565,8 @@ async fn run_docker(
                 Some(item) => {
                     let raw = item?;
                     // A bollard item is a docker *frame*, not a line: a TTY
-                    // container (`docker run -t`) can stream a chunk that
-                    // holds several log lines, so split before batching each
-                    // one as its own LogLine.
+                    // container can stream a chunk holding several log
+                    // lines, so split before batching each as its own LogLine.
                     for seg in raw.split_inclusive('\n') {
                         batcher.push(docker_line(seg, id));
                     }
@@ -646,9 +610,9 @@ pub struct JournalFilters {
 }
 
 impl JournalFilters {
-    /// The filter flags that are legal on ANY read. `--since` is deliberately
-    /// absent: it is rejected alongside `--cursor`, so it is added only by
-    /// `journal_tail_argv`, never by `journal_page_argv`.
+    /// The filter flags legal on ANY read. `--since` is deliberately absent
+    /// here -- it's rejected alongside `--cursor`, so only `journal_tail_argv`
+    /// adds it.
     fn common_flags(&self) -> Vec<String> {
         let mut argv = Vec::new();
         if self.max_priority > 0 {
@@ -693,15 +657,12 @@ pub fn journal_tail_argv(
     argv
 }
 
-/// The argv for a backward page read: the `limit` entries *before*
-/// `before_cursor`, newest-first (`finalize_page` re-orders them). `--cursor` is
-/// inclusive of the anchor entry and `-n limit+1` fetches it so it can be
-/// dropped, so a page never duplicates the boundary line the client already
-/// holds. Never follows. `unit` is `None` for the whole system journal.
+/// The argv for a backward page read: `limit` entries *before*
+/// `before_cursor`, newest-first (`finalize_page` reorders). `--cursor` is
+/// inclusive of the anchor, so `-n limit+1` fetches it just to drop it.
 ///
-/// Emits `-p`/`-b` but NEVER `--since` — journalctl exits with "Please specify
-/// only one of --since=, --cursor=, ..." if both are given. The time window is
-/// applied to a page by `finalize_page` instead.
+/// Never `--since` -- journalctl rejects combining it with `--cursor`;
+/// `finalize_page` applies the time window instead.
 pub fn journal_page_argv(
     unit: Option<&str>,
     before_cursor: &str,
@@ -726,34 +687,22 @@ pub fn journal_page_argv(
     argv
 }
 
-/// `--since @<epoch>` (used by `journal_tail_argv`) only has second
-/// resolution — `since_ms / 1000` truncates. The page-side cutoff below has to
-/// floor to the same second, or a page read is up to 999ms stricter than the
-/// tail that produced the cursor it's paging from, and `reached_start` could
-/// fire up to a second before the tail's own window actually ends.
+/// `--since @<epoch>` only has second resolution (`since_ms / 1000`
+/// truncates); this must floor to the same second, or a page read becomes
+/// up to 999ms stricter than the tail that produced its cursor, falsely
+/// firing `reached_start` early.
 fn floor_to_epoch_second(since_ms: u64) -> i64 {
     ((since_ms / 1000) * 1000) as i64
 }
 
-/// Turn a raw `--reverse` page (newest-first, starting at the anchor) into the
-/// display page: drop the anchor entry the client already has, drop
-/// everything from where the descending scan first crosses below `since_ms`
-/// onward, and re-order oldest-first so lines arrive in reading order. Called
-/// by `run_journal_page`.
+/// Turns a raw `--reverse` page (newest-first, from the anchor) into the
+/// display page: drops the anchor, drops everything from the first
+/// `since_ms` crossing onward, reorders oldest-first.
 ///
-/// The `since_ms` cutoff lives here rather than in the argv because journalctl
-/// rejects `--since` alongside `--cursor`.
-///
-/// `take_while`, not a per-record `filter`: dropped entries must be a
-/// structural SUFFIX of the descending page, because the server's
-/// `reached_start = lines.len() < limit` rule assumes exactly that.
-/// `__REALTIME_TIMESTAMP` is not guaranteed monotonic within a page (a
-/// backward clock step, or a read spanning merged journal files), so a
-/// per-record `filter` could excise one out-of-order entry and silently
-/// resume past it -- shortening the page and permanently latching
-/// `reached_start` on the client for a page that never actually reached the
-/// window's edge. `take_while` cuts once, at the first crossing, and keeps
-/// everything after it dropped too.
+/// `take_while`, not `filter`: dropped entries must be a structural SUFFIX
+/// (the server's `reached_start` rule assumes that), and timestamps aren't
+/// guaranteed monotonic within a page -- a per-record `filter` could excise
+/// one anomaly and silently resume past it, falsely latching `reached_start`.
 pub fn finalize_page(records: Vec<LogLine>, before_cursor: &str, since_ms: u64) -> Vec<LogLine> {
     let mut kept: Vec<LogLine> = records
         .into_iter()
@@ -1048,9 +997,9 @@ mod tests {
         assert_eq!(out.lines().count(), 2);
     }
 
-    /// A tail on a QUIET unit must still deliver its backlog promptly — the
-    /// flush timer has to fire on its own, not only when the next line
-    /// arrives. Reverting the ticker makes this hang until the timeout.
+    /// A tail on a QUIET unit must still deliver its backlog promptly, not
+    /// only when the next line arrives -- reverting the ticker makes this
+    /// hang until timeout.
     #[tokio::test]
     #[ignore = "spawns journalctl; needs a live journal, run under sudo"]
     async fn live_idle_tail_flushes_its_backlog_without_waiting_for_a_new_line() {
@@ -1234,14 +1183,12 @@ mod tests {
     #[test]
     fn finalize_page_drops_the_anchor_and_orders_oldest_first() {
         // journalctl --reverse returns newest-first, starting AT the anchor.
-        // Records as received: [anchor(t=30), t=20, t=10].
         let records = vec![
             line_with_cursor("s=anchor", 30),
             line_with_cursor("s=b", 20),
             line_with_cursor("s=a", 10),
         ];
         let page = finalize_page(records, "s=anchor", 0);
-        // anchor removed, re-ordered oldest-first
         let ts: Vec<i64> = page.iter().map(|l| l.ts).collect();
         assert_eq!(ts, vec![10, 20], "anchor dropped, chronological order");
         assert!(
@@ -1261,9 +1208,8 @@ mod tests {
     #[test]
     fn finalize_page_drops_entries_older_than_the_window() {
         // --since cannot ride a cursor read, so the window is enforced here.
-        // Values are whole seconds apart (not sub-second offsets) so the
-        // floor-to-the-second cutoff (see `floor_to_epoch_second`) doesn't
-        // collapse them all into the same bucket.
+        // Values are whole seconds apart so the floor-to-the-second cutoff
+        // doesn't collapse them into the same bucket.
         let records = vec![
             line_with_cursor("s=anchor", 1_600_000_300_000),
             line_with_cursor("s=c", 1_600_000_250_000),
@@ -1294,13 +1240,9 @@ mod tests {
     #[test]
     fn finalize_page_a_non_monotonic_dip_forms_a_clean_structural_cutoff() {
         // journalctl --reverse walks JOURNAL SEQUENCE order, not timestamp
-        // order: a backward clock step (or reading across merged journal
-        // files) can put an entry with an anomalously low
-        // __REALTIME_TIMESTAMP in the middle of an otherwise-descending page.
-        // `take_while` must stop AT that entry and drop everything after it
-        // too — even records whose own timestamp would individually still
-        // pass — rather than a per-record `filter` excising just the one
-        // anomaly and silently resuming past it.
+        // order, so a clock step can put an anomalously-low timestamp
+        // mid-page. `take_while` must cut there and stay cut, not resume
+        // past it.
         let records = vec![
             line_with_cursor("s=anchor", 1_600_000_500_000),
             line_with_cursor("s=d", 1_600_000_400_000),
@@ -1319,10 +1261,8 @@ mod tests {
 
     #[test]
     fn finalize_page_floors_the_cutoff_to_the_second_like_the_tail_does() {
-        // journal_tail_argv's `--since @<epoch>` divides by 1000 (integer,
-        // floors to the second); the page cutoff must floor the same way or a
-        // page read is up to 999ms stricter than the tail that produced its
-        // anchor, and `reached_start` could fire up to a second early.
+        // Mirrors floor_to_epoch_second's rationale: the page cutoff must
+        // floor to the same second as the tail's `--since @<epoch>`.
         let since_ms = 1_600_000_000_500; // 500ms into the second
         let records = vec![
             line_with_cursor("s=anchor", 1_600_000_001_000),
@@ -1341,8 +1281,6 @@ mod tests {
         );
     }
 
-    /// Live page read against the local journal. Ignored like the repo's other
-    /// live-journal tests; run with --ignored under sudo on a systemd host.
     #[tokio::test]
     #[ignore = "needs a live journal; run under sudo"]
     async fn live_journal_page_reads_older_than_a_cursor() {
@@ -1391,7 +1329,6 @@ mod tests {
         }
     }
 
-    /// A filtered whole-journal page read against the local journal.
     #[tokio::test]
     #[ignore = "needs a live journal; run under sudo"]
     async fn live_filtered_whole_journal_page_reads_older_than_a_cursor() {

@@ -1,7 +1,6 @@
 //! Docker collection + verb execution. Talks ONLY to the local daemon over
-//! its unix socket via bollard — never TCP/TLS, so the musl-static
-//! build stays free of openssl (see Cargo.toml). Mapping is factored into pure
-//! functions so it's unit-testable without a running daemon.
+//! its unix socket via bollard, never TCP/TLS, keeping the musl-static
+//! build free of openssl (see Cargo.toml).
 
 use argus_proto::v1::{CommandResult, Container, Verb};
 use bollard::models::ContainerSummary;
@@ -25,7 +24,6 @@ pub struct DockerClient {
 }
 
 impl DockerClient {
-    /// Best-effort connect to the local socket. Never fails.
     pub fn connect() -> DockerClient {
         match Docker::connect_with_socket_defaults() {
             Ok(d) => DockerClient { inner: Some(d) },
@@ -36,13 +34,9 @@ impl DockerClient {
         }
     }
 
-    /// Whether a daemon is actually answering, bounded by `timeout`.
-    ///
-    /// `connect()` succeeding only means a client was constructed — it never
-    /// contacts the daemon — so this pings `/_ping` rather than trusting that.
-    ///
-    /// Consumed by `capabilities::probe()`, called once per session from
-    /// `session::connect_and_serve` immediately before `Hello`.
+    /// Whether the daemon is actually answering, within `timeout`.
+    /// `connect()` succeeding only means a client was constructed, never
+    /// that the daemon was contacted -- this pings `/_ping` for real.
     pub async fn ping_ok(&self, timeout: Duration) -> bool {
         let Some(docker) = &self.inner else {
             return false;
@@ -73,8 +67,7 @@ impl DockerClient {
         }
     }
 
-    /// Run a container verb against `target` (id or name), producing a
-    /// `CommandResult` correlated by `command_id`.
+    /// Runs a container verb against `target` (container id or name).
     pub async fn run_verb(&self, command_id: String, verb: Verb, target: &str) -> CommandResult {
         let Some(docker) = &self.inner else {
             return result(
@@ -123,16 +116,15 @@ impl DockerClient {
             .as_ref()
             .ok_or_else(|| anyhow::anyhow!("docker daemon not available on this host"))?
             .clone();
-        // `default()`, not `new()` — this is the shape bollard itself uses in
-        // its own `From<LogsOptions>` impl. `.tail` takes a `&str`.
+        // `default()`, not `new()` -- matches bollard's own `From<LogsOptions>`
+        // impl; `.tail` takes a `&str`, hence the to_string().
         let opts = LogsOptionsBuilder::default()
             .stdout(true)
             .stderr(true)
             .follow(follow)
             .tail(&tail.to_string())
             .build();
-        // `LogOutput` implements Display, which flattens the stdout/stderr
-        // framing to the message text — the interleaved view `docker logs` gives.
+        // `LogOutput`'s `Display` impl does the stdout/stderr flattening.
         Ok(docker
             .logs(id, Some(opts))
             .map(|r| r.map(|out| out.to_string()).map_err(anyhow::Error::from)))
@@ -148,7 +140,6 @@ fn result(command_id: String, ok: bool, message: &str) -> CommandResult {
     }
 }
 
-/// Map a bollard container summary to the proto. Pure — unit-tested below.
 fn summary_to_container(s: ContainerSummary) -> Container {
     let name = s
         .names

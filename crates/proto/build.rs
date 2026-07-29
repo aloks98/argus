@@ -1,8 +1,6 @@
-//! Generate the gRPC bindings at build time.
-//!
-//! We compile the `.proto` with `protox` (a pure-Rust protobuf compiler) so no
-//! external `protoc` binary is required, then hand the resulting descriptor set
-//! to `tonic-prost-build` for client + server code generation.
+//! Generates gRPC bindings at build time via `protox` (a pure-Rust protobuf
+//! compiler, so no external `protoc` binary is required) piped into
+//! `tonic-prost-build` for client + server codegen.
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("cargo:rerun-if-changed=proto/argus.proto");

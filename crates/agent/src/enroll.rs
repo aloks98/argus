@@ -15,9 +15,9 @@ pub struct Identity {
     pub agent_id: String,
 }
 
-/// Load an existing on-disk identity, or run the enrollment handshake to obtain
-/// one: generate a keypair + CSR locally (the private key never leaves the guest),
-/// call `Enroll` over server-authenticated TLS, and persist the returned cert.
+/// Loads an existing on-disk identity, or runs the enrollment handshake:
+/// generate a keypair + CSR locally (the private key never leaves the
+/// guest), call `Enroll` over server-authenticated TLS, persist the cert.
 pub async fn ensure_enrolled(cfg: &Config) -> Result<Identity> {
     if let Some(existing) = identity::load(&cfg.data_dir).context("loading local identity")? {
         return Ok(existing);
@@ -27,9 +27,9 @@ pub async fn ensure_enrolled(cfg: &Config) -> Result<Identity> {
         identity::load_or_generate_csr(&cfg.data_dir).context("generating local keypair + CSR")?;
     let info = crate::info::gather(env!("CARGO_PKG_VERSION")).context("gathering host facts")?;
 
-    // Server-authenticated TLS only: the agent has no client cert yet, so it
-    // presents none. It verifies the control plane against the CA cert baked
-    // into its config (PRD §5.2).
+    // Server-authenticated TLS only: no client cert exists yet, so none is
+    // presented; the control plane is verified against the baked-in CA cert
+    // (PRD §5.2).
     let ca_cert_pem = std::fs::read(&cfg.ca_cert_path)
         .with_context(|| format!("reading CA cert at {}", cfg.ca_cert_path))?;
     let tls = ClientTlsConfig::new().ca_certificate(Certificate::from_pem(ca_cert_pem));

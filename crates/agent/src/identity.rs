@@ -1,9 +1,8 @@
 //! Local mTLS identity: keypair + CSR generation, and on-disk persistence of
 //! the CA-signed client cert returned by `Enroll` (PRD §5.2, §5.3).
 //!
-//! The private key is generated here and never leaves this file's I/O
-//! boundary: `enroll::ensure_enrolled` only ever sends the CSR PEM (a public
-//! artifact) over the wire, never `agent.key`.
+//! The private key never leaves this file's I/O boundary: `ensure_enrolled`
+//! only ever sends the CSR PEM (public) over the wire, never `agent.key`.
 
 use crate::enroll::Identity;
 use anyhow::{Context, Result};
@@ -20,12 +19,11 @@ pub struct PendingIdentity {
     pub csr_pem: String,
 }
 
-/// Load this agent's private key from `<data_dir>/agent.key` if one already
-/// exists (reused across enroll attempts before a cert is issued), or
-/// generate a new one and persist it with mode `0600`. Either way, build a
-/// CSR whose CommonName is this host's `/etc/machine-id`; the control plane
-/// overwrites the CN with the assigned agent UUID when it signs
-/// (`ca.rs::sign_csr`), so this is just a human-readable hint at request time.
+/// Loads the private key from `<data_dir>/agent.key` if present (reused
+/// across enroll attempts), else generates one and persists it `0600`.
+/// Either way, the CSR's CommonName is this host's `/etc/machine-id` -- just
+/// a human-readable hint, since the control plane overwrites it with the
+/// assigned agent UUID when signing (`ca.rs::sign_csr`).
 pub fn load_or_generate_csr(data_dir: &str) -> Result<PendingIdentity> {
     let key_path = Path::new(data_dir).join("agent.key");
 
@@ -78,10 +76,9 @@ pub fn persist_cert(data_dir: &str, cert_pem: &str, ca_pem: &str) -> Result<()> 
     Ok(())
 }
 
-/// Load a previously-persisted identity, if all three files (`agent.key`,
-/// `agent.crt`, `ca.crt`) are present. `agent_id` is parsed out of the client
-/// cert's CommonName -- the control plane sets `CN = <agent UUID>` when it
-/// signs (`ca.rs::sign_csr`).
+/// Loads a previously-persisted identity if all three files (`agent.key`,
+/// `agent.crt`, `ca.crt`) are present. `agent_id` is parsed from the client
+/// cert's CommonName, which the control plane sets to the agent UUID.
 pub fn load(data_dir: &str) -> Result<Option<Identity>> {
     let dir = Path::new(data_dir);
     let key_path = dir.join("agent.key");
@@ -201,7 +198,6 @@ mod tests {
     fn load_parses_agent_id_from_persisted_cert_common_name() {
         let dir = unique_temp_dir("load-some");
 
-        // Generates + persists agent.key.
         load_or_generate_csr(&dir).expect("generate key + csr");
 
         // A self-signed cert standing in for the CA-signed client cert the

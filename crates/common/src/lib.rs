@@ -20,19 +20,9 @@ pub const CONTROL_STREAM_ID: u64 = 0;
 /// walked-away root shell closes even while a `top` keeps producing output.
 pub const TERMINAL_IDLE_SECS: u64 = 1800;
 
-/// PTY output buffering (server side). The byte water marks drive `PtyFlow`;
-/// `PTY_CHANNEL_CAP` (message count) is sized so the BYTE watermark is always
-/// the binding constraint, never the message count -- the only way to fill
-/// the channel before crossing high-water would be a sustained run of
-/// sub-64-byte chunks, which a real pty doesn't produce under load.
-/// `deliver_pty_output`'s full-channel teardown is a defensive assertion,
-/// not a path a fast program reaches.
-///
-/// A live firehose (`seq 1 200000` in a real terminal) measured ~138
-/// bytes/chunk, far below the 64 KiB a naive "big reads" assumption would
-/// suggest. Sizing against a realistic 64-bytes/chunk floor, crossing
-/// `PTY_HIGH_WATER` (1 MiB) takes 16,384 chunks; doubling for headroom gives
-/// `PTY_CHANNEL_CAP = 32,768` -- more than 4x the measured trip point.
+/// PTY output buffering (server side): the BYTE water marks drive `PtyFlow`,
+/// never the message count -- `PTY_CHANNEL_CAP` is sized (measured ~138
+/// bytes/chunk under load) so crossing `PTY_HIGH_WATER` always happens first.
 pub const PTY_CHANNEL_CAP: usize = 32_768; // messages
 pub const PTY_HIGH_WATER: usize = 1 << 20; // 1 MiB buffered -> pause
 pub const PTY_LOW_WATER: usize = 256 << 10; // 256 KiB buffered -> resume
