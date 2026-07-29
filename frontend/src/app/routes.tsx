@@ -15,14 +15,13 @@ export type AppRoute = {
   path: string;
   element: ReactElement;
   nav?: {
-    /** Sidebar label. */
     label: string;
     /** Sidebar group heading; entries sharing a section render under one heading. */
     section: string;
     /**
-     * Shown beside the label, and it is ALL that shows when the sidebar is
-     * collapsed to its icon rail — so every nav entry needs one or it collapses
-     * to a blank square. Required, not optional, for exactly that reason.
+     * Shown beside the label, and ALL that shows when the sidebar collapses
+     * to its icon rail — so every entry needs one, or it collapses to a
+     * blank square. Required, not optional, for exactly that reason.
      */
     icon: LucideIcon;
   };

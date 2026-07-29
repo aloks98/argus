@@ -109,9 +109,8 @@ export default function TimeSeriesChart({
    *  in the tooltip while the axis stays plain "8.3 GB". */
   tooltipFormat?: (v: number) => string;
   /** When set, a second y-axis renders on the RIGHT relabeling the SAME
-   *  scale — e.g. bytes on the left, the equivalent percentage on the
-   *  right. Only meaningful when the mapping is a constant factor (memory
-   *  against a fixed total); it is a relabeling, not a second scale. */
+   *  scale (e.g. bytes on the left, percentage on the right) — a relabeling,
+   *  not a second scale, so only meaningful for a constant-factor mapping. */
   rightAxisFormat?: (v: number) => string;
 }) {
   const box = useRef<HTMLDivElement>(null);
@@ -196,14 +195,12 @@ export default function TimeSeriesChart({
         ...series.map((s) => ({ label: s.name, stroke: cssVar(s.colorVar, "#F5F5F5"), width: 2 })),
       ],
     }),
-    // exhaustive-deps wants `axis`, `label`, and `series` added here too, but
-    // both omissions are deliberate:
-    //  - `axis`/`label` are `cssVar` reads that only change when the theme's
-    //    CSS custom properties change, which is exactly what bumps
-    //    `themeVersion` (see useThemeVersion above) — already covered.
-    //  - `series` is deliberately represented by `seriesKey` above instead —
-    //    see the comment there. Adding the raw `series` array here would
-    //    reintroduce the per-render identity churn `seriesKey` exists to avoid.
+    // exhaustive-deps wants `axis`/`label`/`series` added too, but both
+    // omissions are deliberate: `axis`/`label` only change when the theme's
+    // CSS vars change, which is exactly what bumps `themeVersion` (already
+    // covered); `series` is represented by `seriesKey` above instead (see
+    // that comment) — the raw array would reintroduce the identity churn
+    // `seriesKey` exists to avoid.
     // oxlint-disable-next-line react-hooks/exhaustive-deps
     [width, height, themeVersion, seriesKey, format, tooltipFormat, rightAxisFormat],
   );

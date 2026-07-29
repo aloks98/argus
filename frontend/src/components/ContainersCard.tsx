@@ -1,6 +1,5 @@
 // Docker container list + start/stop/restart verbs for a single machine.
-// Extracted out of MachineDetailPage so the Containers tab owns its own file;
-// keeps the mutation wiring (`useContainerAction`) local to itself.
+// Owns its own mutation wiring (`useContainerAction`).
 import { Link } from "react-router-dom";
 import {
   Alert,
@@ -144,10 +143,9 @@ export default function ContainersCard({
                       {c.status}
                     </TableCell>
                     <TableCell className="whitespace-nowrap text-right">
-                      {/* One loading state for the row rather than a "…" on
-                          every button, and otherwise all three verbs with the
-                          inapplicable ones disabled — kept identical to
-                          UnitsCard so the two tabs behave the same way. */}
+                      {/* One loading state per row rather than a spinner per button; the
+                          three verbs render with inapplicable ones disabled — kept
+                          identical to UnitsCard so both tabs behave the same way. */}
                       {rowBusy ? (
                         <span
                           role="status"

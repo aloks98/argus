@@ -1,6 +1,3 @@
-// Chart-series builders, moved verbatim out of MachineDetailPage — they are
-// pure functions over a MetricPoint[] window and don't belong to any one
-// screen.
 import type { MetricPoint } from "../api";
 
 export type ChartPoint = { ts: string; value: number };
@@ -10,10 +7,9 @@ export function buildCpuSeries(points: MetricPoint[]): ChartPoint[] {
   return points.filter((p) => p.cpu_pct !== null).map((p) => ({ ts: p.ts, value: p.cpu_pct! }));
 }
 
-// Absolute bytes used, not a derived percentage — a percentage hides the real
-// numbers. Total is effectively constant per machine, so the chart shape is
-// the same either way; only the axis becomes meaningful. Points missing the
-// counter are skipped rather than plotted as 0.
+// Absolute bytes, not a derived percentage — a percentage hides the real
+// numbers, and total is ~constant per machine so the chart shape doesn't
+// change either way. Points missing the counter are skipped, not zeroed.
 export function buildMemUsedSeries(points: MetricPoint[]): ChartPoint[] {
   return points.filter((p) => p.mem_used !== null).map((p) => ({ ts: p.ts, value: p.mem_used! }));
 }

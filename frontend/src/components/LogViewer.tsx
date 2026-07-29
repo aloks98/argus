@@ -1,7 +1,6 @@
 // The shared log view. Drives LazyLog in controlled `text` mode: we own the
-// EventSource and the line buffer, because the library's `eventsource` mode is
-// append-only and loading older pages needs to PREPEND to the buffer.
-// Behaviour of the live tail is unchanged — stream, follow, search, select.
+// EventSource and the line buffer, because the library's `eventsource` mode
+// is append-only and loading older pages needs to PREPEND to the buffer.
 import { useEffect, useMemo, useRef, useState, type WheelEvent } from "react";
 import { LazyLog } from "@melloware/react-logviewer";
 import { fetchLogPage, logStreamUrl, ALL_LOGS } from "../api";
@@ -17,7 +16,6 @@ const LEVEL_TEXT: Record<Tone, string> = {
   idle: "text-foreground",
 };
 
-/** Bound the buffer so a long session can't grow unbounded. */
 const MAX_LINES = 50_000;
 
 export default function LogViewer({
@@ -44,11 +42,10 @@ export default function LogViewer({
   // Pending rAF handles for the deferred post-prepend anchor (cancelled on unmount).
   const anchorRaf1 = useRef(0);
   const anchorRaf2 = useRef(0);
-  // Bumped every time the reset effect below rebuilds the stream (source or
+  // Bumped whenever the reset effect below rebuilds the stream (source or
   // filter change). `loadOlder` captures the value before its `await` and
-  // discards a response that resolves after the generation has moved on, so a
-  // stale in-flight page can never prepend into a freshly-reset, differently
-  // filtered buffer.
+  // discards a stale response, so it can never prepend into a freshly-reset,
+  // differently filtered buffer.
   const runIdRef = useRef(0);
   // The cutoff this tail resolved, learned from the stream's `meta` frame.
   // A ref, not state: it must be readable by `loadOlder` without making the
@@ -57,7 +54,6 @@ export default function LogViewer({
 
   const isJournal = source.startsWith("journal:");
 
-  // Cancel any in-flight anchor frames if we unmount mid-load.
   useEffect(
     () => () => {
       cancelAnimationFrame(anchorRaf1.current);
@@ -66,12 +62,7 @@ export default function LogViewer({
     [],
   );
 
-  // Own the EventSource so the buffer is ours to append to and to prepend
-  // older pages into. Re-created when machine, source, or filters change.
   useEffect(() => {
-    // A new generation: any `loadOlder` call still in flight from the
-    // previous machine/source/filters must not touch the buffer being reset
-    // here once its response arrives.
     runIdRef.current += 1;
     setLines([]);
     setReachedStart(false);
@@ -79,16 +70,12 @@ export default function LogViewer({
     setAnchorLine(undefined);
     const es = new EventSource(logStreamUrl(machineId, source, filters));
     sinceMsRef.current = undefined;
-    // Named events do NOT reach `onmessage`, so this can't collide with the
-    // NDJSON log frames. The server re-announces a fresh cutoff on every
-    // reconnect (routine — it ends the SSE stream whenever an agent session
-    // tears down), but the line buffer is NOT cleared on a reconnect, only on
-    // machine/source/filter change — so adopting a later cutoff here would pair
-    // it with an older buffer: `loadOlder` would send a cutoff newer than the
-    // anchor already in view, `finalize_page` would truncate the page to
-    // nothing, and the viewer would report "beginning of window" while still
-    // showing an older span. So only the FIRST announced cutoff for this
-    // buffer's lifetime is adopted; later reconnects' cutoffs are discarded.
+    // Named events don't reach `onmessage`. The server re-announces a cutoff
+    // on every reconnect (an agent session tear-down ends the SSE stream —
+    // routine), but the buffer only clears on machine/source/filter change.
+    // Adopting a later cutoff would pair it with an older buffer and desync
+    // `loadOlder`'s paging math — so only the FIRST cutoff per buffer
+    // lifetime is adopted.
     es.addEventListener("meta", (e) => {
       if (sinceMsRef.current !== undefined) return;
       try {
@@ -108,12 +95,10 @@ export default function LogViewer({
     };
     // The browser's EventSource auto-reconnects; nothing to do on error.
     return () => es.close();
-    // Depends on `filters.priority`/`filters.window`, not `filters` itself,
-    // deliberately: `useLogFilters` derives a fresh `LogFilters` object from
-    // the URL params on every render (see lib/logFilters.ts), so its
-    // reference changes on every unrelated re-render (e.g. this page's 10s
-    // metrics poll). Depending on the object would tear down and reopen the
-    // EventSource on every one of those, not just on an actual filter change.
+    // Depends on filters.priority/window, not `filters` itself: useLogFilters
+    // derives a fresh object from URL params every render (lib/logFilters.ts),
+    // so depending on the object would tear the EventSource down on every
+    // unrelated re-render (e.g. the 10s metrics poll), not just a real change.
     // oxlint-disable-next-line react-hooks/exhaustive-deps
   }, [machineId, source, filters.priority, filters.window]);
 
@@ -126,11 +111,10 @@ export default function LogViewer({
     if (oldest === undefined || oldest === null) return;
     loadingRef.current = true;
     setLoadingOlder(true);
-    // react-logviewer only re-scrolls when scrollToLine's VALUE changes across
-    // renders. Pages are a fixed 500 lines, so the target would be the same
-    // number two loads in a row and the second load's anchor would silently
-    // no-op. Clear it first so every load transitions through a distinct
-    // (undefined) value before landing on the real target below.
+    // react-logviewer only re-scrolls when scrollToLine's VALUE changes.
+    // Pages are a fixed 500 lines, so two loads in a row would target the
+    // same number and the second anchor would silently no-op — clear it
+    // first so every load passes through a distinct (undefined) value.
     setAnchorLine(undefined);
     // Captured before the `await`: if a filter/source change bumps this while
     // the request is in flight, the reset effect has already cleared `lines`
@@ -145,12 +129,11 @@ export default function LogViewer({
           const merged = page.lines.concat(prev);
           return merged.length > MAX_LINES ? merged.slice(0, MAX_LINES) : merged;
         });
-        // The line that was at the top is now shifted down by page.lines.length;
-        // scroll to it (1-based) so the viewport does not jump. Defer this two
-        // frames: LazyLog re-parses `text` on a follow-up render and virtua then
-        // lays out the new rows, so scrolling in the same commit as the prepend
-        // races that and leaves the viewport pinned at the top (offset 0), where
-        // no scroll events fire and the next load can't be triggered.
+        // The old top line is now shifted down by page.lines.length; scroll
+        // to it (1-based) so the viewport doesn't jump. Deferred two frames
+        // — LazyLog re-parses `text` then virtua lays out the new rows, so
+        // scrolling in the same commit races that and pins the viewport at
+        // offset 0, where the next load can never trigger.
         cancelAnimationFrame(anchorRaf1.current);
         cancelAnimationFrame(anchorRaf2.current);
         anchorRaf1.current = requestAnimationFrame(() => {
@@ -179,16 +162,14 @@ export default function LogViewer({
     lastScrollTopRef.current = scrollTop;
     // Near the top: load older (journal only).
     if (scrollTop <= 40) void loadOlder();
-    // Follow only while at the bottom.
     const atBottom = scrollHeight - scrollTop - clientHeight <= 40;
     setFollowing(atBottom);
   }
 
   function onWheel(e: WheelEvent) {
-    // virtua only emits onScroll when the offset actually changes, so once the
-    // viewport is parked at the very top (offset 0) an upward scroll produces no
-    // event and the onScroll trigger above can never re-fire. Catch the upward
-    // wheel here so "load older" keeps working when parked at the top.
+    // virtua only emits onScroll when the offset actually changes, so once
+    // parked at the very top (offset 0) an upward scroll fires no event and
+    // onScroll's trigger above can't re-fire. Catch it here instead.
     if (e.deltaY < 0 && lastScrollTopRef.current <= 40) void loadOlder();
   }
 
@@ -205,13 +186,11 @@ export default function LogViewer({
               : "scroll up to load older"}
         </div>
       )}
-      {/* `dark` is deliberate and not a theme bug: LazyLog's own surface is
-          always dark, but the row colours below come from theme tokens, so in
-          light mode `--foreground` resolves to near-black and the log text
-          renders dark-on-dark. Scoping a dark token context to just this
-          subtree keeps the rows readable in both themes. It is applied here
-          rather than on the component root so the "scroll up to load older"
-          status line above still follows the page theme. */}
+      {/* `dark` here is deliberate, not a theme bug: LazyLog's surface is
+          always dark, but the row colours come from theme tokens, so in
+          light mode `--foreground` resolves near-black and text renders
+          dark-on-dark. Scoped to this subtree (not the component root) so
+          the status line above still follows the page theme. */}
       <div className="dark min-h-0 flex-1" onWheel={onWheel}>
         <LazyLog
           // Remount on a source switch so an in-progress search term and scroll

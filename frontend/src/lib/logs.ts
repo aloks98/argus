@@ -1,10 +1,9 @@
 // The two halves of the LazyLog seam, kept pure and out of the component.
 //
-// LazyLog's controlled `text` mode stores one string per line and `formatPart`
-// receives only that string — never the original object — so severity has to
-// survive as text. `formatLogLine` encodes a `LogLine` into that string and
-// `parseLogParts` decodes it back out; they must agree on the prefix, which is
-// why they live together.
+// LazyLog's controlled `text` mode stores one string per line, never the
+// original object, so severity must survive as text: `formatLogLine` encodes
+// a `LogLine` into that string, `parseLogParts` decodes it back — they must
+// agree on the prefix, which is why they live together.
 import type { Tone } from "./status";
 
 export type LogLine = {

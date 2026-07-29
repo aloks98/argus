@@ -19,30 +19,22 @@ import { ArrowLeft } from "lucide-react";
 import { RateLimited, localLogin } from "../api";
 
 /**
- * Full-page gate, in two stages: pick a method, then use it. Both methods are
- * always offered -- this must never probe `/auth/login` to hide whichever
- * isn't configured.
+ * Full-page gate: both methods are always offered — this must never probe
+ * `/auth/login` to hide whichever isn't configured.
  *
- * `GET /auth/login` is not a status check, it is the start of a real OIDC flow
- * (design §8/§13): every hit runs discovery, mints a fresh CSRF
- * token/nonce/PKCE verifier, and sets a live 10-minute flow cookie that the
- * design documents as reachable only by top-level navigation. Firing it from
- * a background `fetch` on every sign-in-page mount would silently start an
- * unrequested OAuth flow for every signed-out visitor -- and because the flow
- * cookie is per-origin and shared across tabs, a probe in one tab could stomp
- * the flow cookie of a legitimate SSO login in flight in another, breaking
- * its CSRF/nonce/PKCE check on return to the callback.
+ * `GET /auth/login` is not a status check, it starts a real OIDC flow
+ * (design §8/§13): it mints CSRF/nonce/PKCE state and a live flow cookie
+ * shared across tabs, so a background probe could stomp a legitimate SSO
+ * login in flight in another tab, breaking its callback check.
  *
- * So: no probe. When SSO isn't configured, a visitor who clicks "Sign in"
- * gets the server's own friendly "single sign-on is not configured" page --
- * a fine outcome that costs nothing, and the only way to know that requires
- * no request to be made from here at all.
+ * So: no probe. An unconfigured-SSO click just gets the server's own
+ * "not configured" page — free, and the only way to know that without
+ * ever making a request from here.
  */
 export default function SignIn() {
   const next = window.location.pathname + window.location.search;
-  // Two stages rather than a disclosure: picking a method replaces the choice
-  // instead of growing beneath it. One decision on screen at a time, and the
-  // form is never competing for attention with a button that would abandon it.
+  // Two stages rather than a disclosure: picking a method replaces the
+  // choice instead of growing beneath it — one decision on screen at a time.
   const [stage, setStage] = useState<"choose" | "local">("choose");
 
   return (
@@ -65,27 +57,24 @@ export default function SignIn() {
             >
               Sign in with SSO
             </Button>
-            {/* Outline keeps SSO the primary route without demoting this one
-                into small print. In a local-admin-only deployment SSO is the
-                route that does NOT work, and an operator mid-outage should not
-                have to hunt for the one that does. */}
+            {/* Outline keeps SSO primary without demoting this route to small
+                print — in an SSO outage or local-only deployment, this is the
+                one that works, and shouldn't require hunting for. */}
             <Button variant="outline" className="w-full" onClick={() => setStage("local")}>
               Use a local account
             </Button>
           </>
         ) : (
           <>
-            {/* A plain control carrying breadcrumb weight, not a Button: as a
-                Button it read as heavy as the submit control beneath it, which
-                put two equally-weighted actions in a form that has one. The
-                type here is deliberately the same as MachineDetailPage's
-                breadcrumb link -- font-mono, 11px, muted, underline on hover --
-                so "leave this stage" looks the same everywhere in the app.
+            {/* A plain control carrying breadcrumb weight, not a Button — a
+                Button here reads as heavy as the submit control below it.
+                Styled to match MachineDetailPage's breadcrumb link so "leave
+                this stage" looks the same everywhere.
 
-                Still a real <button>: it changes component state rather than
-                navigating, and an <a> without an href is neither focusable nor
-                announced as a control. `self-start` stops the flex column from
-                stretching it to the form's width. */}
+                Still a real <button>, not <a>: it changes state, not
+                navigation, and an href-less <a> isn't focusable or announced
+                as a control. `self-start` stops the flex column from
+                stretching it full-width. */}
             <button
               type="button"
               onClick={() => setStage("choose")}
@@ -103,12 +92,11 @@ export default function SignIn() {
 }
 
 /**
- * Deliberately validates only PRESENCE. A rule like "at least 24 characters"
- * would mirror what `generate_password` happens to produce today, so it would
- * reject a still-valid credential the moment that length changes — and it
- * would tell an unauthenticated visitor the shape of the secret. Whether the
- * password is *correct* is the server's business, and the server answers every
- * wrong answer identically on purpose (design §11).
+ * Deliberately validates only PRESENCE. A length rule would mirror
+ * `generate_password`'s current output, breaking the moment that changes,
+ * and would leak the secret's shape to an unauthenticated visitor. Whether
+ * it's *correct* is the server's business — it answers every wrong case
+ * identically on purpose (design §11).
  */
 const localSignInSchema = z.object({
   username: z.string().min(1, "Enter your username."),
@@ -134,10 +122,9 @@ function LocalSignInForm() {
   });
 
   const rateLimited = mutation.error instanceof RateLimited ? mutation.error : null;
-  // Anything that isn't the rate-limit case renders as ONE generic message --
-  // never anything that would tell a caller whether the account exists
-  // (design §11; the server itself makes the three failure cases
-  // indistinguishable, and this must not undo that).
+  // Anything but rate-limiting renders as ONE generic message — never
+  // anything that would reveal whether the account exists (design §11; the
+  // server already makes the three failure cases indistinguishable).
   const genericFailure = mutation.error !== null && rateLimited === null;
 
   return (
@@ -159,9 +146,8 @@ function LocalSignInForm() {
       )}
 
       {/* `noValidate` on the form above is deliberate: without it the browser's
-          own bubble fires first and the inline FieldError never gets a chance
-          to render, so the two validation systems would fight and the native
-          one would always win. */}
+          own bubble fires first and FieldError never gets a chance to render —
+          the two validation systems would fight and native would always win. */}
       <FieldGroup>
         <Controller
           name="username"

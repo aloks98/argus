@@ -2,14 +2,12 @@
 // can be reasoned about (and tested, once a runner exists) on its own.
 import type { Unit } from "../api";
 
-/** Sort rank: failures first, then active, then everything else. */
 function rank(u: Unit): number {
   if (u.active_state === "failed") return 0;
   if (u.active_state === "active") return 1;
   return 2;
 }
 
-/** How many units are in the failed state. */
 export function countFailed(units: Unit[]): number {
   return units.filter((u) => u.active_state === "failed").length;
 }

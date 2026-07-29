@@ -1,6 +1,6 @@
 import { cva } from "class-variance-authority";
 
-/** The semantic tones. Colour never carries status alone — always paired with text. */
+/** Colour never carries status alone — always paired with text. */
 export type Tone = "ok" | "warn" | "fail" | "idle";
 
 /** machines.status from the control plane. */
@@ -53,17 +53,10 @@ export function unitTone(activeState: string): Tone {
 }
 
 /**
- * Enrollment-token lifecycle, derived client-side from its four contributing
- * fields (there is no `state` column on the wire). Order matters: a revoked
- * token reads "revoked" even if it's also past its expiry or used up.
- *
- * "used up" deliberately folds into "expired": a token that has spent all its
- * uses is, for every purpose an operator cares about, no longer usable — same
- * as one past its time expiry — so both read the same way (`warn` tone). The
- * uses column (`t.uses`/`t.max_uses`) still shows `1/1` on the row, so which
- * kind of "expired" it is isn't lost, just not its own label. Revoke button
- * visibility (active-only) is unaffected — it was never gated on "used up"
- * specifically.
+ * Derived client-side (no `state` column on the wire). Order matters:
+ * revoked wins over expiry. "Used up" folds into "expired" — both read as
+ * `warn` since neither is usable to an operator; `uses`/`max_uses` on the
+ * row still shows which kind it is.
  */
 export type TokenState = "revoked" | "expired" | "active";
 
@@ -79,7 +72,6 @@ export function tokenState(t: {
   return "active";
 }
 
-/** fail/warn/ok, per the design. */
 export function tokenTone(state: TokenState): Tone {
   switch (state) {
     case "revoked":

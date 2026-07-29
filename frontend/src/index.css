@@ -19,10 +19,9 @@
   --font-display: "Archivo Black", "Archivo", system-ui, sans-serif;
 }
 
-/* ─── Argus identity: asset tag, hazard yellow on black ───────────────────
-   These override the rnui-themes values. Brand and status FILLS are the same
-   in both themes (that is what makes the asset tag ground-agnostic); only the
-   chrome and the *-text variants change. */
+/* Argus identity: hazard yellow on black, overriding rnui-themes. Status
+   FILLS stay identical in both themes (what makes the asset tag
+   ground-agnostic) — only chrome and the *-text variants change. */
 
 :root {
   --radius: 0rem;
@@ -175,13 +174,10 @@
   margin-right: 5px;
 }
 
-/* shiki dual-theme activation. rnui's CodeBlock renders with
-   `defaultColor: false`, so every token carries ONLY `--shiki-light` /
-   `--shiki-dark` custom properties and no inline color — without these
-   rules the block renders in the inherited foreground (i.e. no
-   highlighting at all). Neither rnui-react nor rnui-themes ships this
-   mapping; it is the consumer's job (shiki docs, "dual themes").
-   Dark mode is `.dark` on <html> (next-themes), same as everywhere else. */
+/* shiki dual-theme activation: CodeBlock renders with `defaultColor: false`
+   (tokens carry only --shiki-light/-dark custom props, no inline color),
+   and neither rnui-react nor rnui-themes maps them — without this, no
+   highlighting at all. */
 .shiki,
 .shiki span {
   color: var(--shiki-light);
@@ -197,10 +193,9 @@
   font-weight: var(--shiki-dark-font-weight);
 }
 
-/* uPlot legend, restyled to the app's idiom. uPlot renders it as
-   table.u-legend.u-inline when `live: false`; markers carry the series
-   stroke as an inline border color, so only shape/size/typography are
-   overridden here. */
+/* uPlot legend (table.u-legend.u-inline when `live: false`) restyled to
+   the app's idiom. Markers already carry the series stroke as an inline
+   border color, so only shape/size/typography are overridden here. */
 table.u-legend.u-inline {
   margin-top: 0.5rem;
 }

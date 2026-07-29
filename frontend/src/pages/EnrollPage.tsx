@@ -1,7 +1,6 @@
 // The Enroll page: mint a join token for a new agent, show the raw secret
 // exactly once, and manage existing tokens (usage/expiry/revoke). Mirrors
-// SignIn.tsx's form structure (react-hook-form + zod via Controller + rnui
-// Field/FieldLabel/FieldError, `noValidate`).
+// SignIn.tsx's form structure (react-hook-form + zod, rnui Field/FieldError).
 import { useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm } from "react-hook-form";
@@ -96,9 +95,9 @@ function toMintBody(values: MintFormValues): MintTokenBody {
 }
 
 export default function EnrollPage() {
-  // Owns the one `useMintToken()` instance and both dialogs' open state at the
-  // page level — the "Mint a token" trigger lives in PageHeader's `actions`
-  // slot, a sibling of `MintDialogs` rather than a descendant.
+  // Owns the one `useMintToken()` instance and both dialogs' open state —
+  // the "Mint a token" trigger lives in PageHeader's `actions` slot, a
+  // sibling of `MintDialogs` rather than a descendant.
   const mintMutation = useMintToken();
   const [mintOpen, setMintOpen] = useState(false);
   const [resultOpen, setResultOpen] = useState(false);
@@ -133,14 +132,13 @@ export default function EnrollPage() {
 }
 
 /**
- * The two mint dialogs (form + result) only — the "Mint a token" trigger lives
- * in PageHeader's `actions` slot. State (including the shared `useMintToken()`
- * mutation) is owned by `EnrollPage` and threaded down as props so the header
- * button and these dialogs, not in the same subtree, stay in sync without a
+ * The two mint dialogs (form + result) only — the "Mint a token" trigger
+ * lives in PageHeader's `actions` slot. State (including the shared
+ * `useMintToken()` mutation) is owned by `EnrollPage` so the header button
+ * and these dialogs, not in the same subtree, stay in sync without a
  * portal. The mutation must live above whichever dialog is mounted so
- * `mintMutation.data` survives the form dialog closing (`MintTokenForm`
- * unmounts on close — see the Dialog below) long enough for the result dialog
- * to read it.
+ * `mintMutation.data` survives the form dialog closing (it unmounts on
+ * close) long enough for the result dialog to read it.
  */
 function MintDialogs({
   mintMutation,
@@ -158,15 +156,12 @@ function MintDialogs({
   return (
     <>
       {/* Dialog 1: the mint form. A normal dismissable dialog (Escape,
-          outside-click, and the built-in X all close it) — unlike the result
-          dialog below, nothing here is destructive or shown only once.
-          `MintTokenForm` is DialogContent's direct child; rnui's
-          `DialogContent` wraps `Dialog.Portal` with no `keepMounted`
-          (defaults to `false`), so the portal — and `MintTokenForm` with
-          it — unmounts once the close transition finishes. That gives the
-          form fresh `useForm()` state on every open for free, the same
-          mechanism MachineDetailPage's identity Dialog relies on for
-          `MachineIdentity` (see its comment for the precedent). */}
+          outside-click, X all close it) — unlike the result dialog below,
+          nothing here is destructive or shown only once. rnui's
+          `DialogContent` wraps `Dialog.Portal` with no `keepMounted`, so it
+          — and `MintTokenForm` with it — unmounts on close, giving the form
+          fresh `useForm()` state on every open (same mechanism as
+          MachineDetailPage's identity Dialog). */}
       <Dialog open={mintOpen} onOpenChange={setMintOpen}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
@@ -185,30 +180,26 @@ function MintDialogs({
         </DialogContent>
       </Dialog>
 
-      {/* Dialog 2: the result. The raw token is shown exactly once, so an
-          accidental Esc or outside click must not close it — hence AlertDialog
-          (which blocks outside-press via `disablePointerDismissal`) plus an
-          `onOpenChange` guard that cancels every close attempt: AlertDialog does
-          NOT block Escape on its own, easy to assume from the name but base-ui
-          only gates outside-press that way. Canceling in `onOpenChange` runs
-          before base-ui touches its own open state, so a canceled Escape/outside
-          press never starts an exit transition — no flicker back open. The
-          "Done" button sets `resultOpen` directly instead, bypassing this guard
-          entirely, so it's the only path that actually closes the dialog. */}
+      {/* Dialog 2: the result. The raw token shows exactly once, so an
+          accidental Esc/outside-click must not close it — hence AlertDialog
+          (blocks outside-press via `disablePointerDismissal`) plus an
+          `onOpenChange` guard that cancels every close attempt: AlertDialog
+          does NOT block Escape on its own (easy to assume from the name).
+          Canceling runs before base-ui touches its own open state, so no
+          flicker back open. The "Done" button sets `resultOpen` directly,
+          bypassing this guard — the only path that actually closes it. */}
       <AlertDialog
         open={resultOpen}
         onOpenChange={(open, eventDetails) => {
           if (!open) eventDetails.cancel();
         }}
       >
-        {/* `AlertDialogContent`'s own width classes use a compound
-            `data-[size=default]:...` modifier chain, not a plain `sm:` chain — an
-            override like `sm:max-w-lg` uses a different chain, so tailwind-merge
-            can't tell it conflicts with the base and won't dedupe it; both classes
-            ship and stylesheet emission order (not source order) decides which
-            wins (the cascade trap docs/DEV.md's frontend design-system section
-            calls out). Match the base's `data-[size=default]:` chain here so
-            tailwind-merge drops the base and this wins deterministically. */}
+        {/* `AlertDialogContent`'s width classes use a compound
+            `data-[size=default]:...` chain, not a plain `sm:` chain — an
+            override like `sm:max-w-lg` can't be recognized as conflicting,
+            so both classes ship and stylesheet emission order decides which
+            wins (see docs/DEV.md's cascade-trap section). Match the base's
+            chain here so tailwind-merge drops it and this wins for real. */}
         <AlertDialogContent className="data-[size=default]:max-w-sm data-[size=default]:sm:max-w-2xl">
           <AlertDialogHeader>
             <AlertDialogTitle>Token minted</AlertDialogTitle>
@@ -239,23 +230,19 @@ function MintTokenForm({
   onMinted: () => void;
 }) {
   const form = useForm<MintFormValues>({
-    // `z.coerce.number()` gives the schema an *input* type of `unknown` for
-    // `max_uses`/`expires_in_hours` (any input is accepted pre-coercion), so
-    // `zodResolver`'s inferred `Resolver<Input, ..., Output>` doesn't line up
-    // with `useForm<MintFormValues>` (the *output*/post-coercion shape this
-    // form actually reads and writes everywhere else — `defaultValues`,
-    // `Controller`'s `field.value`, `onSubmit`). The cast is safe: at
-    // runtime the resolver still coerces exactly per the schema; only the
-    // TS-side input/output split (a well-known zod-coerce + RHF typing gap)
-    // needed reconciling.
+    // `z.coerce.number()` gives `max_uses`/`expires_in_hours` an *input*
+    // type of `unknown` (pre-coercion), so `zodResolver`'s inferred
+    // `Resolver<Input, ..., Output>` doesn't match `useForm<MintFormValues>`
+    // (the *output* shape used everywhere else). The cast is safe: at
+    // runtime the resolver still coerces per the schema — only the TS-side
+    // input/output split (a known zod-coerce + RHF typing gap) needs it.
     resolver: zodResolver(mintSchema) as Resolver<MintFormValues>,
     defaultValues: defaultMintValues,
   });
 
   // Drives disabling the paired number input — checked "unlimited"/"never
-  // expires" means whatever is typed in the number field is ignored at
-  // submit (see `toMintBody`), so disabling it is honest about that rather
-  // than leaving a number field editable but pointless.
+  // expires" means the typed value is ignored at submit (see `toMintBody`),
+  // so disabling it is honest about that rather than pointless-but-editable.
   const unlimitedUses = form.watch("unlimited_uses");
   const neverExpires = form.watch("never_expires");
 
@@ -264,11 +251,9 @@ function MintTokenForm({
   };
 
   return (
-    // No Card here — this component is dialog-only (MintDialogs mounts it
-    // inside DialogContent, which already supplies the frame and the
-    // visible heading via DialogTitle/DialogDescription). Same reasoning as
-    // MachineIdentity.tsx's dialog-only form: a Card wrapper would nest its
-    // own border inside the dialog's, rendering as a visible double border.
+    // No Card here — dialog-only (MintDialogs mounts it inside
+    // DialogContent, which already supplies the frame/heading). Same
+    // reasoning as MachineIdentity.tsx's dialog-only form.
     <>
       {mintMutation.error !== null && (
         <Alert variant="destructive" className="mb-4">
@@ -453,12 +438,10 @@ function MintTokenForm({
 }
 
 function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
-  // `--config` reads the same four keys from an env-file (`KEY=VALUE` per line
-  // — a subset of systemd's `EnvironmentFile=` syntax) instead of the process
-  // environment (docs/DEV.md, "Enroll an agent" § Alternative). The file
-  // survives a reboot and doubles unchanged as a systemd unit's
-  // `EnvironmentFile=` later — why this block writes the file first rather
-  // than passing the four values as env vars directly.
+  // `--config` reads the same four keys from an env-file (`KEY=VALUE`, a
+  // subset of systemd's `EnvironmentFile=` syntax) instead of the process
+  // environment (docs/DEV.md). The file survives a reboot and doubles
+  // unchanged as a systemd unit's `EnvironmentFile=` later.
   const runBlock = [
     "sudo tee /etc/argus/agent.env <<'EOF'",
     "ARGUS_AGENT_ENDPOINT=https://<agent-endpoint>:9443",
@@ -474,17 +457,16 @@ function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
   ].join("\n");
 
   return (
-    // No Card here, same reasoning as MintTokenForm — this panel only ever
+    // No Card here, same reasoning as MintTokenForm — this panel only
     // renders inside the result AlertDialog, which already supplies the
-    // frame and the "Token minted" heading via AlertDialogHeader.
+    // frame/heading.
     //
-    // `min-w-0` here (and `max-w-full` on the boxes below) stops this column
-    // forcing the dialog wider than its own `max-w-*`: a flex/grid item's
-    // default min-width is its content's intrinsic width, and an unbroken
-    // token string or code block is wide enough to overflow the panel
-    // regardless of dialog sizing. `CodeBlock` already wraps its code in
-    // `overflow-x-auto` with `overflow-hidden` on its outer wrapper, so the
-    // command block below doesn't need a second scrolling wrapper.
+    // `min-w-0` (and `max-w-full` below) stops this column forcing the
+    // dialog wider than its own `max-w-*`: a flex/grid item's default
+    // min-width is its content's intrinsic width, and an unbroken token
+    // string is wide enough to overflow regardless of dialog sizing.
+    // `CodeBlock` already wraps in `overflow-x-auto`, so the command block
+    // below doesn't need a second scrolling wrapper.
     <div className="flex min-w-0 flex-col gap-4">
       <div className="flex max-w-full items-center gap-2 rounded-lg border border-border bg-muted/40 px-3 py-2">
         <code className="min-w-0 flex-1 select-all break-all font-mono text-sm">{data.token}</code>
@@ -502,11 +484,10 @@ function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
       </Button>
 
       <div className="min-w-0 max-w-full">
-        {/* vesper: near-black surface with amber accents — the closest bundled
-            theme to the app's black-and-hazard-yellow identity; min-light is
-            its restrained light-mode counterpart. Any theme named here must
-            ALSO be registered in lib/shiki-slim.ts, or the block silently
-            renders as plain text. */}
+        {/* vesper: near-black surface with amber accents, closest bundled
+            theme to the app's identity; min-light is its light-mode
+            counterpart. Any theme named here must ALSO be registered in
+            lib/shiki-slim.ts, or the block silently renders as plain text. */}
         <CodeBlock
           code={runBlock}
           language="bash"
@@ -530,8 +511,7 @@ function TokenTable() {
 
   // The row a revoke confirm is pending for; `null` when the AlertDialog is
   // closed. Controlled (not an AlertDialogTrigger per row) so the dialog's
-  // content can depend on which row was clicked, same shape as
-  // MachineDetailPage's edit Dialog.
+  // content can depend on which row was clicked.
   const [revokeTarget, setRevokeTarget] = useState<EnrollmentToken | null>(null);
 
   function openRevoke(t: EnrollmentToken) {

@@ -9,21 +9,18 @@ import { Unauthenticated, useMe } from "./lib/session";
 import "./index.css";
 
 /**
- * The one place a 401 from ANY endpoint (fleet/machine/metrics/docker/
- * systemd/verbs/log pages -- all mapped to `Unauthenticated` in api.ts, same
- * as `/api/me` in session.ts) turns into the single signal `Gate` reacts to.
+ * The one place a 401 from ANY endpoint (all mapped to `Unauthenticated` in
+ * api.ts/session.ts) turns into the single signal `Gate` reacts to.
  *
  * Without this, TanStack Query keeps the last-known-good `data` on a failed
- * refetch, so a session that dies mid-visit would render a per-page "request
- * failed: 401" banner on every poll forever instead of asking the operator
- * to sign in again (design doc §13).
+ * refetch, so a session that dies mid-visit would render a per-page
+ * "request failed: 401" banner forever instead of asking to sign in again
+ * (design doc §13).
  *
- * `queryKeyRoot` is omitted for mutation errors (mutations have no query
- * key) and is deliberately checked against `"me"` for query errors: `/api/me`
- * failing already updates `useMe()`'s own `error`, which `Gate` reads
- * directly below, so re-invalidating `["me"]` from its OWN failure would just
- * requeue another `/api/me` fetch that fails the same way -- an invalidation
- * storm against a session that is already known to be gone.
+ * `queryKeyRoot` is checked against `"me"` because `/api/me` failing already
+ * updates `useMe()`'s own `error`, which `Gate` reads directly — re-
+ * invalidating `["me"]` from its OWN failure would just requeue another
+ * failing fetch, an invalidation storm against a session already known gone.
  */
 function flipGateOnAuthError(error: unknown, queryKeyRoot?: unknown) {
   if (!(error instanceof Unauthenticated) || queryKeyRoot === "me") return;

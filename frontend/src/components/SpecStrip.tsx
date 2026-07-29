@@ -2,10 +2,6 @@ import type { ReactNode } from "react";
 
 export type SpecItem = { label: string; value: ReactNode };
 
-/**
- * A row of labelled facts. Each cell carries its own key, so fields can be
- * added or omitted without the reader having to track positions.
- */
 export default function SpecStrip({ items }: { items: SpecItem[] }) {
   return (
     <div className="flex flex-wrap border border-border">

@@ -1,6 +1,5 @@
 import { cn } from "../lib/cn";
 
-/** Uppercase display title. */
 export default function PageHeader({
   title,
   meta,

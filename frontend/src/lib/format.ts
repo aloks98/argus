@@ -70,10 +70,9 @@ export function formatUptime(bootTimeIso: string): string {
 }
 
 /**
- * Absolute local date+time (e.g. "7/29/2026, 3:04:00 PM") for facts where the
- * exact instant matters more than "how long ago" — the System tab's Boot
- * time and Enrolled rows. Returns "" for an unparseable timestamp, same
- * omit-the-row contract as `formatUptime`.
+ * Absolute local date+time (e.g. "7/29/2026, 3:04:00 PM") for facts where
+ * the exact instant matters more than "how long ago" (System tab's Boot
+ * time, Enrolled). Returns "", same omit-the-row contract as `formatUptime`.
  */
 export function formatDateTime(iso: string): string {
   const d = new Date(iso);
