@@ -69,8 +69,9 @@ flowchart LR
 
 ## Installing Argus
 
-Tagged releases ship three ways — see [`RELEASING.md`](RELEASING.md) for how
-they're built and exactly where each one lives.
+Tagged releases ship three ways. Tarballs and checksums attach to the
+[Forgejo release page](https://git.nexus.e412.in/aloks98/argus/releases);
+images and the Helm chart live on ghcr.io.
 
 ### Binary tarball
 ```bash

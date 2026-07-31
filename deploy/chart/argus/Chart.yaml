@@ -2,7 +2,7 @@
 #
 # `version` and `appVersion` are stamped from the release tag at package time
 # (`helm package --version <ver> --app-version <ver>`, driven by the
-# `chart` job in release.yml -- see RELEASING.md). The values committed here
+# `chart` job in release.yml -- see docs/DEV.md "Releasing"). The values committed here
 # are dev placeholders; `helm lint`/`helm template` in CI run against them
 # unpinned, they are not what ships.
 apiVersion: v2

@@ -1,56 +1,18 @@
-# Tag-driven release pipeline. Produces the three distribution forms
-# described in the release design doc (git history; see also RELEASING.md): bare-metal
-# tarballs (Forgejo Release attachments), Docker images (ghcr.io), and a Helm
-# chart (OCI push + Release attachment).
+# Tag-driven release pipeline: tarballs (Forgejo Release), Docker images
+# (ghcr.io), Helm chart (OCI + Release attachment). See docs/DEV.md "Releasing".
 #
-# Two trigger shapes:
-#   - `push: tags: v*`   -- the real thing. Version comes from the tag,
-#     checked against workspace Cargo.toml (hard fail on mismatch). Every
-#     publish step runs.
-#   - `workflow_dispatch` -- the rehearsal. Every job still builds, but NO
-#     publish step runs (release creation, asset upload, docker push, helm
-#     push) -- gated by `if: github.event_name == 'push'` throughout. Version
-#     is the fixed placeholder `0.0.0-dry`, no Cargo.toml check. The `dry_run`
-#     input exists to document intent on the dispatch form; it is NOT read
-#     anywhere below because a dispatch run never publishes regardless of its
-#     value -- the real gate is the event type, not the flag.
+# Triggers: `push: tags: v*` = real release (version from the tag, checked
+# against Cargo.toml). `workflow_dispatch` = rehearsal -- builds everything,
+# publishes NOTHING (every publish step is gated on the push event; the
+# dry_run input only documents intent).
 #
-# `contents: write` is requested workflow-wide so the auto-issued
-# secrets.GITHUB_TOKEN can create the Release and attach assets (GitHub's
-# permission model, which Forgejo Actions mirrors). NOT YET EMPIRICALLY
-# VERIFIED that this instance's Forgejo Actions token honors `permissions:`
-# the same way, nor that it has release-creation scope at all -- can't be
-# fully proven without a real tag push (see task-4-report.md / RELEASING.md).
-# If release creation 403s, swap to a dedicated RELEASE_TOKEN secret (a PAT
-# with write:repository scope) in the `artifacts` job's "Create Forgejo
-# release" step.
-#
-# A JOB-LEVEL, RUNNER-SPECIFIC BUG SHAPES THIS FILE'S STRUCTURE, confirmed
-# empirically during this task's dry-run rehearsal (6-run bisection, see
-# task-4-report.md for the full trail): on this Forgejo instance's runner,
-# writing to $GITHUB_OUTPUT from a step that runs inside a job-level
-# `container:` reproducibly FAILS the step (same script, same job, succeeds
-# immediately with `container:` removed; fails immediately -- and ONLY --
-# when a step with `id:` + a `$GITHUB_OUTPUT` write runs under `container:`).
-# Reading `${{ steps.X.outputs.Y }}` / `${{ needs.X.outputs.Y }}` is
-# unaffected (that substitution happens at the orchestration layer before a
-# container step ever starts). Consequences below:
-#   - Version/tag computation lives in its own uncontainerized `version` job
-#     (plain bash + grep, no toolchain needed) instead of inside `artifacts`
-#     or `images` -- both of the latter now `needs: version` and read its
-#     outputs, which also removes what used to be duplicated tag/Cargo.toml
-#     check logic in each.
-#   - Within `artifacts` (which DOES need `container:`, for cargo/pnpm),
-#     step-to-step handoffs (release notes JSON, the created release's id)
-#     go through plain files in the job workspace instead of
-#     $GITHUB_OUTPUT -- the workspace itself IS shared across a job's steps
-#     regardless of `container:` (that's how package-release.sh's own build
-#     output already reaches later steps).
-#   - `chart` no longer consumes a cross-job `release_id` output from
-#     `artifacts` (that output would have to come from a step running inside
-#     `artifacts`'s `container:`, hitting the same bug) -- instead it looks
-#     the release up by tag via the Forgejo API once it starts. `needs:
-#     artifacts` still guarantees the release exists by then.
+# Runner constraints that shape this file (empirically confirmed):
+#   - $GITHUB_OUTPUT writes FAIL inside job-level `container:` steps -- so
+#     `version` is uncontainerized, intra-job handoffs use workspace files,
+#     and `chart` looks the release up via API instead of a cross-job output.
+#   - `permissions:` is IGNORED by Forgejo (its warning says use Authorized
+#     Integrations instead). If release creation 403s: grant the Actions
+#     token release scope there, or swap in a RELEASE_TOKEN secret (PAT).
 name: Release
 
 on:
@@ -63,29 +25,18 @@ on:
         type: boolean
         default: true
 
-permissions:
-  contents: write
-
-# Never let two release runs for the same ref race each other -- a partially
-# published release (assets uploaded twice, or a push interleaved with a
-# dry run) is worse than making the second run wait. No cancel-in-progress:
-# a real release publishing assets should never be killed mid-flight.
-# act_runner executes container-job run steps with `sh` (dash) unless told
-# otherwise -- every `set -euo pipefail` (a bashism) then dies instantly with
-# "Illegal option -o pipefail". Uncontainerized jobs happened to get bash,
-# which is why only container jobs failed. Pin bash for every step.
+# Container jobs get dash unless pinned -- `set -o pipefail` dies instantly.
 defaults:
   run:
     shell: bash
 
+# No cancel-in-progress: never kill a release mid-publish.
 concurrency:
   group: release-${{ github.ref }}
 
 jobs:
-  # Single source of truth for the release version + the tag/Cargo.toml
-  # check. Deliberately uncontainerized (see the header comment) -- this job
-  # needs nothing beyond grep/bash, so that costs nothing. `artifacts` and
-  # `images` both `needs: version` and read its outputs.
+  # Version truth + tag/Cargo.toml check. Uncontainerized on purpose
+  # (header note); `artifacts` and `images` read its outputs.
   version:
     runs-on: small
     outputs:
@@ -95,13 +46,8 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # Tag-push: version comes from the tag, hard-checked against
-      # Cargo.toml (workspace version truth -- CLAUDE.md/constraints.md).
-      # `image_tag` keeps the tag's literal `v` prefix (e.g. "v0.1.0") for
-      # Docker/OCI tags per the brief; `version` strips it to match
-      # Cargo.toml's format ("0.1.0") for the tarballs and the chart.
-      # Dispatch: no tag exists yet, so skip the check and use a fixed
-      # placeholder that can never collide with a real release version.
+      # `image_tag` keeps the `v` prefix (docker/OCI tags); `version` strips
+      # it (tarballs, chart semver). Dispatch uses a non-colliding placeholder.
       - name: Determine version
         id: compute
         run: |
@@ -120,10 +66,8 @@ jobs:
             echo "image_tag=0.0.0-dry" >> "$GITHUB_OUTPUT"
           fi
 
-  # Bare-metal tarballs: build, create the Forgejo Release, upload assets.
-  # Everything after "Package release artifacts" that touches the Forgejo API
-  # is push-only. Intra-job handoffs go through plain files in the workspace,
-  # not $GITHUB_OUTPUT -- see the header comment.
+  # Tarballs -> Forgejo Release. API steps are push-only; intra-job
+  # handoffs use workspace files (header note).
   artifacts:
     runs-on: medium
     needs: version
@@ -133,20 +77,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      # scripts/package-release.sh cross-compiles the agent for
-      # x86_64-unknown-linux-musl, which needs a musl C toolchain for the
-      # linker -- catthehacker/ubuntu:rust-24.04 does NOT ship musl-tools by
-      # default (confirmed empirically: `which musl-gcc` and `rustup target
-      # list --installed` both come up empty in this image). ci.yml's
-      # dedicated agent-musl job installs it the same way for the same
-      # reason, and without it package-release.sh's agent build WOULD fail --
-      # this is a real, necessary fix regardless of the item below.
-      #
-      # User request: the musl std target (~30MB via rustup) and the cargo
-      # registry re-download on every run. actions/cache needs act_runner's
-      # cache server; if it's unavailable the step degrades to a warning and
-      # the job still passes -- verified by rehearsal either way.
-      - name: Cache musl target + cargo registry
+      - name: Cache cargo registry
         uses: actions/cache@v4
         with:
           # The cargo registry ONLY. Do NOT cache the rustup target dir: the
@@ -165,27 +96,16 @@ jobs:
           apt-get update
           apt-get install -y --no-install-recommends musl-tools
 
-      # sqlx's query!/query_scalar! macros compile-time-check against a live
-      # Postgres unless SQLX_OFFLINE=true, in which case they use the
-      # committed .sqlx/ cache instead -- same mechanism Dockerfile.server and
-      # ci.yml's Clippy step already rely on. This runner container has no
-      # database reachable, so without this `cargo build --release -p
-      # argus-server` inside the script fails with "Connection refused"
-      # (the exact failure task-2's report hit building the server image).
+      # SQLX_OFFLINE: no database in this container; the committed .sqlx/
+      # cache is the compile-time source (same as Clippy and the Dockerfile).
       - name: Package release artifacts
         env:
           SQLX_OFFLINE: "true"
           CC_x86_64_unknown_linux_musl: musl-gcc
         run: scripts/package-release.sh "${{ needs.version.outputs.version }}"
 
-      # Release notes = `git log --oneline` since the previous tag. v0.1.0 (or
-      # any dispatch rehearsal before a first tag exists) has no previous tag
-      # to diff against, so fall back to the full log instead of failing.
-      # JSON-escaped via python3 so embedded quotes/newlines in commit
-      # subjects can't break the release-creation payload below. Only this
-      # (push-only) step needs full history -- fetched here instead of
-      # paying for a full clone on the default checkout above, on every run
-      # including dry runs that never reach this step.
+      # Notes = git log since the previous tag (full log when none exists,
+      # e.g. v0.1.0); JSON-escaped; history fetched only in this push-only step.
       - name: Build release notes
         if: ${{ github.event_name == 'push' }}
         run: |
@@ -269,7 +189,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${GHCR_USER:-}" ] || [ -z "${GHCR_TOKEN:-}" ]; then
-            echo "ERROR: GHCR_USER and/or GHCR_TOKEN secrets are not set on this repo -- cannot push images. Configure them before releasing; see RELEASING.md prerequisites." >&2
+            echo "ERROR: GHCR_USER and/or GHCR_TOKEN secrets are not set on this repo -- cannot push images. Configure them before releasing; see docs/DEV.md "Releasing"." >&2
             exit 1
           fi
 
@@ -350,7 +270,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${GHCR_USER:-}" ] || [ -z "${GHCR_TOKEN:-}" ]; then
-            echo "ERROR: GHCR_USER and/or GHCR_TOKEN secrets are not set on this repo -- cannot push the chart. Configure them before releasing; see RELEASING.md prerequisites." >&2
+            echo "ERROR: GHCR_USER and/or GHCR_TOKEN secrets are not set on this repo -- cannot push the chart. Configure them before releasing; see docs/DEV.md "Releasing"." >&2
             exit 1
           fi
           echo "$GHCR_TOKEN" | helm registry login ghcr.io -u "$GHCR_USER" --password-stdin
