@@ -2,37 +2,70 @@
 
 > The hundred-eyed watchman.
 
-Centralized fleet management for a multi-Proxmox-host homelab — "Cockpit, but
-centralized". One control plane for observability, terminal access, and lifecycle
-operations across many VMs and LXCs, without SSH-ing into each guest. Argus *sees
-and operates* the fleet; it is **not** a deployment platform.
+**Centralized fleet management for homelabs** — "Cockpit, but centralized."
+One control plane for observability, terminal access, and lifecycle
+operations across all your VMs and LXCs, without SSH-ing into each guest.
+Argus *sees and operates* the fleet; it is deliberately **not** a deployment
+platform.
 
-- **Design of record:** [`docs/PRD.md`](docs/PRD.md)
-- **Conventions & the decisions that must not be reopened:** [`CLAUDE.md`](CLAUDE.md)
+![Fleet overview](docs/screenshots/fleet.png)
 
-## Architecture at a glance
-- Single Rust **control plane** (`argus`) with an embedded React frontend; stateless,
-  all state in Postgres.
-- Thin Rust **agent** (`argus-agent`) on each guest that dials outbound and holds one
-  persistent **mTLS gRPC** stream; everything (metrics, docker/systemd state, logs,
-  terminal) is multiplexed over it.
-- Internal CA (no external dependency); Postgres via `sqlx` with embedded migrations.
+## What it does
 
-## Layout
+- **Live fleet dashboard** — every machine's status, CPU/memory sparklines,
+  and failed-unit counts on one page, with search, tags, and grouping.
+- **Metrics history** — CPU, memory, load, disk, and network charts per
+  machine; plain Postgres storage, no time-series database to operate.
+- **Docker & systemd** — container and unit state with start/stop/restart
+  verbs, executed over the agent's authenticated stream and audited.
+- **Logs on demand** — journald (whole system or per unit) and container
+  logs, tailed live with priority/time filters and backward paging. Logs
+  are pulled when you look, never shipped continuously.
+- **Interactive terminal** — a real PTY in the browser (xterm.js),
+  multiplexed over the same single connection as everything else.
+- **Hardware inventory** — processor, cores, boot time/uptime,
+  virtualization type (KVM vs LXC matters on a Proxmox fleet), disk,
+  memory, swap.
+- **Authentication** — any spec-compliant OIDC provider (only the issuer is
+  provider-specific), plus a rate-limited local break-glass account for
+  when SSO is down. Every verb writes an audit row.
+- **Phone-friendly PWA** — check the fleet and restart a unit from your
+  couch; installable to a home screen.
+
+| | |
+|---|---|
+| ![Machine detail](docs/screenshots/machine.png) | ![System inventory](docs/screenshots/system.png) |
+
+## How it works
+
+```mermaid
+flowchart LR
+    subgraph guests [Every VM / LXC]
+        A[argus-agent<br/>static musl binary]
+    end
+    subgraph cp [Control plane]
+        S[argus<br/>Rust + embedded React UI]
+        P[(Postgres)]
+    end
+    B[Browser] -->|HTTPS + OIDC| S
+    A -->|one outbound mTLS gRPC stream| S
+    S --- P
 ```
-crates/proto    gRPC contract (argus.proto) + codegen
-crates/common   shared constants/types
-crates/server   control plane (bin: argus) + embedded migrations
-crates/agent    guest agent (bin: argus-agent)
-frontend/       Vite + React + @e412/rnui-react, embedded into argus
-```
 
-## Build
-The frontend must be built before the server (it is embedded via `rust-embed`):
-```bash
-pnpm --dir frontend install --frozen-lockfile && pnpm --dir frontend run build
-cargo build --release
-```
+- The **agent** is a single static binary that dials *outbound* and holds
+  one persistent mTLS gRPC stream. Metrics, container/unit state, logs, and
+  terminal bytes are all multiplexed over it — one connection, one identity,
+  no inbound ports on guests.
+- Identity is an **internal CA**: enrollment exchanges a single-use join
+  token (minted in the UI) for a client certificate; the CA's private key
+  is encrypted at rest in Postgres. No external PKI.
+- The **control plane** is stateless — all state lives in Postgres,
+  migrations are embedded and run on startup. Kill it, restart it, move it;
+  agents reconnect on their own.
+- The browser surface and the agent gRPC surface are **separate
+  endpoints** by design: humans arrive through your HTTPS proxy and OIDC;
+  agents terminate mTLS directly in the process — client-cert verification
+  is never delegated to a middlebox.
 
 ## Installing Argus
 
@@ -64,8 +97,8 @@ docker run -d --name argus --network host \
 ```
 The control plane is stateless and containerizes cleanly. The **agent**
 doesn't — it needs host mounts (Docker socket, D-Bus, journal) that are easy
-to forget and silently degrade a slice instead of failing loudly. Prefer the
-tarball above for agents; if you still want the container,
+to forget and silently degrade a feature instead of failing loudly. Prefer
+the tarball for agents; if you still want the container,
 [`deploy/docker/README.md`](deploy/docker/README.md) has the full mount list
 and the caveats.
 
@@ -76,8 +109,7 @@ kubectl create secret generic argus-env \
   --from-literal=ARGUS_FIELD_KEY="$(openssl rand -base64 32)" \
   --from-literal=ARGUS_PUBLIC_URL=https://argus.example.com
 
-helm install argus oci://ghcr.io/aloks98/charts/argus --version 0.1.0 \
-  --set image.repository=ghcr.io/aloks98/argus
+helm install argus oci://ghcr.io/aloks98/charts/argus --version 0.1.0
 ```
 The chart never templates secret values — `existingSecret: argus-env` (the
 name above) is a hard requirement, not a default to trust. See
@@ -91,7 +123,31 @@ command it prints — endpoint, token, and CA certificate download, ready to
 paste onto the host. Don't hand-type `ARGUS_JOIN_TOKEN`; the page is the
 source of truth for it.
 
-> **Status:** actively developed. Core slices are live — enrollment/mTLS,
-> metrics, Docker + systemd state and verbs, log tailing, interactive
-> terminal, OIDC + local-admin auth, machine inventory, and a responsive
-> PWA frontend. Design of record: [`docs/PRD.md`](docs/PRD.md).
+## Developing
+
+```
+crates/proto    gRPC contract (argus.proto) + codegen (protoc-free)
+crates/common   shared constants/types
+crates/server   control plane (bin: argus) + embedded migrations
+crates/agent    guest agent (bin: argus-agent), musl-static
+frontend/       Vite + React, embedded into argus via rust-embed
+```
+
+The frontend must be built before the server (it's embedded):
+```bash
+pnpm --dir frontend install --frozen-lockfile && pnpm --dir frontend run build
+cargo build --release
+```
+
+- **Design of record:** [`docs/PRD.md`](docs/PRD.md)
+- **Dev environment & operational notes:** [`docs/DEV.md`](docs/DEV.md)
+- **Conventions:** [`CLAUDE.md`](CLAUDE.md)
+
+This repo's canonical home is a self-hosted Forgejo; the GitHub repo is a
+public mirror. Release artifacts (tarballs) attach to Forgejo Releases;
+container images and the Helm chart live on ghcr.io either way.
+
+## License
+
+[AGPL-3.0](LICENSE). Run it, fork it, improve it — if you offer a modified
+Argus to others over a network, share your changes.
