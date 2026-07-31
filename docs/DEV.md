@@ -128,7 +128,7 @@ under `sudo -n`, which does not carry your shell's exports through, unlike the
 missing or unreadable `--config` path IS a hard startup error.
 
 ## Spine end-to-end verification (2026-07-06)
-Verified manually per the plan's Task 11 (`docs/plans/2026-07-05-spine-slice.md`):
+Verified manually per the plan's Task 11 (the `2026-07-05-spine-slice.md` plan (git history)):
 
 - Agent enrolled (`agent_id=284b631f-…`) and connected over mTLS; `GET /api/fleet`
   returned it `online` (`hostname=fatman`, `os=Debian 13 (trixie)`,
@@ -143,7 +143,7 @@ Verified manually per the plan's Task 11 (`docs/plans/2026-07-05-spine-slice.md`
   machine returned to `online` with a fresh `last_seen_at` — no agent restart.
 
 ## Metrics slice end-to-end verification (2026-07-07)
-Verified manually per the plan's Task 10 (`docs/plans/2026-07-07-metrics-slice.md`):
+Verified manually per the plan's Task 10 (the `2026-07-07-metrics-slice.md` plan (git history)):
 
 - A live agent enrolled, connected, and streamed `MetricsSample` frames every 15s;
   rows accumulated in `metrics`.
@@ -185,8 +185,8 @@ container was read-only.
 
 The SPA was given a deliberate visual identity and a shared component/data layer,
 before the systemd / logs / terminal slices each add another screen. Plan:
-`docs/plans/2026-07-23-frontend-design-system.md`; design of record:
-`docs/superpowers/specs/2026-07-23-frontend-design-system-design.md`.
+the `2026-07-23-frontend-design-system.md` plan (git history); design of record:
+the `2026-07-23-frontend-design-system-design.md` design doc (git history).
 
 **Direction — "asset tag".** Industrial rack labelling: a hostname (or container
 name) renders as a solid stencilled tag whose *fill is its status* — that tag is
@@ -400,7 +400,7 @@ readable and the "failed only" checkbox toggles.
 ## Log tailing slice end-to-end verification (2026-07-23)
 
 Verified live against the real system bus and Docker daemon on the dev host.
-Design of record: `docs/superpowers/specs/2026-07-23-log-tailing-design.md`. The
+Design of record: the `2026-07-23-log-tailing-design.md` design doc (git history). The
 agent runs **as root** — journal access for arbitrary units and the Docker
 socket both need it, the same reason the systemd slice's live tests do.
 
@@ -449,7 +449,7 @@ The disposable `argus-flood.service` was removed and the host left with no
 ## Log pagination — manual verification (2026-07-24)
 
 Journal-only "load older" pagination on top of the live SSE tail. Design of
-record: `docs/superpowers/specs/2026-07-24-log-pagination-design.md`. Agent runs
+record: the `2026-07-24-log-pagination-design.md` design doc (git history). Agent runs
 as root (journal access), same as the log slice.
 
 **Endpoint checks (curl), against the live journal:**
@@ -496,7 +496,7 @@ does not do EventSource framing or scroll):** open a unit's logs, then:
 
 Whole-journal source (`journal:@system`) plus a priority ceiling and a time
 window, applied to per-unit journal reads too. Design of record:
-`docs/superpowers/specs/2026-07-24-full-journal-design.md`. Agent runs as root
+the `2026-07-24-full-journal-design.md` design doc (git history). Agent runs as root
 (journal access), same as the earlier log slices.
 
 **The constraint that shapes the whole design** (verified against the live
@@ -561,7 +561,7 @@ the client to echo it on page requests.
 
 Two parts: the deferred log-window bug from PR #8, then agent capability
 reporting. Design of record:
-`docs/superpowers/specs/2026-07-24-capability-reporting-design.md`.
+the `2026-07-24-capability-reporting-design.md` design doc (git history).
 
 ### Part 1 — the log window is now one cutoff per buffer
 
@@ -659,7 +659,7 @@ it).
 
 Interactive shell to a guest: xterm.js ↔ WebSocket ↔ server ↔ the single mTLS
 gRPC `Session` ↔ `portable-pty` on the agent. Design of record:
-`docs/superpowers/specs/2026-07-24-terminal-design.md`. Agent runs as root.
+the `2026-07-24-terminal-design.md` design doc (git history). Agent runs as root.
 
 ### Running it in dev
 
@@ -811,7 +811,7 @@ instead of at the assertion that names the bug.
 Every browser surface (`/api/*`, including the SSE log streams and the terminal
 WebSocket — cookies ride the upgrade request, so one middleware layer covers all
 three transports) now sits behind a signed-in, revocable, Postgres-backed
-session. Design of record: `docs/superpowers/specs/2026-07-25-oidc-design.md`.
+session. Design of record: the `2026-07-25-oidc-design.md` design doc (git history).
 Agents are entirely unaffected: they authenticate by mTLS on the separate agent
 gRPC listener and never touch this path.
 
@@ -1121,7 +1121,7 @@ claim a result that wasn't measured.
 
 ## Local admin (break-glass) — dev setup + live verification (2026-07-26)
 
-Design of record: `docs/superpowers/specs/2026-07-26-local-admin-design.md`.
+Design of record: the `2026-07-26-local-admin-design.md` design doc (git history).
 This is the recovery path for the OIDC slice above: the boot rule becomes
 "OIDC is configured **or** a local admin row exists" (design §4), so a lost
 client secret, a deleted IdP application, or a from-scratch deployment with no
@@ -1317,7 +1317,7 @@ agent-facing check.
 
 ## Fleet identity & navigation — live verification (2026-07-28)
 
-Design of record: `docs/superpowers/specs/2026-07-28-fleet-identity-design.md`.
+Design of record: the `2026-07-28-fleet-identity-design.md` design doc (git history).
 API-level pass run with curl against the dev control plane (branch build,
 migration 0006 applied on startup) and the real dev agent. All green:
 
@@ -1358,7 +1358,7 @@ multi-tag machine; URL round-trip in a fresh tab; Ctrl+K from a cold page.
 
 ## Mobile / responsive pass — verification (2026-07-29)
 
-Design: `docs/superpowers/specs/2026-07-29-mobile-pass-design.md` (see its
+Design: the `2026-07-29-mobile-pass-design.md` design doc (git history) (see its
 amendment). Verified headless at 390×844, BOTH themes, zero page-level
 overflow and zero page errors on: sign-in (both stages), fleet flat +
 grouped (cards below `md`), units/containers (all four verbs on-screen —
@@ -1380,7 +1380,7 @@ entrypoint) and tap fleet → machine → restart a unit.
 
 ## Machine inventory — verification (2026-07-29)
 
-Design: `docs/superpowers/specs/2026-07-29-inventory-design.md`. Agent now
+Design: the `2026-07-29-inventory-design.md` design doc (git history). Agent now
 reports `cpu_model` / `cpu_cores` / `boot_time` / `virt` (additive proto
 fields 10-13; `""`/`0` = not reported → NULL; both write paths coalesce so
 an old agent's Hello can never erase inventory — pinned by

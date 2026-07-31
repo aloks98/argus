@@ -1,5 +1,5 @@
 # Tag-driven release pipeline. Produces the three distribution forms
-# described in docs/superpowers/specs/2026-07-29-release-design.md: bare-metal
+# described in the release design doc (git history; see also RELEASING.md): bare-metal
 # tarballs (Forgejo Release attachments), Docker images (ghcr.io), and a Helm
 # chart (OCI push + Release attachment).
 #
