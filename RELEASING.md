@@ -165,6 +165,13 @@ environment notes" above).
 - [ ] Download a tarball from the Forgejo Release page and run its
       `install.sh` on a real host.
 
+Equally valid: Forgejo's **New release** page (tag `vX.Y.Z` @ `main`,
+Publish). The page creates the tag, the tag fires the pipeline, and the
+pipeline **adopts** your Release — your description is preserved and the
+assets are attached to it. Don't upload files on that page; the pipeline
+attaches the real artifacts.
+
+
 ### The GITHUB_TOKEN question
 
 `release.yml` requests `permissions: contents: write` so the workflow's

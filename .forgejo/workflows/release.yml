@@ -200,18 +200,39 @@ jobs:
           fi
           python3 -c "import json,sys; print(json.dumps(sys.stdin.read()))" <<<"$LOG" > .release-notes.json
 
-      # Uses the workflow's own auto-issued token (secrets.GITHUB_TOKEN --
-      # see the header comment for the RELEASE_TOKEN fallback if this 403s).
-      - name: Create Forgejo release
+      # Adopt-or-create: BOTH release flows are first-class. Publishing from
+      # Forgejo's "New release" page creates the tag AND a Release object;
+      # the tag push lands here, so blindly POSTing a second Release would
+      # 409. Look the tag's Release up first -- if the operator made one
+      # (with their own description), adopt it untouched and only attach
+      # assets; create with generated notes only when the tag arrived bare
+      # (CLI flow). Uses the workflow's own auto-issued token
+      # (secrets.GITHUB_TOKEN -- see the header comment for the
+      # RELEASE_TOKEN fallback if this 403s).
+      - name: Adopt or create Forgejo release
         if: ${{ github.event_name == 'push' }}
         env:
           TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          NOTES_JSON=$(cat .release-notes.json)
-          curl -sfS -X POST "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases" \
-            -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
-            -d "{\"tag_name\":\"$GITHUB_REF_NAME\",\"name\":\"$GITHUB_REF_NAME\",\"body\":$NOTES_JSON}" | tee release.json
+          # GET by tag: 200 = UI-created release exists; 404 = bare tag.
+          # Capture the code as data (never a failing command in a
+          # conditional -- the paths-filter lesson).
+          code=$(curl -sS -o release.json -w "%{http_code}" \
+            -H "Authorization: token $TOKEN" \
+            "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases/tags/$GITHUB_REF_NAME")
+          if [ "$code" = "200" ]; then
+            echo "adopting operator-created release for $GITHUB_REF_NAME (description preserved)"
+          elif [ "$code" = "404" ]; then
+            NOTES_JSON=$(cat .release-notes.json)
+            curl -sfS -X POST "$GITHUB_SERVER_URL/api/v1/repos/$GITHUB_REPOSITORY/releases" \
+              -H "Authorization: token $TOKEN" -H "Content-Type: application/json" \
+              -d "{\"tag_name\":\"$GITHUB_REF_NAME\",\"name\":\"$GITHUB_REF_NAME\",\"body\":$NOTES_JSON}" | tee release.json
+          else
+            echo "ERROR: release lookup returned HTTP $code" >&2
+            cat release.json >&2 || true
+            exit 1
+          fi
           python3 -c "import json;print(json.load(open('release.json'))['id'])" > .release-id.txt
 
       - name: Upload release assets
