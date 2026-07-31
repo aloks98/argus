@@ -35,23 +35,25 @@ Point people at the Forgejo release page for tarballs, not GitHub's tag view.
    `repo` scope for authorization. This is what makes the tag itself (and
    the rest of the source) show up on GitHub — it does not touch Releases or
    packages, see the table above.
-3. **Optional `RELEASE_TOKEN` secret.** `release.yml` uses the workflow's
-   auto-issued `secrets.GITHUB_TOKEN` (Forgejo Actions' GitHub-Actions-
-   compatible token) to create the Release and upload assets, requested via
-   `permissions: contents: write`. Whether this instance's Forgejo Actions
-   token actually carries release-creation scope is **not yet empirically
-   verified** — see "The GITHUB_TOKEN question" below. If it 403s, add a
-   Forgejo personal access token (Settings → Applications → Generate New
-   Token, `write:repository` scope) as a `RELEASE_TOKEN` secret and swap the
+3. **Nothing — the auto-issued token works.** `release.yml` uses the
+   workflow's auto-issued `secrets.GITHUB_TOKEN` (Forgejo Actions'
+   GitHub-Actions-compatible token) to create the Release and upload
+   assets, and the v0.1.0 tag push **empirically confirmed** it carries
+   release-creation scope on this instance. (Note Forgejo ignores the
+   GitHub-style `permissions:` field entirely — token capability comes
+   from the instance/repo "Authorized Integrations" settings.) If a future
+   Forgejo upgrade or settings change makes it 403, add a Forgejo personal
+   access token (Settings → Applications → Generate New Token,
+   `write:repository` scope) as a `RELEASE_TOKEN` secret and swap the
    three `env: TOKEN: ${{ secrets.GITHUB_TOKEN }}` lines in `release.yml`
-   ("Create Forgejo release" and "Upload release assets" in the `artifacts`
-   job, "Attach chart to release" in the `chart` job) to
+   ("Adopt or create Forgejo release" and "Upload release assets" in the
+   `artifacts` job, "Attach chart to release" in the `chart` job) to
    `${{ secrets.RELEASE_TOKEN }}`.
-4. **`deploy/chart/argus/values.yaml`'s `image.repository`** ships as the
-   placeholder `ghcr.io/CHANGEME/argus`. Update it to the real
-   `ghcr.io/aloks98/argus` as part of the first release (see the
-   checklist below) — until then, `helm install`/`helm template` need an
-   explicit `--set image.repository=...` override.
+4. **ghcr package visibility.** GHCR creates packages **private** on first
+   push. After the first release (or after adding a new package), flip
+   `argus`, `argus-agent`, and `charts/argus` to public on github.com →
+   profile → Packages → package settings → Change visibility. Until then,
+   anonymous `docker pull` / `helm install` fail with 403/denied.
 
 ## The release runbook
 
@@ -139,31 +141,27 @@ Re-run the rehearsal after any workflow edit — this pipeline has already
 hidden two runner-specific bugs that only a real dispatch surfaced (see "CI
 environment notes" above).
 
-## First-release checklist (v0.1.0)
+## Per-release checklist
 
-- [ ] `GHCR_USER` / `GHCR_TOKEN` secrets set (prerequisite 1).
-- [ ] GitHub push-mirror configured (prerequisite 2).
-- [ ] `deploy/chart/argus/values.yaml`'s `image.repository` updated from
-      `ghcr.io/CHANGEME/argus` to the real namespace (prerequisite 4) —
-      either before tagging, or accept that `helm install` needs
-      `--set image.repository=...` until a follow-up release fixes it.
-- [ ] Confirm workspace `Cargo.toml` `version` is `0.1.0` (it already is).
-- [ ] Tag and push: `git tag v0.1.0 && git push origin v0.1.0`.
-- [ ] Watch all three jobs go green.
-- [ ] **Verify the Forgejo Release was actually created and assets
-      uploaded** — this is the first real test of the GITHUB_TOKEN question
-      below. If "Create Forgejo release" or "Upload release assets" 403s,
-      switch to `RELEASE_TOKEN` (prerequisite 3), then delete and re-push the
-      tag to try again — a push event can't be re-dispatched like a
-      `workflow_dispatch` run:
-      `git push origin :v0.1.0 && git tag -d v0.1.0`, fix the secret, then
-      `git tag v0.1.0 && git push origin v0.1.0`.
-- [ ] Verify `ghcr.io/aloks98/argus:v0.1.0` and `:latest` pull.
-- [ ] Verify `ghcr.io/aloks98/argus-agent:v0.1.0` and `:latest` pull.
-- [ ] Verify `helm install argus oci://ghcr.io/aloks98/charts/argus
-      --version 0.1.0` works against a real cluster.
-- [ ] Download a tarball from the Forgejo Release page and run its
-      `install.sh` on a real host.
+(v0.1.0 shipped 2026-07-31, run #105, all four jobs green on the first tag
+push — Release created by the auto token, images and chart on ghcr.)
+
+- [ ] Version bumped in workspace `Cargo.toml`, merged to `main`.
+- [ ] Tag and push: `git tag vX.Y.Z && git push origin vX.Y.Z` — or use
+      Forgejo's **New release** page (see below).
+- [ ] Watch all four jobs go green (`fj actions tasks`).
+- [ ] Verify the Forgejo Release has the tarballs, `SHA256SUMS`, and the
+      chart `.tgz` attached. If a create/upload step 403s (it didn't for
+      v0.1.0), switch to `RELEASE_TOKEN` (prerequisite 3), then delete and
+      re-push the tag — a push event can't be re-dispatched:
+      `git push origin :vX.Y.Z && git tag -d vX.Y.Z`, fix the secret, then
+      re-tag and push.
+- [ ] Verify `ghcr.io/aloks98/argus:vX.Y.Z` and `:latest` pull
+      **anonymously** (new packages start private — prerequisite 4).
+- [ ] Same for `ghcr.io/aloks98/argus-agent` and the chart:
+      `helm install argus oci://ghcr.io/aloks98/charts/argus --version X.Y.Z`.
+- [ ] Spot-check a tarball's `install.sh` on a real host after notable
+      packaging changes.
 
 Equally valid: Forgejo's **New release** page (tag `vX.Y.Z` @ `main`,
 Publish). The page creates the tag, the tag fires the pipeline, and the
@@ -172,16 +170,19 @@ assets are attached to it. Don't upload files on that page; the pipeline
 attaches the real artifacts.
 
 
-### The GITHUB_TOKEN question
+### The GITHUB_TOKEN question (answered)
 
-`release.yml` requests `permissions: contents: write` so the workflow's
-auto-issued `secrets.GITHUB_TOKEN` can create the Release and attach assets
-— that's GitHub's permission model, which Forgejo Actions mirrors, but
-**whether this specific Forgejo instance's Actions token actually carries
-release-creation scope has not been empirically proven**: no dry run reaches
-the push-gated release steps (dispatch runs never publish), so the first
-real `v0.1.0` tag push is the first real test. If it 403s, this is expected
-and already has a documented fallback — see prerequisite 3 above.
+Resolved by the real v0.1.0 tag push: the auto-issued `secrets.GITHUB_TOKEN`
+**can** create Releases and attach assets on this instance. Two findings
+worth keeping:
+
+- Forgejo **ignores** GitHub's `permissions:` field (it warns "not
+  supported… will be ignored" per job), so `release.yml` doesn't carry one.
+  Token capability is governed by Forgejo's "Authorized Integrations"
+  settings, not the workflow file.
+- Dry runs never reach the push-gated publish steps, so token scope can
+  only be tested by a real tag. If it ever 403s, the `RELEASE_TOKEN`
+  fallback is documented in prerequisite 3 above.
 
 ## Follow-ups (deliberately out of scope for v0.1.0)
 
