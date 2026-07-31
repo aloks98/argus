@@ -27,6 +27,12 @@ cargo build --release -p argus-server
 
 # Agent: static musl, asserted.
 echo "==> agent musl build"
+# Self-heal before target add: files without rustup's manifest (poisoned
+# cache, reused runner) make `rustup target add` fail with "detected
+# conflict" -- clear strays when rustup doesn't list the target.
+if ! rustup target list --installed | grep -q x86_64-unknown-linux-musl; then
+  rm -rf "$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-musl"
+fi
 rustup target add x86_64-unknown-linux-musl
 cargo build --release -p argus-agent --target x86_64-unknown-linux-musl
 AGENT_BIN="$ROOT/target/x86_64-unknown-linux-musl/release/argus-agent"

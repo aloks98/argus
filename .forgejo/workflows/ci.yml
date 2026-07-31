@@ -136,17 +136,26 @@ jobs:
       - name: Cache musl target + cargo registry
         uses: actions/cache@v4
         with:
-          path: |
-            ~/.rustup/toolchains/*/lib/rustlib/x86_64-unknown-linux-musl
-            ~/.cargo/registry
-          key: musl-cargo-${{ hashFiles('Cargo.lock') }}
+          # The cargo registry ONLY. Do NOT cache the rustup target dir: the
+          # component's files without rustup's manifest make the next
+          # `rustup target add` fail with "detected conflict" (rustup finds
+          # files it didn't install). Learned the hard way on run #97; the
+          # v2 key prefix retires the poisoned entries.
+          path: ~/.cargo/registry
+          key: cargo-registry-v2-${{ hashFiles('Cargo.lock') }}
           restore-keys: |
-            musl-cargo-
+            cargo-registry-v2-
 
       - name: Install musl toolchain
         run: |
           apt-get update
           apt-get install -y --no-install-recommends musl-tools
+          # Self-heal: if rustup doesn't list the target but stray files
+          # exist (poisoned cache, reused runner), remove them first or
+          # `target add` refuses with "detected conflict".
+          if ! rustup target list --installed | grep -q x86_64-unknown-linux-musl; then
+            rm -rf "$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-musl"
+          fi
           rustup target add x86_64-unknown-linux-musl
 
       - name: Build the static agent (Flatcar target)
