@@ -10,8 +10,9 @@
 #   - $GITHUB_OUTPUT writes FAIL inside job-level `container:` steps -- so
 #     `version` is uncontainerized, intra-job handoffs use workspace files,
 #     and `chart` looks the release up via API instead of a cross-job output.
-#   - If release creation 403s (GITHUB_TOKEN scope unverified until the
-#     first real tag), swap in a RELEASE_TOKEN secret (PAT, write:repository).
+#   - `permissions:` is IGNORED by Forgejo (its warning says use Authorized
+#     Integrations instead). If release creation 403s: grant the Actions
+#     token release scope there, or swap in a RELEASE_TOKEN secret (PAT).
 name: Release
 
 on:
@@ -23,9 +24,6 @@ on:
         description: "Rehearse the pipeline without publishing anything (dispatch runs never publish regardless of this value -- see the header comment)."
         type: boolean
         default: true
-
-permissions:
-  contents: write
 
 # Container jobs get dash unless pinned -- `set -o pipefail` dies instantly.
 defaults:
