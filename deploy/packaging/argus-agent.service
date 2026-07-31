@@ -1,0 +1,16 @@
+[Unit]
+Description=Argus fleet agent
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+EnvironmentFile=/etc/argus/agent.env
+ExecStart=/usr/local/bin/argus-agent --config /etc/argus/agent.env
+# Root on purpose: journal access, docker socket, and the terminal spawns
+# the operator's shell as the agent's own user (docs/DEV.md).
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

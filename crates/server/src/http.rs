@@ -144,10 +144,17 @@ async fn me(crate::auth::AuthUser(id): crate::auth::AuthUser) -> impl IntoRespon
     }))
 }
 
-async fn readyz() -> impl IntoResponse {
-    // TODO(spine): gate on Postgres connectivity so we don't accept agents before
-    // migrations finish (PRD §2.5).
-    (StatusCode::OK, "ready")
+/// Readiness gates on Postgres (PRD §2.5): the Helm chart's readiness probe
+/// points here, so an unconditional "ready" would admit traffic before the
+/// database (and therefore auth, enrollment, everything) is reachable.
+async fn readyz(State(state): State<AppState>) -> impl IntoResponse {
+    match sqlx::query_scalar!("SELECT 1").fetch_one(&state.pool).await {
+        Ok(_) => (StatusCode::OK, "ready"),
+        Err(err) => {
+            tracing::warn!(error = %err, "readyz: database unreachable");
+            (StatusCode::SERVICE_UNAVAILABLE, "database unreachable")
+        }
+    }
 }
 
 /// One row of the fleet page's machine table (PRD §9.1).
@@ -1420,6 +1427,16 @@ mod tests {
     use tokio::sync::mpsc;
     use tonic::Status;
     use tower::ServiceExt;
+
+    #[sqlx::test]
+    async fn readyz_reports_ready_with_a_live_database(pool: PgPool) -> anyhow::Result<()> {
+        let app = router(test_state(pool));
+        let res = app
+            .oneshot(Request::get("/readyz").body(Body::empty())?)
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        Ok(())
+    }
 
     #[sqlx::test]
     async fn fleet_lists_machines_with_status(pool: PgPool) -> anyhow::Result<()> {

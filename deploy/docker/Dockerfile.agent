@@ -1,0 +1,36 @@
+# Argus agent image. Static musl binary (CLAUDE.md: agent builds static via
+# x86_64-unknown-linux-musl so it runs on Flatcar). Build context is the REPO
+# ROOT, e.g.:
+#   docker build -f deploy/docker/Dockerfile.agent -t argus-agent:local .
+#
+# NOTE (see deploy/docker/README.md): a container is NOT the primary shipping
+# form for the agent -- the static binary run directly on the host (as a
+# systemd unit, see deploy/packaging/) is the recommended install, because the
+# agent's slices (docker verbs, systemd verbs, journal tailing) need
+# /var/run/docker.sock, the host D-Bus, and the host journal, which a
+# container only gets via explicit bind mounts. This image exists for users
+# who specifically want a containerized agent anyway.
+
+# --- rust, cargo-chef for layer caching ---
+FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
+WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-unknown-linux-musl
+FROM chef AS planner
+COPY . .
+RUN cargo chef prepare --recipe-path recipe.json
+FROM chef AS builder
+COPY --from=planner /app/recipe.json recipe.json
+# Same empirical result as Dockerfile.server's cook step (see its comment):
+# cargo chef stubs workspace-member source before cooking, so this needs
+# nothing from frontend/ -- argus-agent doesn't touch it anyway.
+ENV CC_x86_64_unknown_linux_musl=musl-gcc
+RUN cargo chef cook --release --recipe-path recipe.json -p argus-agent --target x86_64-unknown-linux-musl
+COPY . .
+RUN cargo build --release -p argus-agent --target x86_64-unknown-linux-musl
+
+# --- runtime ---
+FROM gcr.io/distroless/static-debian12 AS runtime
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/argus-agent /argus-agent
+ENTRYPOINT ["/argus-agent"]

@@ -1,0 +1,13 @@
+# Argus control plane Helm chart.
+#
+# `version` and `appVersion` are stamped from the release tag at package time
+# (`helm package --version <ver> --app-version <ver>`, driven by the
+# `chart` job in release.yml -- see RELEASING.md). The values committed here
+# are dev placeholders; `helm lint`/`helm template` in CI run against them
+# unpinned, they are not what ships.
+apiVersion: v2
+name: argus
+description: Centralized fleet management control plane for a multi-Proxmox-host homelab.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

@@ -15,6 +15,14 @@ on:
     branches: [main]
   pull_request:
 
+# act_runner executes container-job run steps with `sh` (dash) unless told
+# otherwise -- every `set -euo pipefail` (a bashism) then dies instantly with
+# "Illegal option -o pipefail". Uncontainerized jobs happened to get bash,
+# which is why only container jobs failed. Pin bash for every step.
+defaults:
+  run:
+    shell: bash
+
 concurrency:
   group: ci-${{ github.ref }}
   cancel-in-progress: true
@@ -38,6 +46,17 @@ jobs:
 
       - name: Rustfmt
         run: cargo fmt --all --check
+
+      - name: Helm lint + template
+        run: |
+          if ! command -v helm >/dev/null; then
+            curl -fsSL https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz | tar xz -C /tmp
+            install /tmp/linux-amd64/helm /usr/local/bin/helm
+          fi
+          helm lint deploy/chart/argus
+          helm template argus deploy/chart/argus > /dev/null
+          helm template argus deploy/chart/argus --set ingress.mode=traefik --set ingress.host=x.test > /dev/null
+          helm template argus deploy/chart/argus --set ingress.mode=ingress --set ingress.host=x.test > /dev/null
 
   build-test:
     runs-on: medium
@@ -110,10 +129,33 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # User request: the musl std target (~30MB via rustup) and the cargo
+      # registry re-download on every run. actions/cache needs act_runner's
+      # cache server; if it's unavailable the step degrades to a warning and
+      # the job still passes -- verified by rehearsal either way.
+      - name: Cache musl target + cargo registry
+        uses: actions/cache@v4
+        with:
+          # The cargo registry ONLY. Do NOT cache the rustup target dir: the
+          # component's files without rustup's manifest make the next
+          # `rustup target add` fail with "detected conflict" (rustup finds
+          # files it didn't install). Learned the hard way on run #97; the
+          # v2 key prefix retires the poisoned entries.
+          path: ~/.cargo/registry
+          key: cargo-registry-v2-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-registry-v2-
+
       - name: Install musl toolchain
         run: |
           apt-get update
           apt-get install -y --no-install-recommends musl-tools
+          # Self-heal: if rustup doesn't list the target but stray files
+          # exist (poisoned cache, reused runner), remove them first or
+          # `target add` refuses with "detected conflict".
+          if ! rustup target list --installed | grep -q x86_64-unknown-linux-musl; then
+            rm -rf "$(rustc --print sysroot)/lib/rustlib/x86_64-unknown-linux-musl"
+          fi
           rustup target add x86_64-unknown-linux-musl
 
       - name: Build the static agent (Flatcar target)
@@ -127,3 +169,55 @@ jobs:
         run: |
           file "$BIN"
           file "$BIN" | grep -qi 'static' || { echo "ERROR: agent is not statically linked"; exit 1; }
+
+  # PR-time guard: prove both Dockerfiles still build before merge, without
+  # pushing anything anywhere (no ghcr auth needed here -- that's the release
+  # workflow's job). Skips entirely on non-PR events and on PRs that don't
+  # touch anything the images depend on, since a full server image build is a
+  # release compile and not cheap.
+  #
+  # NOT YET EMPIRICALLY VERIFIED (task-2 constraint: the daemon question is
+  # runner-specific and can't be tested from this dev box) -- confirm on the
+  # first real PR that touches deploy/docker/**:
+  #   `container:` puts the job's steps inside catthehacker/ubuntu:act-24.04,
+  #   and `docker build` there only works if that container can reach a
+  #   docker daemon (e.g. the runner host's /var/run/docker.sock bind-mounted
+  #   in, or docker-in-docker). If `docker build` fails with something like
+  #   "Cannot connect to the Docker daemon" / "docker: command not found",
+  #   the large runner does NOT expose a daemon to job containers -- drop the
+  #   `container:` key entirely so this job runs directly on the runner host
+  #   instead (which does have docker; see CLAUDE.md / constraints.md: "docker
+  #   IS available on this dev box", true for the runner host too).
+  docker-build:
+    runs-on: large
+    if: ${{ github.event_name == 'pull_request' }}
+    # No `container:` here ON PURPOSE: on this runner, job containers (a)
+    # cannot reach the docker daemon and (b) cannot write $GITHUB_OUTPUT --
+    # both bisection-confirmed during the release-pipeline rehearsals.
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Detect docker/package changes
+        id: filter
+        run: |
+          set -euo pipefail
+          git fetch origin "${{ github.base_ref }}" --depth=50
+          # Two-dot (not triple-dot): triple-dot needs a merge-base, which two
+          # disconnected depth-limited fetches (this shallow clone + the base
+          # ref's own shallow fetch above) often can't produce -- that failure
+          # happened silently before, because this used to run inside the `if`
+          # below where errexit doesn't apply, so a git error fell through to
+          # the else branch and skipped the build with a green check. The
+          # capture below is a bare statement (not inside an `if`), so
+          # `set -e` kills the step on any git failure instead.
+          files=$(git diff --name-only "origin/${{ github.base_ref }}" HEAD)
+          if echo "$files" | grep -qE '^(deploy/docker/|\.dockerignore|Cargo\.(toml|lock)|crates/|frontend/)'; then
+            echo "changed=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "changed=false" >> "$GITHUB_OUTPUT"
+          fi
+      - name: Build images (no push)
+        if: steps.filter.outputs.changed == 'true'
+        run: |
+          docker build -f deploy/docker/Dockerfile.server -t argus:ci .
+          docker build -f deploy/docker/Dockerfile.agent -t argus-agent:ci .

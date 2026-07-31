@@ -1,0 +1,23 @@
+{{- /*
+Traefik-native ingress for the browser HTTP surface. The agent gRPC surface
+is NEVER routed here -- see service-grpc.yaml and PRD §2.4.
+*/ -}}
+{{- if eq .Values.ingress.mode "traefik" }}
+apiVersion: traefik.io/v1alpha1
+kind: IngressRoute
+metadata:
+  name: {{ include "argus.fullname" . }}
+  labels:
+    {{- include "argus.labels" . | nindent 4 }}
+spec:
+  entryPoints:
+    - websecure
+  routes:
+    - kind: Rule
+      match: Host(`{{ .Values.ingress.host }}`)
+      services:
+        - name: {{ include "argus.fullname" . }}-http
+          port: {{ .Values.http.port }}
+  tls:
+    secretName: {{ include "argus.fullname" . }}-tls
+{{- end }}
