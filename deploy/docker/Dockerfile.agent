@@ -32,5 +32,13 @@ RUN cargo build --release -p argus-agent --target x86_64-unknown-linux-musl
 
 # --- runtime ---
 FROM gcr.io/distroless/static-debian12 AS runtime
+# The source label is what links the ghcr package to the GitHub (mirror) repo.
+# Dynamic labels (version/revision/created) are passed by release.yml at build time.
+LABEL org.opencontainers.image.title="argus-agent" \
+      org.opencontainers.image.description="Argus guest agent — static musl binary for VMs/LXCs" \
+      org.opencontainers.image.source="https://github.com/aloks98/argus" \
+      org.opencontainers.image.url="https://github.com/aloks98/argus" \
+      org.opencontainers.image.documentation="https://github.com/aloks98/argus/blob/main/README.md" \
+      org.opencontainers.image.licenses="AGPL-3.0-only"
 COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/argus-agent /argus-agent
 ENTRYPOINT ["/argus-agent"]

@@ -205,6 +205,9 @@ jobs:
           docker build -f deploy/docker/Dockerfile.server \
             -t "ghcr.io/${{ steps.ns.outputs.user }}/argus:${{ needs.version.outputs.image_tag }}" \
             -t "ghcr.io/${{ steps.ns.outputs.user }}/argus:latest" \
+            --label "org.opencontainers.image.version=${{ needs.version.outputs.version }}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             .
 
       - name: Build agent image
@@ -213,6 +216,9 @@ jobs:
           docker build -f deploy/docker/Dockerfile.agent \
             -t "ghcr.io/${{ steps.ns.outputs.user }}/argus-agent:${{ needs.version.outputs.image_tag }}" \
             -t "ghcr.io/${{ steps.ns.outputs.user }}/argus-agent:latest" \
+            --label "org.opencontainers.image.version=${{ needs.version.outputs.version }}" \
+            --label "org.opencontainers.image.revision=${GITHUB_SHA}" \
+            --label "org.opencontainers.image.created=$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
             .
 
       - name: Log in to GHCR

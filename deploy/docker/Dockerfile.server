@@ -46,6 +46,14 @@ RUN cargo build --release -p argus-server
 
 # --- runtime ---
 FROM debian:bookworm-slim AS runtime
+# The source label is what links the ghcr package to the GitHub (mirror) repo.
+# Dynamic labels (version/revision/created) are passed by release.yml at build time.
+LABEL org.opencontainers.image.title="argus" \
+      org.opencontainers.image.description="Argus control plane — centralized fleet management for homelabs" \
+      org.opencontainers.image.source="https://github.com/aloks98/argus" \
+      org.opencontainers.image.url="https://github.com/aloks98/argus" \
+      org.opencontainers.image.documentation="https://github.com/aloks98/argus/blob/main/README.md" \
+      org.opencontainers.image.licenses="AGPL-3.0-only"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
     && useradd --system --no-create-home argus

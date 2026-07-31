@@ -11,3 +11,12 @@ description: Centralized fleet management control plane for a multi-Proxmox-host
 type: application
 version: 0.1.0
 appVersion: "0.1.0"
+home: https://github.com/aloks98/argus
+sources:
+  - https://github.com/aloks98/argus
+# Helm >=3.14 copies these into the OCI manifest annotations on push; the
+# source annotation is what links the ghcr package to the GitHub (mirror) repo.
+annotations:
+  org.opencontainers.image.source: https://github.com/aloks98/argus
+  org.opencontainers.image.description: Helm chart for the Argus control plane
+  org.opencontainers.image.licenses: AGPL-3.0-only
