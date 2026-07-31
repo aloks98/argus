@@ -19,10 +19,14 @@ spec:
       labels:
         {{- include "argus.labels" . | nindent 8 }}
     spec:
+      securityContext:
+        {{- toYaml .Values.podSecurityContext | nindent 8 }}
       containers:
         - name: argus
           image: {{ include "argus.image" . }}
           imagePullPolicy: {{ .Values.image.pullPolicy }}
+          securityContext:
+            {{- toYaml .Values.securityContext | nindent 12 }}
           # All runtime config (DB DSN, field key, OIDC, ...) comes from an
           # existing Secret -- never templated from values. See values.yaml.
           envFrom:
@@ -45,6 +49,14 @@ spec:
               port: http
           resources:
             {{- toYaml .Values.resources | nindent 12 }}
+          # readOnlyRootFilesystem is on, so scratch space must be an
+          # explicit writable mount.
+          volumeMounts:
+            - name: tmp
+              mountPath: /tmp
+      volumes:
+        - name: tmp
+          emptyDir: {}
       {{- with .Values.nodeSelector }}
       nodeSelector:
         {{- toYaml . | nindent 8 }}

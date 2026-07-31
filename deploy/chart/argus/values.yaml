@@ -45,3 +45,30 @@ ingress:
 resources: {}
 nodeSelector: {}
 tolerations: []
+
+# Pod Security Standards `restricted` compliance. Clusters that enforce
+# `restricted` (a PSS label on the namespace) reject this pod outright
+# without these -- and the rejection surfaces on the ReplicaSet, not the
+# Deployment, so the symptom is "zero pods, no obvious error".
+#
+# runAsUser is set EXPLICITLY and numerically on purpose: the image
+# declares `USER argus` by NAME, and the kubelet refuses to start a
+# container with runAsNonRoot: true and a non-numeric image user --
+# "image has non-numeric user (argus), cannot verify user is non-root".
+# 999 is the uid useradd --system assigned to `argus` in Dockerfile.server.
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 999
+  seccompProfile:
+    type: RuntimeDefault
+
+# The control plane is stateless -- the CA, sessions, and all other state
+# live in Postgres -- so the root filesystem can be read-only. A writable
+# /tmp is mounted separately below (see the `tmp` emptyDir in the
+# Deployment) because the process still needs scratch space.
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: true
+  capabilities:
+    drop:
+      - ALL
