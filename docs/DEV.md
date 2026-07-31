@@ -1403,3 +1403,28 @@ up NaNm" live during this slice's own rollout.
 Verified headless: System tab desktop + 390px (zero overflow/errors),
 cpu/virt values rendered, swap row correctly absent on this swapless
 guest.
+
+## Releasing
+
+The pipeline (`.forgejo/workflows/release.yml`) is tag-driven: pushing
+`vX.Y.Z` builds tarballs, docker images, and the Helm chart. The workflow
+file's own comments carry the runner quirks; what an operator needs:
+
+- **The tag must equal the workspace `Cargo.toml` version** (`v` prefix
+  aside) or the `version` job hard-fails before anything builds. Bump +
+  merge first, then tag: `git tag vX.Y.Z && git push origin vX.Y.Z`.
+  Forgejo's **New release** page works too — the pipeline adopts the
+  Release it creates (description preserved, real assets attached).
+- **Tarballs + SHA256SUMS + chart `.tgz` attach to the Forgejo Release
+  only.** The GitHub push-mirror replicates git objects — tags show up
+  there, Release assets don't. Images and the chart live on
+  `ghcr.io/aloks98/{argus,argus-agent}` / `oci://ghcr.io/aloks98/charts/argus`.
+- **New ghcr packages start private.** Flip visibility to public on
+  github.com → Packages after any first push, or anonymous pulls 403.
+- **Rehearse without publishing:** `fj actions dispatch release.yml <branch>`
+  runs every build step; all publish steps are gated on the push event.
+- **Token:** the auto-issued `GITHUB_TOKEN` creates Releases on this
+  instance (verified v0.1.0; Forgejo ignores `permissions:` — capability
+  comes from Authorized Integrations). If it ever 403s, add a PAT with
+  `write:repository` as a `RELEASE_TOKEN` secret and swap the three
+  `TOKEN:` env lines in `release.yml`.

@@ -1,5 +1,5 @@
 # Tag-driven release pipeline: tarballs (Forgejo Release), Docker images
-# (ghcr.io), Helm chart (OCI + Release attachment). See RELEASING.md.
+# (ghcr.io), Helm chart (OCI + Release attachment). See docs/DEV.md "Releasing".
 #
 # Triggers: `push: tags: v*` = real release (version from the tag, checked
 # against Cargo.toml). `workflow_dispatch` = rehearsal -- builds everything,
@@ -189,7 +189,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${GHCR_USER:-}" ] || [ -z "${GHCR_TOKEN:-}" ]; then
-            echo "ERROR: GHCR_USER and/or GHCR_TOKEN secrets are not set on this repo -- cannot push images. Configure them before releasing; see RELEASING.md prerequisites." >&2
+            echo "ERROR: GHCR_USER and/or GHCR_TOKEN secrets are not set on this repo -- cannot push images. Configure them before releasing; see docs/DEV.md "Releasing"." >&2
             exit 1
           fi
 
@@ -270,7 +270,7 @@ jobs:
         run: |
           set -euo pipefail
           if [ -z "${GHCR_USER:-}" ] || [ -z "${GHCR_TOKEN:-}" ]; then
-            echo "ERROR: GHCR_USER and/or GHCR_TOKEN secrets are not set on this repo -- cannot push the chart. Configure them before releasing; see RELEASING.md prerequisites." >&2
+            echo "ERROR: GHCR_USER and/or GHCR_TOKEN secrets are not set on this repo -- cannot push the chart. Configure them before releasing; see docs/DEV.md "Releasing"." >&2
             exit 1
           fi
           echo "$GHCR_TOKEN" | helm registry login ghcr.io -u "$GHCR_USER" --password-stdin

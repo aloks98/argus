@@ -1,5 +1,5 @@
 # Argus Helm chart configuration. See docs/PRD.md §13 for the Kubernetes
-# topology this maps to, and RELEASING.md for how `version`/`appVersion` get
+# topology this maps to, and docs/DEV.md "Releasing" for how `version`/`appVersion` get
 # stamped at release-package time.
 
 image:
