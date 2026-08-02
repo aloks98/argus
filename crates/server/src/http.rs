@@ -203,23 +203,25 @@ struct SparkSeries {
 }
 
 async fn fleet(State(state): State<AppState>) -> Result<Json<Vec<FleetRow>>, StatusCode> {
-    let rows = sqlx::query!(
-        r#"SELECT id, hostname, display_name, os, host(primary_ip) as "primary_ip?", status,
-                  last_seen_at, tags, capabilities FROM machines ORDER BY hostname"#
-    )
-    .fetch_all(&state.pool)
-    .await
-    .map_err(|err| {
+    // Independent reads on the hottest endpoint (every open tab polls it
+    // each 5s), so they run concurrently rather than back-to-back -- the
+    // pool has ample headroom for two connections.
+    let (rows, spark_rows) = tokio::join!(
+        sqlx::query!(
+            r#"SELECT id, hostname, display_name, os, host(primary_ip) as "primary_ip?", status,
+                      last_seen_at, tags, capabilities FROM machines ORDER BY hostname"#
+        )
+        .fetch_all(&state.pool),
+        repo::recent_series_all(&state.pool, 20),
+    );
+    let rows = rows.map_err(|err| {
         tracing::error!(error = %err, "failed to list fleet");
         StatusCode::INTERNAL_SERVER_ERROR
     })?;
-
-    let spark_rows = repo::recent_series_all(&state.pool, 20)
-        .await
-        .map_err(|err| {
-            tracing::error!(error = %err, "failed to load fleet sparkline series");
-            StatusCode::INTERNAL_SERVER_ERROR
-        })?;
+    let spark_rows = spark_rows.map_err(|err| {
+        tracing::error!(error = %err, "failed to load fleet sparkline series");
+        StatusCode::INTERNAL_SERVER_ERROR
+    })?;
 
     let mut series: HashMap<Uuid, SparkSeries> = HashMap::new();
     for row in spark_rows {

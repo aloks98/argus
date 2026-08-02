@@ -91,3 +91,10 @@ sysinfo = "0.39"
 [profile.release]
 lto = "thin"
 strip = true
+# One codegen unit: ~10-20% smaller/faster binaries for release-only compile
+# time -- worth it most for the musl agent copied to every guest. NOT
+# `panic = "abort"`: the server leans on unwinding (a panicking handler task
+# must not kill the control plane; terminal.rs's PtyCloseGuard documents
+# cleanup-on-unwind explicitly), and the agent's PTY threads recover from
+# poisoned locks for the same reason.
+codegen-units = 1
