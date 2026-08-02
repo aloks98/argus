@@ -6,6 +6,18 @@
 # allows. Both use catthehacker's Rust image (rustc/cargo/rustfmt/clippy +
 # node + git + gcc/make preinstalled).
 #
+# PR jobs are skipped by changed area: the `changes` job diffs the PR once
+# and every other job gates on its outputs, so a docs-only PR runs nothing
+# heavy and a frontend-only PR compiles no Rust. Pushes to main NEVER skip
+# -- the merge commit always gets the full gate.
+#
+#   area      paths                                              gates
+#   rust      crates/, Cargo.toml|lock, .sqlx/, rust-toolchain   build-test, agent-musl, rustfmt
+#   frontend  frontend/                                          frontend checks (+build when rust won't)
+#   chart     deploy/chart/                                      helm lint
+#   docker    deploy/docker/, .dockerignore, + rust + frontend   docker-build
+#   .forgejo/ (workflow change)                                  everything
+#
 # pnpm is installed via `npm i -g`, not corepack: newer Node builds dropped
 # bundled corepack, and the runner image's Node version is not pinned by us.
 name: CI
@@ -28,7 +40,69 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  # Which areas this event touches, computed ONCE; every other job gates on
+  # these outputs. Uncontainerized ON PURPOSE: job containers on this runner
+  # cannot write $GITHUB_OUTPUT (bisection-confirmed during the
+  # release-pipeline rehearsals; same reason release.yml's `version` job is
+  # uncontainerized -- and its cross-job outputs are proven to work).
+  #
+  # `large`, NOT `small` (empirically confirmed, run #122): a container-less
+  # job on `small` runs in act_runner's default node:24-bookworm-slim image,
+  # which has NO git -- checkout@v4 silently falls back to a REST tarball
+  # (no .git dir) and the `git fetch` below dies with exit 127. `large` maps
+  # to host mode (same reason docker-build's `docker` works there), where
+  # git is real. Cost: every PR push briefly holds the large runner; it's a
+  # <30s job.
+  changes:
+    runs-on: large
+    outputs:
+      rust: ${{ steps.filter.outputs.rust }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+      chart: ${{ steps.filter.outputs.chart }}
+      docker: ${{ steps.filter.outputs.docker }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+      - name: Detect changed areas
+        id: filter
+        run: |
+          set -euo pipefail
+          all() { for k in rust frontend chart docker; do echo "$k=true" >> "$GITHUB_OUTPUT"; done; }
+          # Pushes to main are merges: never skip the full gate there. Only
+          # PR iteration -- where the same commits rebuild push after push --
+          # is worth trimming.
+          if [ "${{ github.event_name }}" != "pull_request" ]; then
+            all
+            exit 0
+          fi
+          git fetch origin "${{ github.base_ref }}" --depth=50
+          # Two-dot (not triple-dot): triple-dot needs a merge-base, which two
+          # disconnected depth-limited fetches (this shallow clone + the base
+          # ref's own shallow fetch above) often can't produce. Two-dot can
+          # over-report (files changed on main since the branch diverged),
+          # which errs toward RUNNING jobs -- the safe direction. The capture
+          # is a bare statement (not inside an `if`, where errexit doesn't
+          # apply), so `set -e` kills the step on any git failure instead of
+          # silently skipping work with a green check.
+          files=$(git diff --name-only "origin/${{ github.base_ref }}" HEAD)
+          echo "changed files:"; echo "$files"
+          # A workflow change invalidates every skip decision below: run it all.
+          if echo "$files" | grep -qE '^\.forgejo/'; then
+            all
+            exit 0
+          fi
+          has() { echo "$files" | grep -qE "$1" && echo true || echo false; }
+          echo "rust=$(has '^(crates/|Cargo\.(toml|lock)$|\.sqlx/|rust-toolchain\.toml$)')" >> "$GITHUB_OUTPUT"
+          echo "frontend=$(has '^frontend/')" >> "$GITHUB_OUTPUT"
+          echo "chart=$(has '^deploy/chart/')" >> "$GITHUB_OUTPUT"
+          # Same set docker-build's inline filter used to test: anything the
+          # images depend on, not just the Dockerfiles.
+          echo "docker=$(has '^(deploy/docker/|\.dockerignore$|Cargo\.(toml|lock)$|crates/|frontend/)')" >> "$GITHUB_OUTPUT"
+
   checks:
+    needs: changes
+    # Skipped entirely (no container spin-up) when no lintable area changed.
+    if: needs.changes.outputs.frontend == 'true' || needs.changes.outputs.rust == 'true' || needs.changes.outputs.chart == 'true'
     runs-on: small
     container:
       image: catthehacker/ubuntu:rust-24.04
@@ -37,6 +111,7 @@ jobs:
         uses: actions/checkout@v4
 
       - name: Frontend lint + format + typecheck
+        if: needs.changes.outputs.frontend == 'true'
         run: |
           npm install -g pnpm@11.17.0
           pnpm --dir frontend install --frozen-lockfile
@@ -44,10 +119,19 @@ jobs:
           pnpm --dir frontend run lint
           pnpm --dir frontend run typecheck
 
+      # Only when build-test won't run: that job builds the frontend anyway
+      # (the embed needs it), so this step exists exactly for frontend-only
+      # PRs, where a broken `vite build` would otherwise reach main unseen.
+      - name: Frontend production build (frontend-only PRs)
+        if: needs.changes.outputs.frontend == 'true' && needs.changes.outputs.rust != 'true'
+        run: pnpm --dir frontend run build
+
       - name: Rustfmt
+        if: needs.changes.outputs.rust == 'true'
         run: cargo fmt --all --check
 
       - name: Helm lint + template
+        if: needs.changes.outputs.chart == 'true'
         run: |
           if ! command -v helm >/dev/null; then
             curl -fsSL https://get.helm.sh/helm-v3.16.4-linux-amd64.tar.gz | tar xz -C /tmp
@@ -58,7 +142,13 @@ jobs:
           helm template argus deploy/chart/argus --set ingress.mode=traefik --set ingress.host=x.test > /dev/null
           helm template argus deploy/chart/argus --set ingress.mode=ingress --set ingress.host=x.test > /dev/null
 
+  # Gated on rust only: a frontend-only change can't alter workspace
+  # compilation or tests (rust-embed includes whatever dist holds; its
+  # contents are not exercised by the test suite), and the frontend build
+  # itself is covered by `checks` on those PRs.
   build-test:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: medium
     container:
       image: catthehacker/ubuntu:rust-24.04
@@ -122,6 +212,8 @@ jobs:
   # convention). This builds it for the musl target and asserts it's static, so a
   # dependency that breaks the static build is caught here rather than at deploy.
   agent-musl:
+    needs: changes
+    if: needs.changes.outputs.rust == 'true'
     runs-on: medium
     container:
       image: catthehacker/ubuntu:rust-24.04
@@ -172,9 +264,9 @@ jobs:
 
   # PR-time guard: prove both Dockerfiles still build before merge, without
   # pushing anything anywhere (no ghcr auth needed here -- that's the release
-  # workflow's job). Skips entirely on non-PR events and on PRs that don't
-  # touch anything the images depend on, since a full server image build is a
-  # release compile and not cheap.
+  # workflow's job). PR-only, and gated on the `docker` area from `changes`
+  # (which owns the diff logic this job used to carry inline), since a full
+  # server image build is a release compile and not cheap.
   #
   # NOT YET EMPIRICALLY VERIFIED (task-2 constraint: the daemon question is
   # runner-specific and can't be tested from this dev box) -- confirm on the
@@ -189,35 +281,16 @@ jobs:
   #   instead (which does have docker; see CLAUDE.md / constraints.md: "docker
   #   IS available on this dev box", true for the runner host too).
   docker-build:
+    needs: changes
+    if: github.event_name == 'pull_request' && needs.changes.outputs.docker == 'true'
     runs-on: large
-    if: ${{ github.event_name == 'pull_request' }}
     # No `container:` here ON PURPOSE: on this runner, job containers (a)
     # cannot reach the docker daemon and (b) cannot write $GITHUB_OUTPUT --
     # both bisection-confirmed during the release-pipeline rehearsals.
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Detect docker/package changes
-        id: filter
-        run: |
-          set -euo pipefail
-          git fetch origin "${{ github.base_ref }}" --depth=50
-          # Two-dot (not triple-dot): triple-dot needs a merge-base, which two
-          # disconnected depth-limited fetches (this shallow clone + the base
-          # ref's own shallow fetch above) often can't produce -- that failure
-          # happened silently before, because this used to run inside the `if`
-          # below where errexit doesn't apply, so a git error fell through to
-          # the else branch and skipped the build with a green check. The
-          # capture below is a bare statement (not inside an `if`), so
-          # `set -e` kills the step on any git failure instead.
-          files=$(git diff --name-only "origin/${{ github.base_ref }}" HEAD)
-          if echo "$files" | grep -qE '^(deploy/docker/|\.dockerignore|Cargo\.(toml|lock)|crates/|frontend/)'; then
-            echo "changed=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "changed=false" >> "$GITHUB_OUTPUT"
-          fi
       - name: Build images (no push)
-        if: steps.filter.outputs.changed == 'true'
         run: |
           docker build -f deploy/docker/Dockerfile.server -t argus:ci .
           docker build -f deploy/docker/Dockerfile.agent -t argus-agent:ci .
