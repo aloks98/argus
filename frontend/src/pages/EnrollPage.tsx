@@ -38,6 +38,8 @@ import {
   FieldGroup,
   FieldLabel,
   Input,
+  NativeSelect,
+  NativeSelectOption,
   Spinner,
   Table,
   TableBody,
@@ -52,7 +54,13 @@ import PageHeader from "../components/PageHeader";
 import StatusBadge from "../components/StatusBadge";
 import { codeHighlighter } from "../lib/codeHighlighter";
 import { formatRelative } from "../lib/format";
-import { useEnrollmentTokens, useMintToken, useRevokeToken } from "../lib/queries";
+import {
+  useCaPem,
+  useEnrollmentConfig,
+  useEnrollmentTokens,
+  useMintToken,
+  useRevokeToken,
+} from "../lib/queries";
 import { tokenState, tokenTone } from "../lib/status";
 
 const mintSchema = z.object({
@@ -201,7 +209,12 @@ function MintDialogs({
             so both classes ship and stylesheet emission order decides which
             wins (see docs/DEV.md's cascade-trap section). Match the base's
             chain here so tailwind-merge drops it and this wins for real. */}
-        <AlertDialogContent className="data-[size=default]:max-w-sm data-[size=default]:sm:max-w-2xl">
+        {/* `max-h` + a scrolling middle: the printed block now inlines the
+            CA PEM (~20 lines), which pushed an unconstrained dialog past the
+            viewport — clipping the title above and the Done button below
+            with no way to scroll. Header and footer stay pinned; only the
+            panel scrolls, so Done is always reachable. */}
+        <AlertDialogContent className="flex max-h-[85vh] flex-col data-[size=default]:max-w-sm data-[size=default]:sm:max-w-2xl">
           <AlertDialogHeader>
             <AlertDialogTitle>Token minted</AlertDialogTitle>
             <AlertDialogDescription>
@@ -209,7 +222,11 @@ function MintDialogs({
             </AlertDialogDescription>
           </AlertDialogHeader>
 
-          {mintMutation.data && <ResultPanel data={mintMutation.data} />}
+          {mintMutation.data && (
+            <div className="min-h-0 flex-1 overflow-y-auto">
+              <ResultPanel data={mintMutation.data} />
+            </div>
+          )}
 
           <AlertDialogFooter>
             {/* Must stay a plain Button, not AlertDialogCancel — that routes
@@ -439,13 +456,43 @@ function MintTokenForm({
 }
 
 function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
+  // Both fixed at control-plane boot; see the hooks' shared doc comment.
+  const configQuery = useEnrollmentConfig();
+  const caQuery = useCaPem();
+
+  // The server composes endpoints from its own SANs (see api.ts's
+  // EnrollmentConfig doc — a hand-typed address that "looks right" fails
+  // TLS, so the operator picks from the list instead of typing). `null` =
+  // "use the first"; ARGUS_AGENT_SANS order is the operator's preference.
+  const endpoints = configQuery.data?.agent_endpoints ?? [];
+  const [chosenEndpoint, setChosenEndpoint] = useState<string | null>(null);
+  const endpoint =
+    (chosenEndpoint !== null && endpoints.includes(chosenEndpoint) ? chosenEndpoint : null) ??
+    endpoints[0] ??
+    // Degraded fallback (config fetch failed): the old placeholder, so the
+    // panel still yields a usable-after-editing block rather than nothing.
+    "https://<agent-endpoint>:9443";
+
+  const caPem = caQuery.data?.trim() ?? null;
+
   // `--config` reads the same four keys from an env-file (`KEY=VALUE`, a
   // subset of systemd's `EnvironmentFile=` syntax) instead of the process
   // environment (docs/DEV.md). The file survives a reboot and doubles
   // unchanged as a systemd unit's `EnvironmentFile=` later.
+  //
+  // The CA is INLINED as a heredoc: the agent must have it before its first
+  // connection, so the printed block has to carry it or every enrollment
+  // needs an out-of-band file transfer. (Scripted installs can instead
+  // fetch it from the public, unauthenticated `/ca.pem`.) The acceptance
+  // bar for this block: pasting it on a fresh host, verbatim, produces a
+  // connected agent.
   const runBlock = [
-    "sudo tee /etc/argus/agent.env <<'EOF'",
-    "ARGUS_AGENT_ENDPOINT=https://<agent-endpoint>:9443",
+    "sudo mkdir -p /etc/argus",
+    ...(caPem !== null
+      ? ["sudo tee /etc/argus/argus-ca.crt >/dev/null <<'EOF'", caPem, "EOF", ""]
+      : []),
+    "sudo tee /etc/argus/agent.env >/dev/null <<'EOF'",
+    `ARGUS_AGENT_ENDPOINT=${endpoint}`,
     `ARGUS_JOIN_TOKEN=${data.token}`,
     "ARGUS_CA_CERT=/etc/argus/argus-ca.crt",
     "ARGUS_DATA_DIR=/var/lib/argus-agent",
@@ -484,6 +531,26 @@ function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
         Download CA certificate
       </Button>
 
+      {/* Only when there's a real choice: one endpoint (the common case)
+          interpolates silently, and zero means the config fetch failed —
+          the block then shows the editable placeholder instead. */}
+      {endpoints.length > 1 && (
+        <Field className="w-fit">
+          <FieldLabel htmlFor="agent-endpoint">Agent endpoint</FieldLabel>
+          <NativeSelect
+            id="agent-endpoint"
+            value={endpoint}
+            onChange={(e) => setChosenEndpoint(e.target.value)}
+          >
+            {endpoints.map((ep) => (
+              <NativeSelectOption key={ep} value={ep}>
+                {ep}
+              </NativeSelectOption>
+            ))}
+          </NativeSelect>
+        </Field>
+      )}
+
       <div className="min-w-0 max-w-full">
         {/* vesper: near-black surface with amber accents, closest bundled
             theme to the app's identity; min-light is its light-mode
@@ -497,10 +564,6 @@ function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
           themes={{ light: "min-light", dark: "vesper" }}
           highlighter={codeHighlighter}
         />
-        <FieldDescription className="mt-1">
-          Replace <code>&lt;agent-endpoint&gt;</code> with the address agents reach the control
-          plane on — Argus cannot know its externally routable address.
-        </FieldDescription>
       </div>
     </div>
   );

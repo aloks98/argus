@@ -233,6 +233,12 @@ impl AgentService for AgentSvc {
         let pool = self.pool.clone();
         let hub = self.hub.clone();
         let (epoch, shutdown) = hub.register(machine_id, tx.clone());
+        // The one positive "this host actually connected" line, symmetric
+        // with the disconnect log in the teardown below. Every earlier
+        // return in this fn is a rejection; without this, a HEALTHY
+        // enrollment is indistinguishable from nothing happening in the
+        // control plane's own logs -- confirmable only from the agent side.
+        tracing::info!(%machine_id, epoch, "session: agent connected and authenticated");
         let mut inbound = request.into_inner();
 
         tokio::spawn(async move {

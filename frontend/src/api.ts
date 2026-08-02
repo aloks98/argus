@@ -371,6 +371,32 @@ export async function listTokens(): Promise<EnrollmentToken[]> {
   return r.json();
 }
 
+/**
+ * `GET /api/enrollment-config` — the agent endpoints the server composed
+ * from its own `ARGUS_AGENT_SANS` + agent port. Each is guaranteed to match
+ * a SAN on the agent-surface TLS leaf, which is why the enroll block
+ * interpolates one of THESE and never asks the operator to type an address:
+ * a hand-typed value that "looks right" fails TLS at connect time.
+ */
+export type EnrollmentConfig = { agent_endpoints: string[] };
+
+export async function getEnrollmentConfig(): Promise<EnrollmentConfig> {
+  const r = unauthenticatedOr(await fetch("/api/enrollment-config"));
+  if (!r.ok) throw new Error(`enrollment config ${r.status}`);
+  return r.json();
+}
+
+/**
+ * `GET /api/ca.pem` as text, for inlining into the enroll block's heredoc.
+ * (The same PEM is public at `/ca.pem` for scripted fetches from hosts; this
+ * authenticated read is for the already-signed-in enroll page.)
+ */
+export async function getCaPem(): Promise<string> {
+  const r = unauthenticatedOr(await fetch("/api/ca.pem"));
+  if (!r.ok) throw new Error(`ca.pem ${r.status}`);
+  return r.text();
+}
+
 /** The `token` field is the raw secret, present ONLY in this response. */
 export async function mintToken(body: MintTokenBody): Promise<EnrollmentToken & { token: string }> {
   const r = unauthenticatedOr(

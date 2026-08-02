@@ -94,6 +94,19 @@ pub struct Config {
 }
 
 impl Config {
+    /// The port agents dial, parsed from `agent_addr` ("0.0.0.0:9443" ->
+    /// 9443). Used to compose the advertised agent endpoints
+    /// (`http::AppState.agent_endpoints`) -- if a load balancer remaps the
+    /// port externally, the operator's `ARGUS_AGENT_SANS` hostnames still
+    /// resolve, and the Enroll page's value can be edited; this only has to
+    /// be right for the direct-exposure default.
+    pub fn agent_port(&self) -> u16 {
+        self.agent_addr
+            .rsplit_once(':')
+            .and_then(|(_, p)| p.parse().ok())
+            .unwrap_or(9443)
+    }
+
     pub fn from_env() -> Result<Self> {
         use argus_common::env;
         let public_url = req(env::PUBLIC_URL)?;
@@ -260,6 +273,29 @@ fn parse_agent_sans(raw: Option<&str>) -> Vec<String> {
 #[cfg(test)]
 mod tests {
     use super::parse_agent_sans;
+
+    #[test]
+    fn agent_port_parses_the_listen_addr_and_falls_back() {
+        let mut cfg = test_config();
+        cfg.agent_addr = "0.0.0.0:9443".into();
+        assert_eq!(cfg.agent_port(), 9443);
+        cfg.agent_addr = "127.0.0.1:12345".into();
+        assert_eq!(cfg.agent_port(), 12345);
+        cfg.agent_addr = "garbage".into();
+        assert_eq!(cfg.agent_port(), 9443, "unparseable addr falls back");
+    }
+
+    fn test_config() -> super::Config {
+        super::Config {
+            database_url: String::new(),
+            field_key_b64: String::new(),
+            http_addr: String::new(),
+            agent_addr: "0.0.0.0:9443".into(),
+            agent_sans: vec![],
+            public_url: String::new(),
+            oidc: None,
+        }
+    }
 
     #[test]
     fn parse_agent_sans_defaults_when_unset() {

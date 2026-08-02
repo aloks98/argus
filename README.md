@@ -120,9 +120,15 @@ the mTLS gRPC `LoadBalancer` address, resources).
 ### Enrolling an agent
 Whichever way you installed the control plane, agents join through the app:
 open the fleet UI's **Enroll** page, mint a join token, and copy the exact
-command it prints — endpoint, token, and CA certificate download, ready to
-paste onto the host. Don't hand-type `ARGUS_JOIN_TOKEN`; the page is the
-source of truth for it.
+command it prints — the agent endpoint (interpolated from the server's own
+`ARGUS_AGENT_SANS`, so it always matches the TLS certificate), the token, and
+the CA certificate inlined — ready to paste onto the host verbatim. Don't
+hand-type any of it; the page is the source of truth.
+
+For scripted installs (cloud-init, config management, image baking), the CA
+certificate is also served unauthenticated at `GET /ca.pem` on the browser
+origin — it is a public certificate by definition, and a host being enrolled
+has no session to present.
 
 ## Developing
 

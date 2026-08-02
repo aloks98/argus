@@ -1122,6 +1122,7 @@ mod tests {
             oidc_client: Some(oidc_client),
             public_url,
             limiter: Arc::new(crate::auth::ratelimit::LoginLimiter::new()),
+            agent_endpoints: vec!["https://agents.test:9443".into()],
         }
     }
 
@@ -1142,6 +1143,7 @@ mod tests {
             oidc_client: None,
             public_url: "http://localhost:8080".into(),
             limiter: Arc::new(crate::auth::ratelimit::LoginLimiter::new()),
+            agent_endpoints: vec!["https://agents.test:9443".into()],
         }
     }
 

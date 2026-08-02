@@ -3,7 +3,9 @@
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   containerAction,
+  getCaPem,
   getDocker,
+  getEnrollmentConfig,
   getFleet,
   getMachine,
   getMetrics,
@@ -30,6 +32,8 @@ export const qk = {
   docker: (id: string) => ["docker", id] as const,
   systemd: (id: string) => ["systemd", id] as const,
   enrollmentTokens: ["enrollment-tokens"] as const,
+  enrollmentConfig: ["enrollment-config"] as const,
+  caPem: ["ca-pem"] as const,
 };
 
 /**
@@ -125,6 +129,28 @@ export function useUnitAction(id: string) {
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: qk.systemd(id) });
     },
+  });
+}
+
+/**
+ * Both feed the enroll block. No `refetchInterval` and `staleTime: Infinity`:
+ * the agent endpoints and CA cert are fixed at control-plane boot (SANs from
+ * env, CA generated once and persisted), so refetching within a session can
+ * never observe a change.
+ */
+export function useEnrollmentConfig() {
+  return useQuery({
+    queryKey: qk.enrollmentConfig,
+    queryFn: getEnrollmentConfig,
+    staleTime: Infinity,
+  });
+}
+
+export function useCaPem() {
+  return useQuery({
+    queryKey: qk.caPem,
+    queryFn: getCaPem,
+    staleTime: Infinity,
   });
 }
 

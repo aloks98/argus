@@ -1334,7 +1334,11 @@ migration 0006 applied on startup) and the real dev agent. All green:
   `{"tags": ["has space"]}` → 400 with the actionable message naming the tag;
   partial semantics verified (revert PATCH left unlisted fields alone).
 - **Fleet payload** carries `display_name`, `tags`, `capabilities`.
-  **`GET /api/ca.pem`** serves the CA PEM behind auth.
+  **`GET /api/ca.pem`** serves the CA PEM behind auth; **`GET /ca.pem`**
+  serves the same PEM publicly (scriptable bootstrap — the CA is not secret,
+  PRD §5, and the Enroll RPC already hands it to any token holder).
+  **`GET /api/enrollment-config`** returns the composed agent endpoints the
+  Enroll page interpolates.
 - **Revoke** → 204; list-state derivation shows `revoked` / `used` / `active`
   correctly across the table's real history.
 - **Audit**: `machine.update` rows carry field NAMES only (never values);

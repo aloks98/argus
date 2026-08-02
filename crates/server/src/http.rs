@@ -46,6 +46,12 @@ pub struct AppState {
     /// One instance for the process's lifetime, shared via this `Arc` clone
     /// across every request -- a per-request limiter would limit nothing.
     pub limiter: Arc<crate::auth::ratelimit::LoginLimiter>,
+    /// The agent-endpoint URLs the Enroll page interpolates into its printed
+    /// block, composed from `ARGUS_AGENT_SANS` + the agent port. The server
+    /// owns this composition: each hostname/IP here is a SAN on the
+    /// agent-surface TLS leaf, so a value from this list passes certificate
+    /// verification -- a hand-typed one only might.
+    pub agent_endpoints: Vec<String>,
 }
 
 pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
@@ -64,6 +70,7 @@ pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
         .context("building the OIDC client")?
         .map(Arc::new);
 
+    let agent_port = cfg.agent_port();
     let app = router(AppState {
         pool,
         hub,
@@ -72,6 +79,11 @@ pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
         oidc_client,
         public_url: cfg.public_url.clone(),
         limiter: Arc::new(crate::auth::ratelimit::LoginLimiter::new()),
+        agent_endpoints: cfg
+            .agent_sans
+            .iter()
+            .map(|san| format!("https://{san}:{agent_port}"))
+            .collect(),
     });
 
     let listener = tokio::net::TcpListener::bind(&cfg.http_addr).await?;
@@ -110,8 +122,11 @@ fn router(state: AppState) -> Router {
         .route("/api/local-admin/rotate", post(crate::auth::local::rotate))
         .route("/api/enrollment-tokens", get(list_tokens).post(mint_token))
         .route("/api/enrollment-tokens/{id}", delete(revoke_token))
-        // Not secret (PRD §5), but nothing under /api is served unauthenticated;
-        // see `ca_pem`'s doc comment.
+        // What the Enroll page interpolates into its printed block.
+        .route("/api/enrollment-config", get(enrollment_config))
+        // The authenticated route predates the public /ca.pem below and is
+        // kept for the download button + any existing automation; both call
+        // the same handler.
         .route("/api/ca.pem", get(ca_pem))
         .layer(axum::middleware::from_fn_with_state(
             state.clone(),
@@ -124,6 +139,13 @@ fn router(state: AppState) -> Router {
     Router::new()
         .route("/healthz", get(|| async { "ok" }))
         .route("/readyz", get(readyz))
+        // Public ON PURPOSE, outside /api (whose blanket everything-is-
+        // authenticated rule stays intact): the CA cert is public by
+        // definition (PRD §5) -- the Enroll RPC already hands it to any
+        // join-token holder -- and a host being enrolled needs it BEFORE it
+        // has any credential a browser session could supply. This is what
+        // lets `curl .../ca.pem` work in cloud-init / config management.
+        .route("/ca.pem", get(ca_pem))
         .route("/auth/login", get(crate::auth::oidc::login))
         .route("/auth/callback", get(crate::auth::oidc::callback))
         .route("/auth/logout", post(crate::auth::oidc::logout))
@@ -511,6 +533,15 @@ impl From<repo::TokenRow> for TokenDto {
     }
 }
 
+/// `GET /api/enrollment-config` -- what the Enroll page needs to print a
+/// runnable block: the agent endpoints composed by the server (see
+/// `AppState::agent_endpoints` for why the server, not a human, owns this
+/// value). Order follows `ARGUS_AGENT_SANS`, so the operator controls which
+/// endpoint the page offers first.
+async fn enrollment_config(State(state): State<AppState>) -> impl IntoResponse {
+    Json(serde_json::json!({ "agent_endpoints": state.agent_endpoints }))
+}
+
 /// Newest first. Never the hash or raw token.
 async fn list_tokens(State(state): State<AppState>) -> Response {
     match repo::list_enrollment_tokens(&state.pool).await {
@@ -693,8 +724,11 @@ async fn revoke_token(
     StatusCode::NO_CONTENT.into_response()
 }
 
-/// For the enroll page's download button. Not secret, but nothing under
-/// `/api` is unauthenticated. 503 when the CA hasn't been initialized yet.
+/// The CA certificate, served BOTH at public `/ca.pem` (scriptable
+/// bootstrap -- see the router comment) and authenticated `/api/ca.pem`
+/// (the enroll page's download button; kept so existing links keep
+/// working). 503 when the CA hasn't been initialized yet -- only reachable
+/// in the boot window before `CertAuthority::load_or_init` has run.
 async fn ca_pem(State(state): State<AppState>) -> Response {
     match sqlx::query_scalar!("SELECT cert_pem FROM ca_material WHERE id = 1")
         .fetch_optional(&state.pool)
@@ -2012,6 +2046,63 @@ mod tests {
         Ok(())
     }
 
+    /// The scriptable-bootstrap route (design: the CA is public by
+    /// definition; a host being enrolled has no session to present). The
+    /// authenticated twin must stay authenticated -- the /api blanket rule
+    /// is intact, this route simply lives outside it.
+    #[sqlx::test]
+    async fn public_ca_pem_serves_without_a_session(pool: PgPool) -> anyhow::Result<()> {
+        sqlx::query!(
+            "INSERT INTO ca_material (id, cert_pem, key_ciphertext, key_nonce)
+             VALUES (1, '-----BEGIN CERTIFICATE-----test', '\\x00'::bytea, '\\x00'::bytea)"
+        )
+        .execute(&pool)
+        .await?;
+        let app = router(test_state(pool));
+
+        // NO cookie on purpose -- this is the whole point of the route.
+        let res = app
+            .clone()
+            .oneshot(Request::get("/ca.pem").body(Body::empty())?)
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await?;
+        assert!(body.starts_with(b"-----BEGIN CERTIFICATE-----"));
+
+        // The /api twin still 401s without a session: public /ca.pem must
+        // not have been achieved by weakening the /api layer.
+        let res = app
+            .oneshot(Request::get("/api/ca.pem").body(Body::empty())?)
+            .await?;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
+
+    /// The Enroll page's endpoint interpolation source: server-composed
+    /// URLs (SAN + agent port), authenticated like everything under /api.
+    #[sqlx::test]
+    async fn enrollment_config_returns_composed_endpoints(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool));
+
+        let res = app
+            .clone()
+            .oneshot(Request::get("/api/enrollment-config").body(Body::empty())?)
+            .await?;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED, "must require auth");
+
+        let res = request(&app, "GET", "/api/enrollment-config", &cookie).await;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await?;
+        let v: serde_json::Value = serde_json::from_slice(&body)?;
+        assert_eq!(
+            v["agent_endpoints"],
+            serde_json::json!(["https://agents.test:9443", "https://10.0.0.5:9443"]),
+            "endpoints come through in ARGUS_AGENT_SANS order"
+        );
+        Ok(())
+    }
+
     #[sqlx::test]
     async fn get_docker_returns_cached_snapshot(pool: PgPool) -> anyhow::Result<()> {
         let cookie = auth_cookie(&pool).await?;
@@ -3261,6 +3352,10 @@ mod tests {
             oidc_client: Some(oidc_client),
             public_url: "http://localhost:8080".into(),
             limiter: Arc::new(crate::auth::ratelimit::LoginLimiter::new()),
+            agent_endpoints: vec![
+                "https://agents.test:9443".into(),
+                "https://10.0.0.5:9443".into(),
+            ],
         }
     }
 
