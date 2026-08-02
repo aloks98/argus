@@ -36,6 +36,7 @@ import Sparkline from "../components/Sparkline";
 import StatusBadge from "../components/StatusBadge";
 import { displayName, fleetTags, groupFleet, visibleFleet } from "../lib/fleet";
 import { formatPct, formatRelative } from "../lib/format";
+import { describeError } from "../lib/errors";
 import { useFleet } from "../lib/queries";
 import { machineTone } from "../lib/status";
 
@@ -79,9 +80,7 @@ function FleetTable({ rows }: { rows: FleetRow[] }) {
             <TableHead>OS</TableHead>
             <TableHead>Tags</TableHead>
             <TableHead>CPU</TableHead>
-            <TableHead>CPU trend</TableHead>
             <TableHead>Mem</TableHead>
-            <TableHead>Mem trend</TableHead>
             <TableHead>Last seen</TableHead>
           </TableRow>
         </TableHeader>
@@ -118,13 +117,21 @@ function FleetTable({ rows }: { rows: FleetRow[] }) {
                   </div>
                 )}
               </TableCell>
-              <TableCell className="font-mono">{formatPct(row.cpu_pct)}</TableCell>
-              <TableCell>
-                <Sparkline values={row.spark_cpu} />
+              {/* Value + trend are one fact — composed in one cell (as the
+                  phone cards already do), not split into four columns. The
+                  fixed-width value keeps sparklines aligned down the column
+                  ("4%" vs "100%" would otherwise stagger them). */}
+              <TableCell className="whitespace-nowrap">
+                <span className="flex items-center gap-2">
+                  <span className="w-[4ch] text-right font-mono">{formatPct(row.cpu_pct)}</span>
+                  <Sparkline values={row.spark_cpu} />
+                </span>
               </TableCell>
-              <TableCell className="font-mono">{formatPct(row.mem_pct)}</TableCell>
-              <TableCell>
-                <Sparkline values={row.spark_mem} />
+              <TableCell className="whitespace-nowrap">
+                <span className="flex items-center gap-2">
+                  <span className="w-[4ch] text-right font-mono">{formatPct(row.mem_pct)}</span>
+                  <Sparkline values={row.spark_mem} />
+                </span>
               </TableCell>
               <TableCell className="font-mono">{formatRelative(row.last_seen_at)}</TableCell>
             </TableRow>
@@ -250,7 +257,7 @@ export default function FleetPage() {
       {error != null && (
         <Alert variant="destructive" className="mb-4">
           <AlertTitle>Failed to load fleet</AlertTitle>
-          <AlertDescription>{error.message}</AlertDescription>
+          <AlertDescription>{describeError(error)}</AlertDescription>
         </Alert>
       )}
 

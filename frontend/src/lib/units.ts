@@ -13,6 +13,31 @@ export function countFailed(units: Unit[]): number {
 }
 
 /**
+ * Units where a mis-click on Stop/Restart costs more than the unit itself:
+ * the operator's way in (ssh), the host's network path, the runtime every
+ * container sits on, or Argus's own eyes on the machine. Verbs on these
+ * confirm first (RowActions); everything else stays one click — the guard
+ * is per-unit, not a blanket dialog, so it never reads as nagging.
+ */
+const PROTECTED_UNITS = new Set([
+  "argus-agent.service",
+  "containerd.service",
+  "dbus.service",
+  "docker.service",
+  "NetworkManager.service",
+  "ssh.service",
+  "sshd.service",
+  "systemd-journald.service",
+  "systemd-logind.service",
+  "systemd-networkd.service",
+  "systemd-resolved.service",
+]);
+
+export function isProtectedUnit(name: string): boolean {
+  return PROTECTED_UNITS.has(name);
+}
+
+/**
  * The rows to render: optionally narrowed to failures, optionally filtered by a
  * case-insensitive substring of the name or description, then sorted
  * failed → active → other and alphabetically within each group.

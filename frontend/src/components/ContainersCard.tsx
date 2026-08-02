@@ -1,15 +1,11 @@
 // Docker container list + start/stop/restart verbs for a single machine.
 // Owns its own mutation wiring (`useContainerAction`).
-import { Link } from "react-router-dom";
 import {
   Alert,
   AlertDescription,
   AlertTitle,
   Badge,
-  Button,
-  ButtonGroup,
   EmptyState,
-  Spinner,
   Table,
   TableBody,
   TableCell,
@@ -18,9 +14,12 @@ import {
   TableRow,
 } from "@e412/rnui-react";
 import type { Container, ContainerAction } from "../api";
+import { describeError } from "../lib/errors";
 import { useContainerAction } from "../lib/queries";
 import { containerTone } from "../lib/status";
-import AssetTag from "./AssetTag";
+import { StatusName } from "./AssetTag";
+import RowActions from "./RowActions";
+import type { RowOutcome } from "./RowActions";
 import StatusBadge from "./StatusBadge";
 
 /** Spelled out rather than concatenated — `stop` + "ing" would read "stoping". */
@@ -35,6 +34,20 @@ const VERB_DONE: Record<ContainerAction, string> = {
   stop: "stopped",
   restart: "restarted",
 };
+
+/** Same shape as UnitsCard's rowOutcome — see the comment there. Keyed on
+ *  container id rather than unit name. */
+function rowOutcome(
+  action: ReturnType<typeof useContainerAction>,
+  containerId: string,
+): RowOutcome | null {
+  const vars = action.variables;
+  if (vars === undefined || vars.container !== containerId || action.isPending) return null;
+  if (action.isError) return { tone: "fail", label: "failed" };
+  if (action.data?.status === "pending") return { tone: "warn", label: "unconfirmed" };
+  if (action.isSuccess) return { tone: "ok", label: VERB_DONE[vars.action] };
+  return null;
+}
 
 export default function ContainersCard({
   machineId,
@@ -58,13 +71,13 @@ export default function ContainersCard({
         </span>
       </div>
 
-      {/* Outcome of the most recent verb — same three-state status line as
-          UnitsCard, including an explicit success, since the snapshot is
-          agent-pushed and the table usually hasn't caught up yet. */}
+      {/* Success feedback lives in the acted-on ROW (RowActions' outcome
+          badge) — same reasoning as UnitsCard. Only failures and the 202
+          keep a banner; both also mark the row. */}
       {actionError != null && (
         <Alert variant="destructive" className="mb-4">
           <AlertTitle>Action failed</AlertTitle>
-          <AlertDescription>{actionError.message}</AlertDescription>
+          <AlertDescription>{describeError(actionError)}</AlertDescription>
         </Alert>
       )}
 
@@ -74,19 +87,6 @@ export default function ContainersCard({
           <AlertDescription>
             The command was dispatched, but the agent did not report a result in time. The container
             may still be starting or stopping — this table refreshes as new state arrives.
-          </AlertDescription>
-        </Alert>
-      )}
-
-      {action.isSuccess && action.data.status !== "pending" && (
-        <Alert variant="success" className="mb-4">
-          <AlertTitle>
-            {action.variables === undefined
-              ? "Done"
-              : `Container ${VERB_DONE[action.variables.action]}`}
-          </AlertTitle>
-          <AlertDescription>
-            The daemon reported the action completed. The row below updates on the next snapshot.
           </AlertDescription>
         </Alert>
       )}
@@ -106,9 +106,10 @@ export default function ContainersCard({
               <TableRow>
                 <TableHead>Name</TableHead>
                 <TableHead className="hidden md:table-cell">Image</TableHead>
-                {/* Same phone-width trade as UnitsCard's Active column: the name
-                    tag's tone carries the state, and the column's width is what
-                    keeps Restart reachable at 390px. */}
+                {/* Same phone-width trade as UnitsCard's Active column: the
+                    name treatment separates exception from normal (StatusName),
+                    and the column's width is what keeps the actions reachable
+                    at 390px. */}
                 <TableHead className="hidden md:table-cell">State</TableHead>
                 <TableHead className="hidden md:table-cell">Status</TableHead>
                 <TableHead className="text-right">Actions</TableHead>
@@ -121,12 +122,7 @@ export default function ContainersCard({
                 return (
                   <TableRow key={c.id}>
                     <TableCell className="font-medium" title={c.name}>
-                      <AssetTag
-                        tone={containerTone(c.state)}
-                        className="max-w-[16ch] md:max-w-[30ch]"
-                      >
-                        <span className="min-w-0 truncate">{c.name}</span>
-                      </AssetTag>
+                      <StatusName tone={containerTone(c.state)} name={c.name} />
                     </TableCell>
                     <TableCell className="hidden md:table-cell font-mono text-muted-foreground">
                       {c.image}
@@ -143,62 +139,19 @@ export default function ContainersCard({
                       {c.status}
                     </TableCell>
                     <TableCell className="whitespace-nowrap text-right">
-                      {/* One loading state per row rather than a spinner per button; the
-                          three verbs render with inapplicable ones disabled — kept
-                          identical to UnitsCard so both tabs behave the same way. */}
-                      {rowBusy ? (
-                        <span
-                          role="status"
-                          className="inline-flex items-center gap-2 font-mono text-[11px] uppercase tracking-widest text-muted-foreground"
-                        >
-                          <Spinner className="size-3.5" />
-                          {action.variables === undefined
+                      <RowActions
+                        name={c.name}
+                        logsTo={`?tab=containers&logs=${encodeURIComponent(`docker:${c.id}`)}`}
+                        active={running}
+                        busy={rowBusy}
+                        busyLabel={
+                          action.variables === undefined
                             ? "working…"
-                            : VERB_PROGRESS[action.variables.action]}
-                        </span>
-                      ) : (
-                        // `ml-auto` rather than the cell's `text-right` —
-                        // ButtonGroup is a block-level `flex w-fit`. See UnitsCard.
-                        <ButtonGroup className="ml-auto justify-end">
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            render={
-                              <Link
-                                to={`?tab=containers&logs=${encodeURIComponent(`docker:${c.id}`)}`}
-                              />
-                            }
-                            nativeButton={false}
-                          >
-                            Logs
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            disabled={running}
-                            title={running ? "Already running" : undefined}
-                            onClick={() => action.mutate({ container: c.id, action: "start" })}
-                          >
-                            Start
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            disabled={!running}
-                            title={!running ? "Not running" : undefined}
-                            onClick={() => action.mutate({ container: c.id, action: "stop" })}
-                          >
-                            Stop
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => action.mutate({ container: c.id, action: "restart" })}
-                          >
-                            Restart
-                          </Button>
-                        </ButtonGroup>
-                      )}
+                            : VERB_PROGRESS[action.variables.action]
+                        }
+                        outcome={rowOutcome(action, c.id)}
+                        onVerb={(verb) => action.mutate({ container: c.id, action: verb })}
+                      />
                     </TableCell>
                   </TableRow>
                 );

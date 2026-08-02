@@ -2,17 +2,13 @@
 // reports far more units than containers, so this table leads with
 // failures and carries its own filter (ordering in lib/units.ts).
 import { useState } from "react";
-import { Link } from "react-router-dom";
 import {
   Alert,
   AlertDescription,
   AlertTitle,
-  Button,
-  ButtonGroup,
   Checkbox,
   EmptyState,
   Input,
-  Spinner,
   Table,
   TableBody,
   TableCell,
@@ -21,10 +17,13 @@ import {
   TableRow,
 } from "@e412/rnui-react";
 import type { Unit, UnitAction } from "../api";
+import { describeError } from "../lib/errors";
 import { useUnitAction } from "../lib/queries";
 import { unitTone } from "../lib/status";
-import { countFailed, visibleUnits } from "../lib/units";
-import AssetTag from "./AssetTag";
+import { countFailed, isProtectedUnit, visibleUnits } from "../lib/units";
+import { StatusName } from "./AssetTag";
+import RowActions from "./RowActions";
+import type { RowOutcome } from "./RowActions";
 import StatusBadge from "./StatusBadge";
 
 /** Spelled out rather than concatenated — `stop` + "ing" would read "stoping". */
@@ -39,6 +38,20 @@ const VERB_DONE: Record<UnitAction, string> = {
   stop: "stopped",
   restart: "restarted",
 };
+
+/** The last verb's outcome IF it targeted this unit — rendered inside the
+ *  row so feedback appears where the click happened. Success is stated
+ *  explicitly, not left implicit: the snapshot is agent-pushed on a 15s
+ *  cadence, so the row's state usually hasn't changed yet, and silence
+ *  after a successful click reads as "nothing happened". */
+function rowOutcome(action: ReturnType<typeof useUnitAction>, unit: string): RowOutcome | null {
+  const vars = action.variables;
+  if (vars === undefined || vars.unit !== unit || action.isPending) return null;
+  if (action.isError) return { tone: "fail", label: "failed" };
+  if (action.data?.status === "pending") return { tone: "warn", label: "unconfirmed" };
+  if (action.isSuccess) return { tone: "ok", label: VERB_DONE[vars.action] };
+  return null;
+}
 
 export default function UnitsCard({
   machineId,
@@ -76,14 +89,23 @@ export default function UnitsCard({
         </span>
       </div>
 
-      {/* One status line covering all three verb outcomes. Success is stated
-          EXPLICITLY, not left implicit: the snapshot is agent-pushed on a 15s
-          cadence, so the table usually hasn't changed yet, and silence after
-          a successful click reads as "nothing happened". */}
+      {/* Success feedback lives in the acted-on ROW (RowActions' outcome
+          badge), not up here — in a table this tall a banner lands off-screen
+          from the click. Only the two outcomes needing more words than a
+          badge keep a banner: failures (the error detail has to live
+          somewhere readable) and the 202. Both ALSO mark the row. */}
       {actionError != null && (
         <Alert variant="destructive" className="mb-4">
-          <AlertTitle>Action failed</AlertTitle>
-          <AlertDescription>{actionError.message}</AlertDescription>
+          <AlertTitle>
+            Action failed
+            {action.variables !== undefined && (
+              <>
+                {" — "}
+                <span className="font-mono">{action.variables.unit}</span>
+              </>
+            )}
+          </AlertTitle>
+          <AlertDescription>{describeError(actionError)}</AlertDescription>
         </Alert>
       )}
 
@@ -97,18 +119,6 @@ export default function UnitsCard({
             <span className="font-mono">{action.variables?.unit}</span> was dispatched, but the
             agent did not report a result in time. It may still be starting or stopping — this table
             refreshes as new state arrives.
-          </AlertDescription>
-        </Alert>
-      )}
-
-      {action.isSuccess && action.data.status !== "pending" && (
-        <Alert variant="success" className="mb-4">
-          <AlertTitle>
-            {action.variables === undefined ? "Done" : `Unit ${VERB_DONE[action.variables.action]}`}
-          </AlertTitle>
-          <AlertDescription>
-            <span className="font-mono">{action.variables?.unit}</span> — systemd reported the job
-            completed. The row below updates on the next snapshot.
           </AlertDescription>
         </Alert>
       )}
@@ -146,6 +156,19 @@ export default function UnitsCard({
         </div>
       </form>
 
+      {/* At this row count the table is ~250 tab stops; keyboard users need
+          an exit that doesn't mean tabbing through every row. Hidden until
+          focused (the sr-only → not-sr-only pattern), so pointer users never
+          see it. */}
+      {rows.length > 0 && (
+        <a
+          href="#units-table-end"
+          className="sr-only border border-border px-2 py-1 font-mono text-[11px] uppercase tracking-widest focus:not-sr-only"
+        >
+          Skip past unit rows
+        </a>
+      )}
+
       {/* A tall table needs a height bound or the page scrolls, hiding the
           machine header/tabs/filter and the column headers with it. The cap
           must go on rnui's OWN `data-slot="table-container"` (already the
@@ -167,9 +190,11 @@ export default function UnitsCard({
             <TableHeader className="sticky top-0 z-10 [&_th]:bg-background">
               <TableRow>
                 <TableHead>Name</TableHead>
-                {/* Hidden on phones (same reasoning as Sub/Description): tone
-                    already encodes active-vs-failed, and this column's
-                    ~110px is what pushed Restart off a 390px screen. */}
+                {/* Hidden on phones (same reasoning as Sub/Description): the
+                    name treatment still separates exception from normal
+                    (StatusName: tag = warn/fail, dimmed = idle), and this
+                    column's ~110px is what pushed the actions off a 390px
+                    screen. */}
                 <TableHead className="hidden md:table-cell">Active</TableHead>
                 <TableHead className="hidden md:table-cell">Sub</TableHead>
                 <TableHead className="hidden md:table-cell">Description</TableHead>
@@ -187,12 +212,7 @@ export default function UnitsCard({
                         chars and pushed Actions out of reach. Cap + truncate;
                         the full name is the cell's title. */}
                     <TableCell className="font-medium" title={u.name}>
-                      <AssetTag
-                        tone={unitTone(u.active_state)}
-                        className="max-w-[16ch] md:max-w-[30ch]"
-                      >
-                        <span className="min-w-0 truncate">{u.name}</span>
-                      </AssetTag>
+                      <StatusName tone={unitTone(u.active_state)} name={u.name} />
                     </TableCell>
                     <TableCell className="hidden md:table-cell">
                       <StatusBadge tone={unitTone(u.active_state)} label={u.active_state} />
@@ -207,81 +227,25 @@ export default function UnitsCard({
                       {u.description}
                     </TableCell>
                     <TableCell className="whitespace-nowrap text-right">
-                      {/* One loading state for the row while a verb runs (not a
-                          spinner per button) — which verb is running is the useful
-                          fact, and a job can take up to 90s. Otherwise all three
-                          verbs render in the same order with inapplicable ones
-                          disabled, not swapped out, so a click target never moves
-                          and `title` explains why a control is disabled. */}
-                      {rowBusy ? (
-                        <span
-                          role="status"
-                          className="inline-flex items-center gap-2 font-mono text-[11px] uppercase tracking-widest text-muted-foreground"
-                        >
-                          <Spinner className="size-3.5" />
-                          {action.variables === undefined
+                      <RowActions
+                        name={u.name}
+                        logsTo={`?tab=units&logs=${encodeURIComponent(`journal:${u.name}`)}`}
+                        logsDisabledReason={canReadJournal ? undefined : "no journald on this host"}
+                        active={active}
+                        busy={rowBusy}
+                        busyLabel={
+                          action.variables === undefined
                             ? "working…"
-                            : VERB_PROGRESS[action.variables.action]}
-                        </span>
-                      ) : (
-                        // `ml-auto`, not the cell's `text-right`: ButtonGroup is a
-                        // block-level `flex w-fit`, so text-align doesn't move it —
-                        // auto margin is what pushes a fit-width block right.
-                        <ButtonGroup className="ml-auto justify-end">
-                          {canReadJournal ? (
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              render={
-                                <Link
-                                  to={`?tab=units&logs=${encodeURIComponent(`journal:${u.name}`)}`}
-                                />
-                              }
-                              nativeButton={false}
-                            >
-                              Logs
-                            </Button>
-                          ) : (
-                            // Disabled Button, not a disabled Link: `disabled` does
-                            // nothing to an anchor, so a Link would still navigate to
-                            // a dialog that can't load. Shown (not hidden) for
-                            // consistency with Start/Stop.
-                            <Button
-                              size="sm"
-                              variant="outline"
-                              disabled
-                              title="no journald on this host"
-                            >
-                              Logs
-                            </Button>
-                          )}
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            disabled={active}
-                            title={active ? "Already active" : undefined}
-                            onClick={() => action.mutate({ unit: u.name, action: "start" })}
-                          >
-                            Start
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            disabled={!active}
-                            title={!active ? "Not running" : undefined}
-                            onClick={() => action.mutate({ unit: u.name, action: "stop" })}
-                          >
-                            Stop
-                          </Button>
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            onClick={() => action.mutate({ unit: u.name, action: "restart" })}
-                          >
-                            Restart
-                          </Button>
-                        </ButtonGroup>
-                      )}
+                            : VERB_PROGRESS[action.variables.action]
+                        }
+                        outcome={rowOutcome(action, u.name)}
+                        confirmReason={
+                          isProtectedUnit(u.name)
+                            ? "This unit is host-critical — losing it can cut off SSH, networking, or Argus's own agent."
+                            : undefined
+                        }
+                        onVerb={(verb) => action.mutate({ unit: u.name, action: verb })}
+                      />
                     </TableCell>
                   </TableRow>
                 );
@@ -290,6 +254,8 @@ export default function UnitsCard({
           </Table>
         )}
       </div>
+      {/* The skip link's landing point — focusable by script only. */}
+      <span id="units-table-end" tabIndex={-1} />
     </>
   );
 }

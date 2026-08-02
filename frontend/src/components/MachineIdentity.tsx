@@ -28,6 +28,7 @@ import {
 } from "@e412/rnui-react";
 import { X } from "lucide-react";
 import type { MachineDetail } from "../api";
+import { describeError } from "../lib/errors";
 import { fleetTags } from "../lib/fleet";
 import { useFleet, useUpdateMachine } from "../lib/queries";
 
@@ -105,7 +106,7 @@ export default function MachineIdentity({
       {mutation.error !== null && (
         <Alert variant="destructive" className="mb-4">
           <AlertTitle>Update failed</AlertTitle>
-          <AlertDescription>{mutation.error.message}</AlertDescription>
+          <AlertDescription>{describeError(mutation.error)}</AlertDescription>
         </Alert>
       )}
 

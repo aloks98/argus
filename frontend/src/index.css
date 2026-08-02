@@ -136,6 +136,15 @@
   --sidebar-ring: #ffe600;
 }
 
+/* rnui's destructive Button/action colors its TEXT with --destructive
+   (#ff1744): 5.46:1 on black, only ~3.85:1 on white — under WCAG AA. Repoint
+   the utility, not the token: the FILL must stay #ff1744 in both themes (the
+   asset-tag invariant), it's only red-as-text that needs the darkened value,
+   exactly what --fail-text exists for. */
+:root:not(.dark) .text-destructive {
+  color: var(--fail-text);
+}
+
 /* Focus must stay visible against a black ground. */
 :where(a, button, [role="tab"], [tabindex]):focus-visible {
   outline: 2px solid var(--focus);

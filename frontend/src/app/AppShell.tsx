@@ -100,7 +100,10 @@ function TopBar({ onOpenPalette }: { onOpenPalette: () => void }) {
     <header className="sticky top-0 z-30 flex h-12 shrink-0 items-center gap-3 border-b border-border bg-background px-3">
       <SidebarTrigger aria-label="Toggle sidebar" title="Toggle sidebar" />
       {summary !== null && (
-        <span className="ml-auto font-mono text-[10px] uppercase tracking-widest text-muted-foreground">
+        <span
+          title="Machines online / machines enrolled"
+          className="ml-auto font-mono text-[10px] uppercase tracking-widest text-muted-foreground"
+        >
           {summary}
         </span>
       )}

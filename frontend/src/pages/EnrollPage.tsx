@@ -1,7 +1,7 @@
 // The Enroll page: mint a join token for a new agent, show the raw secret
 // exactly once, and manage existing tokens (usage/expiry/revoke). Mirrors
 // SignIn.tsx's form structure (react-hook-form + zod, rnui Field/FieldError).
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { Controller, useForm } from "react-hook-form";
 import type { Resolver } from "react-hook-form";
@@ -53,6 +53,7 @@ import type { EnrollmentToken, MintTokenBody } from "../api";
 import PageHeader from "../components/PageHeader";
 import StatusBadge from "../components/StatusBadge";
 import { codeHighlighter } from "../lib/codeHighlighter";
+import { describeError } from "../lib/errors";
 import { formatRelative } from "../lib/format";
 import {
   useCaPem,
@@ -105,7 +106,7 @@ function toMintBody(values: MintFormValues): MintTokenBody {
 
 export default function EnrollPage() {
   // Owns the one `useMintToken()` instance and both dialogs' open state —
-  // the "Mint a token" trigger lives in PageHeader's `actions` slot, a
+  // the "Mint token" trigger lives in PageHeader's `actions` slot, a
   // sibling of `MintDialogs` rather than a descendant.
   const mintMutation = useMintToken();
   const [mintOpen, setMintOpen] = useState(false);
@@ -124,7 +125,7 @@ export default function EnrollPage() {
       <PageHeader
         title="Enroll"
         meta="Mint a join token so a new agent can enroll into the fleet."
-        actions={<Button onClick={openMint}>Mint a token</Button>}
+        actions={<Button onClick={openMint}>Mint token</Button>}
       />
       <div className="flex flex-col gap-4">
         <MintDialogs
@@ -141,7 +142,7 @@ export default function EnrollPage() {
 }
 
 /**
- * The two mint dialogs (form + result) only — the "Mint a token" trigger
+ * The two mint dialogs (form + result) only — the "Mint token" trigger
  * lives in PageHeader's `actions` slot. State (including the shared
  * `useMintToken()` mutation) is owned by `EnrollPage` so the header button
  * and these dialogs, not in the same subtree, stay in sync without a
@@ -162,6 +163,22 @@ function MintDialogs({
   resultOpen: boolean;
   setResultOpen: (open: boolean) => void;
 }) {
+  // The dialog's Esc/outside-click guard can't stop a refresh or tab close,
+  // and the raw token is unrecoverable once this unmounts (the server keeps
+  // only a hash). `beforeunload` is the one hook the browser offers; the
+  // string is ignored by modern browsers (they show their own prompt) but
+  // `preventDefault` + `returnValue` are both needed for cross-browser
+  // coverage.
+  useEffect(() => {
+    if (!resultOpen) return;
+    const warn = (e: BeforeUnloadEvent) => {
+      e.preventDefault();
+      e.returnValue = "";
+    };
+    window.addEventListener("beforeunload", warn);
+    return () => window.removeEventListener("beforeunload", warn);
+  }, [resultOpen]);
+
   return (
     <>
       {/* Dialog 1: the mint form. A normal dismissable dialog (Escape,
@@ -174,7 +191,9 @@ function MintDialogs({
       <Dialog open={mintOpen} onOpenChange={setMintOpen}>
         <DialogContent className="sm:max-w-lg">
           <DialogHeader>
-            <DialogTitle>Mint an enrollment token</DialogTitle>
+            {/* Same phrase as the header button and the submit below — one
+                action, one name, all the way through the flow. */}
+            <DialogTitle>Mint token</DialogTitle>
             <DialogDescription>
               A join token an agent uses once to enroll into the fleet.
             </DialogDescription>
@@ -276,7 +295,7 @@ function MintTokenForm({
       {mintMutation.error !== null && (
         <Alert variant="destructive" className="mb-4">
           <AlertTitle>Mint failed</AlertTitle>
-          <AlertDescription>{mintMutation.error.message}</AlertDescription>
+          <AlertDescription>{describeError(mintMutation.error)}</AlertDescription>
         </Alert>
       )}
 
@@ -603,7 +622,7 @@ function TokenTable() {
       {tokensQuery.error != null && (
         <Alert variant="destructive" className="mb-4">
           <AlertTitle>Failed to load tokens</AlertTitle>
-          <AlertDescription>{tokensQuery.error.message}</AlertDescription>
+          <AlertDescription>{describeError(tokensQuery.error)}</AlertDescription>
         </Alert>
       )}
 
@@ -697,7 +716,7 @@ function TokenTable() {
           {revokeMutation.error !== null && (
             <Alert variant="destructive">
               <AlertTitle>Revoke failed</AlertTitle>
-              <AlertDescription>{revokeMutation.error.message}</AlertDescription>
+              <AlertDescription>{describeError(revokeMutation.error)}</AlertDescription>
             </Alert>
           )}
 

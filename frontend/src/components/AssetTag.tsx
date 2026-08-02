@@ -15,6 +15,49 @@ import { cn } from "../lib/cn";
  * variant background, since `--muted-foreground` differs per theme and
  * couldn't pass contrast in both.
  */
+/**
+ * A unit/container name whose loudness tracks its state: the filled tag is
+ * reserved for exceptions (`warn`/`fail`) so a long table of healthy rows
+ * reads as quiet mono text with the failures shouting — not a wall of green
+ * blocks. `idle` dims to muted. On md+ the adjacent status column carries
+ * the state as TEXT; on phones (column hidden) the split still separates
+ * exception from normal by shape — tag vs plain — not by colour alone.
+ */
+export function StatusName({
+  tone,
+  name,
+  className,
+}: {
+  tone: Tone;
+  name: string;
+  className?: string;
+}) {
+  // `pointer-coarse:` lifts truncation on touch devices: the full name lives
+  // in the cell's `title` there too, but no hover means no way to read it —
+  // wrapping (rare: only ~90-char escaped device names) beats hiding it.
+  if (tone === "warn" || tone === "fail") {
+    return (
+      <AssetTag tone={tone} className={cn("max-w-[16ch] md:max-w-[30ch]", className)}>
+        <span className="min-w-0 truncate pointer-coarse:whitespace-normal pointer-coarse:break-all">
+          {name}
+        </span>
+      </AssetTag>
+    );
+  }
+  return (
+    <span
+      className={cn(
+        "block max-w-[16ch] truncate font-mono text-xs md:max-w-[30ch]",
+        "pointer-coarse:whitespace-normal pointer-coarse:break-all",
+        tone === "idle" && "text-muted-foreground",
+        className,
+      )}
+    >
+      {name}
+    </span>
+  );
+}
+
 export default function AssetTag({
   tone,
   children,

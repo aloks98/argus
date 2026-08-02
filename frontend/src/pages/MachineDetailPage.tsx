@@ -49,6 +49,7 @@ import UnitsCard from "../components/UnitsCard";
 import { BOOT_LOGS, CAP_DOCKER, CAP_JOURNAL, CAP_SYSTEMD, SYSTEM_JOURNAL } from "../api";
 import { cn } from "../lib/cn";
 import { displayName } from "../lib/fleet";
+import { describeError } from "../lib/errors";
 import { useLogFilters } from "../lib/logFilters";
 import { formatBytes, formatBytesPerSec, formatRelative, formatUptime } from "../lib/format";
 import {
@@ -276,7 +277,7 @@ export default function MachineDetailPage() {
       {error != null && (
         <Alert variant="destructive" className="mt-4">
           <AlertTitle>Failed to refresh</AlertTitle>
-          <AlertDescription>{error.message}</AlertDescription>
+          <AlertDescription>{describeError(error)}</AlertDescription>
         </Alert>
       )}
 
