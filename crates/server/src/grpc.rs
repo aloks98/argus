@@ -264,6 +264,11 @@ impl AgentService for AgentSvc {
                 }
             }
             hub.unregister(machine_id, epoch);
+            // Forget the debounce stamp so the next session's first liveness
+            // frame writes immediately. Unconditional (unlike `unregister`'s
+            // epoch check): worst case a newer session's window is cleared
+            // and it writes one extra time -- harmless.
+            hub.clear_online_stamp(machine_id);
             // Closes server-side sinks so they don't hang open forever; see
             // `Hub::close_tails_for`'s doc comment.
             hub.close_tails_for(machine_id);
@@ -299,7 +304,11 @@ async fn handle_agent_frame(
             }
             // Stamps `last_seen_at = now()` as well as the status, so a
             // freshly-online machine isn't immediately eligible for the 45s
-            // offline sweeper.
+            // offline sweeper. Unconditional (a fresh session must flip
+            // pending/offline immediately), but it opens the debounce window
+            // so the snapshot frames sent right behind Hello don't each
+            // write again (see `Hub::should_mark_online`).
+            hub.stamp_online(machine_id);
             repo::mark_online(pool, machine_id).await?;
             repo::audit(
                 pool,
@@ -323,21 +332,32 @@ async fn handle_agent_frame(
         // Every push frame below is proof of life: stamps `last_seen_at` and
         // re-asserts `online` (see `repo::mark_online` for why re-asserting
         // matters -- without it a stall-flipped machine never recovers).
+        // Debounced through `Hub::should_mark_online`: the agent sends all
+        // four back-to-back each tick, and one write per window carries the
+        // same information as four.
         Some(agent_frame::Payload::Heartbeat(_)) => {
-            repo::mark_online(pool, machine_id).await?;
+            if hub.should_mark_online(machine_id) {
+                repo::mark_online(pool, machine_id).await?;
+            }
         }
         Some(agent_frame::Payload::Metrics(m)) => {
             let row = metrics_row_from_proto(&m);
             repo::insert_metrics(pool, machine_id, &row).await?;
-            repo::mark_online(pool, machine_id).await?;
+            if hub.should_mark_online(machine_id) {
+                repo::mark_online(pool, machine_id).await?;
+            }
         }
         Some(agent_frame::Payload::DockerState(ds)) => {
             hub.set_docker(machine_id, ds.containers);
-            repo::mark_online(pool, machine_id).await?;
+            if hub.should_mark_online(machine_id) {
+                repo::mark_online(pool, machine_id).await?;
+            }
         }
         Some(agent_frame::Payload::SystemdState(ss)) => {
             hub.set_systemd(machine_id, ss.units);
-            repo::mark_online(pool, machine_id).await?;
+            if hub.should_mark_online(machine_id) {
+                repo::mark_online(pool, machine_id).await?;
+            }
         }
         Some(agent_frame::Payload::LogChunk(chunk)) => {
             // Deliberately no `mark_online` here: a log tail is not evidence
@@ -852,22 +872,38 @@ mod tests {
 
         tokio::time::sleep(std::time::Duration::from_millis(10)).await;
 
-        handle_agent_frame(
-            &pool,
-            &hub,
+        let heartbeat = || AgentFrame {
+            stream_id: 0,
+            payload: Some(agent_frame::Payload::Heartbeat(
+                argus_proto::v1::Heartbeat {
+                    unix_ms: 0,
+                    uptime_secs: 0,
+                },
+            )),
+        };
+
+        // Inside the debounce window the heartbeat deliberately does NOT
+        // write: Hello just opened the window, and one write per window
+        // carries the same information (see `MARK_ONLINE_DEBOUNCE`).
+        handle_agent_frame(&pool, &hub, machine_id, heartbeat(), &tx).await?;
+
+        let row = sqlx::query!(
+            "SELECT status, last_seen_at FROM machines WHERE id = $1",
             machine_id,
-            AgentFrame {
-                stream_id: 0,
-                payload: Some(agent_frame::Payload::Heartbeat(
-                    argus_proto::v1::Heartbeat {
-                        unix_ms: 0,
-                        uptime_secs: 0,
-                    },
-                )),
-            },
-            &tx,
         )
+        .fetch_one(&pool)
         .await?;
+        assert_eq!(row.status, "online", "Heartbeat must not change status");
+        assert_eq!(
+            row.last_seen_at.expect("Hello stamped last_seen_at"),
+            first_seen,
+            "a heartbeat inside the debounce window must not write"
+        );
+
+        // A cleared stamp is exactly the state once the window expires (or a
+        // session ends) -- simulated rather than sleeping out the real 5s.
+        hub.clear_online_stamp(machine_id);
+        handle_agent_frame(&pool, &hub, machine_id, heartbeat(), &tx).await?;
 
         let row = sqlx::query!(
             "SELECT status, last_seen_at FROM machines WHERE id = $1",
@@ -879,7 +915,7 @@ mod tests {
         let second_seen = row.last_seen_at.expect("Heartbeat must stamp last_seen_at");
         assert!(
             second_seen > first_seen,
-            "Heartbeat must advance last_seen_at"
+            "a heartbeat past the debounce window must advance last_seen_at"
         );
 
         Ok(())

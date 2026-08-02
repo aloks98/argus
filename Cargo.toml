@@ -44,7 +44,9 @@ axum-extra = { version = "0.10", features = ["cookie"] }
 
 # Browser HTTP surface + embedded frontend
 axum = { version = "0.8", features = ["ws"] }
-tower-http = { version = "0.7", features = ["trace"] }
+# `compression-gzip` (flate2/miniz_oxide, pure Rust) serves the embedded SPA
+# bundle compressed; applied to the static fallback only (see http::router).
+tower-http = { version = "0.7", features = ["trace", "compression-gzip"] }
 rust-embed = "8"
 # StreamExt/SinkExt for splitting a WebSocket into concurrent send/recv halves.
 futures-util = "0.3"

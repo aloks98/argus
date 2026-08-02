@@ -129,7 +129,14 @@ fn router(state: AppState) -> Router {
         .route("/auth/logout", post(crate::auth::oidc::logout))
         .route("/auth/local", post(crate::auth::local::login))
         .merge(api)
-        .fallback(static_handler)
+        // Compression is scoped to the static bundle ON PURPOSE, not layered
+        // over the whole router: compressing the SSE log stream would invite
+        // proxy/browser buffering of events, and the /api JSON responses are
+        // small. The ~1.5 MB JS chunk is where the bytes are.
+        .fallback_service(
+            axum::routing::any(static_handler)
+                .layer(tower_http::compression::CompressionLayer::new()),
+        )
         .layer(TraceLayer::new_for_http())
         .with_state(state)
 }
@@ -1384,20 +1391,42 @@ async fn static_handler(uri: Uri) -> Response {
     let path = if path.is_empty() { "index.html" } else { path };
 
     match Assets::get(path) {
-        Some(content) => (
-            [(header::CONTENT_TYPE, content_type(path))],
-            content.data.into_owned(),
-        )
-            .into_response(),
+        Some(content) => asset_response(path, content),
         None => match Assets::get("index.html") {
-            Some(index) => (
-                [(header::CONTENT_TYPE, "text/html")],
-                index.data.into_owned(),
-            )
-                .into_response(),
+            Some(index) => asset_response("index.html", index),
             None => (StatusCode::NOT_FOUND, "not found").into_response(),
         },
     }
+}
+
+/// Vite writes every hashed artifact under `assets/` (a content change means a
+/// new filename), so those are safe to cache forever; everything else --
+/// index.html above all -- must revalidate, or a deploy would strand browsers
+/// on an index pointing at asset hashes that no longer exist.
+fn cache_control(path: &str) -> &'static str {
+    if path.starts_with("assets/") {
+        "public, max-age=31536000, immutable"
+    } else {
+        "no-cache"
+    }
+}
+
+/// In release builds `EmbeddedFile.data` is `Cow::Borrowed(&'static [u8])`;
+/// `into_owned()` would memcpy the whole asset (the main JS chunk is ~1.5 MB)
+/// on every request. `Bytes::from_static` serves the embedded bytes directly.
+fn asset_response(path: &str, content: rust_embed::EmbeddedFile) -> Response {
+    let body = match content.data {
+        std::borrow::Cow::Borrowed(b) => axum::body::Bytes::from_static(b),
+        std::borrow::Cow::Owned(v) => axum::body::Bytes::from(v),
+    };
+    (
+        [
+            (header::CONTENT_TYPE, content_type(path)),
+            (header::CACHE_CONTROL, cache_control(path)),
+        ],
+        body,
+    )
+        .into_response()
 }
 
 fn content_type(path: &str) -> &'static str {
@@ -3178,6 +3207,26 @@ mod tests {
             content_type("manifest.webmanifest"),
             "application/manifest+json"
         );
+    }
+
+    /// Only Vite's content-hashed `assets/` may cache forever; index.html
+    /// (and anything else) must revalidate, or a deploy strands browsers on
+    /// an index pointing at asset hashes that no longer exist.
+    #[test]
+    fn cache_control_is_immutable_only_for_hashed_assets() {
+        assert_eq!(
+            cache_control("assets/index-DZ6.js"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(
+            cache_control("assets/archivo-latin-400.woff2"),
+            "public, max-age=31536000, immutable"
+        );
+        assert_eq!(cache_control("index.html"), "no-cache");
+        assert_eq!(cache_control("favicon.svg"), "no-cache");
+        // A client-side ROUTE served via the SPA fallback re-uses
+        // index.html's policy, keyed by the resolved path, not the URI.
+        assert_eq!(cache_control("machines/abc"), "no-cache");
     }
 
     fn test_state(pool: PgPool) -> AppState {

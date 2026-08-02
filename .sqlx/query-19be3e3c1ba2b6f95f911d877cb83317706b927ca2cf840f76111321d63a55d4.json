@@ -1,11 +1,11 @@
 {
   "db_name": "PostgreSQL",
-  "query": "\n        SELECT machine_id, cpu_pct,\n               (100.0 * mem_used / NULLIF(mem_total, 0))::float8 AS \"mem_pct?\"\n        FROM (\n            SELECT machine_id, ts, cpu_pct, mem_used, mem_total,\n                   row_number() OVER (PARTITION BY machine_id ORDER BY ts DESC) AS rn\n            FROM metrics\n        ) t\n        WHERE rn <= $1\n        ORDER BY machine_id, ts ASC\n        ",
+  "query": "\n        SELECT t.machine_id as \"machine_id!\", t.cpu_pct,\n               (100.0 * t.mem_used / NULLIF(t.mem_total, 0))::float8 AS \"mem_pct?\"\n        FROM machines m\n        CROSS JOIN LATERAL (\n            SELECT machine_id, ts, cpu_pct, mem_used, mem_total\n            FROM metrics\n            WHERE machine_id = m.id\n            ORDER BY ts DESC\n            LIMIT $1\n        ) t\n        ORDER BY t.machine_id, t.ts ASC\n        ",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "machine_id",
+        "name": "machine_id!",
         "type_info": "Uuid",
         "origin": {
           "Table": {
@@ -43,5 +43,5 @@
       null
     ]
   },
-  "hash": "a483753b3b7b1d1694254ae9c874d4873469ac9bf4ffc2eed043a72f67a16312"
+  "hash": "19be3e3c1ba2b6f95f911d877cb83317706b927ca2cf840f76111321d63a55d4"
 }

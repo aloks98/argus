@@ -583,6 +583,14 @@ pub struct SparkRow {
 /// The last `per_machine` metrics samples for EVERY machine that has any,
 /// ordered `(machine_id, ts ASC)` -- backs the fleet-grid sparklines, which
 /// need a short recent-history strip per row without a per-machine round trip.
+///
+/// LATERAL per machine, NOT a window function over the whole table: this
+/// runs on every 5s fleet poll, and `row_number() OVER (PARTITION BY ...)`
+/// seq-scans + sorts ALL of `metrics` (~11.5k rows/machine at 48h retention)
+/// to keep 20 rows per machine. The LATERAL form walks the
+/// `metrics_machine_ts (machine_id, ts DESC)` index and reads exactly
+/// `per_machine` rows per machine -- measured 25.6ms -> 0.28ms on a
+/// single-machine dev table, and it scales with fleet size, not table size.
 pub async fn recent_series_all(
     executor: impl sqlx::PgExecutor<'_>,
     per_machine: i64,
@@ -590,15 +598,17 @@ pub async fn recent_series_all(
     let rows = sqlx::query_as!(
         SparkRow,
         r#"
-        SELECT machine_id, cpu_pct,
-               (100.0 * mem_used / NULLIF(mem_total, 0))::float8 AS "mem_pct?"
-        FROM (
-            SELECT machine_id, ts, cpu_pct, mem_used, mem_total,
-                   row_number() OVER (PARTITION BY machine_id ORDER BY ts DESC) AS rn
+        SELECT t.machine_id as "machine_id!", t.cpu_pct,
+               (100.0 * t.mem_used / NULLIF(t.mem_total, 0))::float8 AS "mem_pct?"
+        FROM machines m
+        CROSS JOIN LATERAL (
+            SELECT machine_id, ts, cpu_pct, mem_used, mem_total
             FROM metrics
+            WHERE machine_id = m.id
+            ORDER BY ts DESC
+            LIMIT $1
         ) t
-        WHERE rn <= $1
-        ORDER BY machine_id, ts ASC
+        ORDER BY t.machine_id, t.ts ASC
         "#,
         per_machine,
     )

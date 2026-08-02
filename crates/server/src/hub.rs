@@ -71,8 +71,23 @@ pub struct Hub {
     /// session_id -> (machine, byte sink for the WS handler, flow state).
     #[allow(clippy::type_complexity)]
     ptys: Mutex<HashMap<String, (Uuid, mpsc::Sender<Vec<u8>>, Arc<PtyFlowState>)>>,
+    /// machine -> when `repo::mark_online` last actually wrote, for
+    /// `should_mark_online`'s debounce. Entries are dropped on session end
+    /// (`clear_online_stamp`) so the map stays bounded by fleet size.
+    online_stamps: Mutex<HashMap<Uuid, std::time::Instant>>,
     epoch_counter: AtomicU64,
 }
+
+/// How long after a `mark_online` write further writes are skipped. The agent
+/// sends Heartbeat + Metrics + DockerState + SystemdState back-to-back every
+/// tick, which without this is 4 `UPDATE machines` round trips (and 4 dead
+/// row versions) per 15s per machine where one carries all the information.
+///
+/// MUST stay well under `DEFAULT_HEARTBEAT_SECS` (15s): the first frame of
+/// each tick then always writes, so `last_seen_at` is at most one debounce
+/// window stale and a sweeper-flipped (45s) machine still recovers on its
+/// next heartbeat exactly as before.
+const MARK_ONLINE_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(5);
 
 /// Journal filters carried on a log request. Zero means unset for every field,
 /// so a default value reproduces the unfiltered behaviour.
@@ -161,6 +176,45 @@ impl Hub {
             .get(&machine_id)
             .cloned()
             .unwrap_or_default()
+    }
+
+    /// Whether a liveness-bearing frame should actually write
+    /// `repo::mark_online`, reserving the slot (stamping `now`) when it says
+    /// yes -- check and stamp are one step under the lock, so two frames
+    /// racing can't both be told to write. `true` at most once per
+    /// `MARK_ONLINE_DEBOUNCE` per machine.
+    ///
+    /// Best-effort by design: if the caller's write then fails, the stamp is
+    /// still spent and `last_seen_at` waits for the next window -- fine,
+    /// because the sweep threshold (45s) dwarfs the window (5s).
+    pub fn should_mark_online(&self, machine_id: Uuid) -> bool {
+        let mut stamps = self.online_stamps.lock().unwrap();
+        let now = std::time::Instant::now();
+        match stamps.get(&machine_id) {
+            Some(last) if now.duration_since(*last) < MARK_ONLINE_DEBOUNCE => false,
+            _ => {
+                stamps.insert(machine_id, now);
+                true
+            }
+        }
+    }
+
+    /// Unconditional stamp for the `Hello` path, which always writes (a fresh
+    /// session must flip a pending/offline machine immediately) but must
+    /// still start a debounce window so the snapshot frames right behind it
+    /// don't each write again.
+    pub fn stamp_online(&self, machine_id: Uuid) {
+        self.online_stamps
+            .lock()
+            .unwrap()
+            .insert(machine_id, std::time::Instant::now());
+    }
+
+    /// Session ended: forget the stamp so the machine's next session (or a
+    /// concurrent one) writes on its first liveness frame, and the map
+    /// doesn't accumulate entries for departed machines.
+    pub fn clear_online_stamp(&self, machine_id: Uuid) {
+        self.online_stamps.lock().unwrap().remove(&machine_id);
     }
 
     /// Counted here (not in the handler) so the fleet query stays one cheap
@@ -627,6 +681,38 @@ mod tests {
             sub_state: "dead".into(),
             description: format!("desc {name}"),
         }
+    }
+
+    /// One write per debounce window per machine: the first caller is told
+    /// to write and reserves the slot; back-to-back frames (the agent sends
+    /// four per tick) are told not to. `clear_online_stamp` (session end /
+    /// window expiry) and `stamp_online` (Hello) both reset the edge.
+    #[test]
+    fn should_mark_online_debounces_until_cleared() {
+        let hub = Hub::new();
+        let m = Uuid::new_v4();
+
+        assert!(hub.should_mark_online(m), "first frame must write");
+        assert!(
+            !hub.should_mark_online(m),
+            "a frame inside the window must not"
+        );
+        assert!(
+            hub.should_mark_online(Uuid::new_v4()),
+            "the debounce is per machine, not global"
+        );
+
+        hub.clear_online_stamp(m);
+        assert!(
+            hub.should_mark_online(m),
+            "a cleared stamp (session end / expired window) must write again"
+        );
+
+        hub.stamp_online(m);
+        assert!(
+            !hub.should_mark_online(m),
+            "stamp_online (the Hello path) must open a window too"
+        );
     }
 
     #[test]
