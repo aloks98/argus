@@ -418,6 +418,23 @@ pub async fn prune_metrics(
     Ok(result.rows_affected())
 }
 
+/// Deletes `audit_log` rows older than `older_than`
+/// (`argus_common::AUDIT_RETENTION_DAYS` at the call site) -- the table has
+/// no other lifecycle and only ever grows. `ts < $1` walks
+/// `audit_log_ts_idx`. Returns rows deleted.
+pub async fn prune_audit_log(
+    exec: impl sqlx::PgExecutor<'_>,
+    older_than: std::time::Duration,
+) -> Result<u64> {
+    let cutoff = OffsetDateTime::now_utc() - older_than;
+
+    let result = sqlx::query!("DELETE FROM audit_log WHERE ts < $1", cutoff)
+        .execute(exec)
+        .await?;
+
+    Ok(result.rows_affected())
+}
+
 /// Append an audit log entry. Every verb goes through this from the start --
 /// a verb without an audit_log write is incomplete.
 pub async fn audit(
@@ -1517,6 +1534,29 @@ mod tests {
         .await?
         .count;
         assert_eq!(remaining, 1, "expected the fresh row to remain");
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn prune_audit_log_deletes_only_rows_past_retention(pool: PgPool) -> anyhow::Result<()> {
+        // Backdated row: audit() always stamps ts = now(), so the old row
+        // needs a direct INSERT with an explicit stale ts.
+        sqlx::query!(
+            "INSERT INTO audit_log (ts, actor, action, result)
+             VALUES (now() - interval '400 days', 'system', 'test.old', 'ok')"
+        )
+        .execute(&pool)
+        .await?;
+        audit(&pool, Actor::System, "test.fresh", None, "ok").await?;
+
+        let deleted = prune_audit_log(&pool, std::time::Duration::from_secs(365 * 86_400)).await?;
+        assert_eq!(deleted, 1, "expected only the 400-day-old row to go");
+
+        let remaining: i64 = sqlx::query_scalar!(r#"SELECT count(*) as "n!" FROM audit_log"#)
+            .fetch_one(&pool)
+            .await?;
+        assert_eq!(remaining, 1, "the fresh row must remain");
 
         Ok(())
     }

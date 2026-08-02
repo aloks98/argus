@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO audit_log (ts, actor, action, result)\n             VALUES (now() - interval '400 days', 'system', 'test.old', 'ok')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "1623dcc8d4d40d9c8a2a27f9d51688e4104fc40ebc537ff1f782b061c42ef220"
+}

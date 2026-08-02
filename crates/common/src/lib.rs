@@ -9,6 +9,12 @@ pub const DEFAULT_METRICS_SECS: u32 = 15;
 /// Metrics retention window; rows older than this are pruned nightly (PRD §6.3).
 pub const METRICS_RETENTION_HOURS: i64 = 48;
 
+/// Audit-log retention window. A year keeps the security trail long enough
+/// to answer "when did this machine last get a verb?" across seasons while
+/// bounding a table that otherwise only ever grows (it has no other
+/// lifecycle). Pruned by the same hourly job as metrics.
+pub const AUDIT_RETENTION_DAYS: i64 = 365;
+
 /// Where the agent persists its identity (private key + issued client cert).
 pub const AGENT_DATA_DIR: &str = "/var/lib/argus";
 

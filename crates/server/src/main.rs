@@ -63,7 +63,7 @@ async fn main() -> Result<()> {
         http::serve(&cfg, pool.clone(), hub.clone()),
         grpc::serve(&cfg, agent_svc, server_identity),
         jobs::run(pool.clone()),
-        jobs::prune_metrics(pool.clone()),
+        jobs::prune_retention(pool.clone()),
     )?;
 
     Ok(())
