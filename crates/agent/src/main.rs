@@ -23,6 +23,11 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,argus_agent=debug".into()),
         )
+        // ANSI only when stdout is really a terminal: under systemd the
+        // colour escapes land in journald verbatim, and journal viewers
+        // half-strip them -- eating the characters around every field
+        // ("INFOrgus_agent"). `fmt()` defaults to always-on.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
     // rustls is pinned to the `ring` provider across the whole workspace.

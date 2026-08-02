@@ -34,6 +34,10 @@ async fn main() -> Result<()> {
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| "info,argus=debug".into()),
         )
+        // ANSI only when stdout is really a terminal -- same reasoning as
+        // the agent's main.rs: `kubectl logs` / journald get escape codes
+        // otherwise, which log viewers mangle.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .init();
 
     // rustls is pinned to the `ring` provider across the whole workspace.
