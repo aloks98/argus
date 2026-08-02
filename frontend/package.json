@@ -13,8 +13,8 @@
     "fmt:check": "oxfmt --check"
   },
   "dependencies": {
-    "@e412/rnui-react": "^0.1.0",
-    "@e412/rnui-themes": "0.1.0",
+    "@e412/rnui-react": "^0.2.0",
+    "@e412/rnui-themes": "0.2.0",
     "@fontsource/archivo": "5.3.0",
     "@fontsource/archivo-black": "5.3.0",
     "@fontsource/ibm-plex-mono": "5.3.0",

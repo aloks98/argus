@@ -15,7 +15,7 @@ import {
 import { ALL_LOGS } from "../api";
 import { useLogFilters } from "../lib/logFilters";
 import LogFilterBar from "./LogFilterBar";
-import LogViewer from "./LogViewer";
+import LogViewer from "./LazyLogViewer";
 
 export default function LogDialog() {
   const { id } = useParams<{ id: string }>();

@@ -50,6 +50,7 @@ import { ChevronRight } from "lucide-react";
 import type { EnrollmentToken, MintTokenBody } from "../api";
 import PageHeader from "../components/PageHeader";
 import StatusBadge from "../components/StatusBadge";
+import { codeHighlighter } from "../lib/codeHighlighter";
 import { formatRelative } from "../lib/format";
 import { useEnrollmentTokens, useMintToken, useRevokeToken } from "../lib/queries";
 import { tokenState, tokenTone } from "../lib/status";
@@ -487,13 +488,14 @@ function ResultPanel({ data }: { data: EnrollmentToken & { token: string } }) {
         {/* vesper: near-black surface with amber accents, closest bundled
             theme to the app's identity; min-light is its light-mode
             counterpart. Any theme named here must ALSO be registered in
-            lib/shiki-slim.ts, or the block silently renders as plain text. */}
+            lib/codeHighlighter.ts, or the block renders empty. */}
         <CodeBlock
           code={runBlock}
           language="bash"
           showCopy
           title="Run on the host"
           themes={{ light: "min-light", dark: "vesper" }}
+          highlighter={codeHighlighter}
         />
         <FieldDescription className="mt-1">
           Replace <code>&lt;agent-endpoint&gt;</code> with the address agents reach the control

@@ -1,2 +1,7 @@
 allowBuilds:
   esbuild: true
+# Own packages -- the release-age gate exists for supply-chain caution on
+# third-party deps, not for rnui releases we cut ourselves.
+minimumReleaseAgeExclude:
+  - "@e412/rnui-react"
+  - "@e412/rnui-themes"

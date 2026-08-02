@@ -6,35 +6,24 @@ import tailwindcss from "@tailwindcss/vite";
 // (crates/server/src/embed.rs) and serves with SPA fallback (PRD §10).
 export default defineConfig({
   plugins: [react(), tailwindcss()],
-  resolve: {
-    alias: [
-      // See src/stubs/echarts.ts — drops ~55% of the bundle. Remove once rnui
-      // no longer registers echarts at module scope.
-      {
-        find: /^echarts(\/.*)?$/,
-        replacement: decodeURIComponent(
-          new URL("./src/stubs/echarts.ts", import.meta.url).pathname,
-        ),
-      },
-      // See src/lib/shiki-slim.ts — shim for bare `shiki` (rnui's CodeBlock
-      // import), which otherwise pulls ~12 MB of grammar/theme chunks.
-      // Exact match on purpose: must not also rewrite the shim's own
-      // `shiki/core` / `shiki/engine/javascript` imports.
-      {
-        find: /^shiki$/,
-        replacement: decodeURIComponent(
-          new URL("./src/lib/shiki-slim.ts", import.meta.url).pathname,
-        ),
-      },
-    ],
-  },
+  // No stub aliases anymore: rnui >= 0.2 tree-shakes (sideEffects:false +
+  // preserved modules) so unused chart components take echarts with them,
+  // and CodeBlock takes an explicit highlighter (lib/codeHighlighter.ts)
+  // instead of statically referencing shiki's full grammar/theme maps —
+  // the full-bundle behavior is an opt-in import (code-block-full) nothing
+  // here uses. If dist ever sprouts hundreds of grammar chunks again,
+  // something reintroduced a full-bundle reference.
   build: {
     outDir: "dist",
     emptyOutDir: true,
-    // Measured floor post-echarts-stub: ~679 kB (gzip ~224 kB) of react-dom +
-    // rnui, not bloat — raised just above that so genuine new bloat still
-    // trips the default 500 kB warning. Lower this if ever served off-LAN.
-    chunkSizeWarningLimit: 750,
+    // Measured floor post-code-splitting (2026-08-01): entry ~921 kB (gzip
+    // ~288 kB) of react-dom + the rnui barrel — the pages, xterm, logviewer
+    // and uplot are lazy chunks now, so the entry can't shrink further from
+    // this repo's side. The remaining fat is rnui not tree-shaking (no
+    // `sideEffects` field, single flat dist bundle + module-scope
+    // registrations); fix that upstream in rnui, then lower this. Set just
+    // above the floor so genuine new entry bloat still warns.
+    chunkSizeWarningLimit: 1000,
   },
   server: {
     // During `npm run dev`, proxy the API/stream surfaces to the local control

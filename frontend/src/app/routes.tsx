@@ -1,8 +1,14 @@
-import type { ReactElement } from "react";
+import { lazy, type ReactElement } from "react";
 import { Plus, Server, type LucideIcon } from "lucide-react";
-import EnrollPage from "../pages/EnrollPage";
-import FleetPage from "../pages/FleetPage";
-import MachineDetailPage from "../pages/MachineDetailPage";
+
+// Route-level code splitting: each page becomes its own chunk, fetched on
+// first navigation (App.tsx owns the one Suspense boundary). The entry
+// chunk then carries only the shell + sign-in; the detail page's heavy
+// dependencies (uplot, and via its own tab-level splits xterm and
+// react-logviewer) stop taxing every first paint.
+const EnrollPage = lazy(() => import("../pages/EnrollPage"));
+const FleetPage = lazy(() => import("../pages/FleetPage"));
+const MachineDetailPage = lazy(() => import("../pages/MachineDetailPage"));
 
 /**
  * The app's routes, and which of them appear in the sidebar.

@@ -2,7 +2,7 @@
 // /api/machines/:id/metrics?range=... every 10s; header plus cpu%/mem%/
 // load1/net-rate charts for the selected range, tabbed against containers/
 // units/logs/terminal. Mirrors FleetPage's polling idioms.
-import { useState } from "react";
+import { Suspense, lazy, useState } from "react";
 import { Link, useParams, useSearchParams } from "react-router-dom";
 import {
   Alert,
@@ -37,13 +37,12 @@ import { Pencil } from "lucide-react";
 import ContainersCard from "../components/ContainersCard";
 import LogDialog from "../components/LogDialog";
 import LogFilterBar from "../components/LogFilterBar";
-import LogViewer from "../components/LogViewer";
+import LogViewer from "../components/LazyLogViewer";
 import MachineIdentity from "../components/MachineIdentity";
 import SpecStrip from "../components/SpecStrip";
 import type { SpecItem } from "../components/SpecStrip";
 import StatusBadge from "../components/StatusBadge";
 import SystemCard from "../components/SystemCard";
-import TerminalView from "../components/TerminalView";
 import TimeSeriesChart from "../components/TimeSeriesChart";
 import type { ChartSeries } from "../components/TimeSeriesChart";
 import UnitsCard from "../components/UnitsCard";
@@ -63,6 +62,11 @@ import {
 import { useDocker, useMachine, useMetrics, useSystemd } from "../lib/queries";
 import type { Range } from "../lib/queries";
 import { machineTone } from "../lib/status";
+
+// xterm (+ fit addon) is the single heaviest dependency on this page and is
+// only needed once the Terminal tab is activated — base-ui unmounts
+// inactive panels, so the chunk isn't fetched until then.
+const TerminalView = lazy(() => import("../components/TerminalView"));
 
 const RANGES: readonly Range[] = ["1h", "6h", "24h"];
 
@@ -513,7 +517,13 @@ export default function MachineDetailPage() {
         </TabsContent>
 
         <TabsContent value="terminal" className="mt-4">
-          <TerminalView machineId={id} />
+          <Suspense
+            fallback={
+              <p className="p-2 font-mono text-xs text-muted-foreground">Loading terminal…</p>
+            }
+          >
+            <TerminalView machineId={id} />
+          </Suspense>
         </TabsContent>
       </Tabs>
 
