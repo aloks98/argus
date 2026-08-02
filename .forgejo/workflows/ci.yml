@@ -162,6 +162,23 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
+      # Same registry-only discipline as agent-musl's cache (see its comment
+      # for why the rustup target dir must NOT be cached). The sqlx binaries
+      # ride along because `cargo install sqlx-cli` builds from source --
+      # minutes per run for a tool whose version almost never changes; the
+      # install step below skips itself when the cached binary already
+      # reports the right minor.
+      - name: Cache cargo registry + sqlx-cli
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/bin/sqlx
+            ~/.cargo/bin/cargo-sqlx
+          key: cargo-buildtest-v1-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            cargo-buildtest-v1-
+
       - name: Start Postgres
         run: |
           apt-get update
@@ -190,7 +207,14 @@ jobs:
       # without `cargo sqlx prepare` being re-run. Needs the live schema.
       - name: Verify the .sqlx offline cache is current
         run: |
-          cargo install sqlx-cli --version ^0.9 --no-default-features --features rustls,postgres --locked
+          # Version-checked (not just `command -v`): a cached binary from
+          # before a sqlx 0.10 bump must trigger a reinstall, not silently
+          # verify with the wrong CLI. Checked explicitly rather than relying
+          # on `cargo install`'s own skip, which needs ~/.cargo/.crates.toml
+          # to also survive the cache -- the binary alone is a simpler contract.
+          if ! ~/.cargo/bin/sqlx --version 2>/dev/null | grep -qE ' 0\.9\.'; then
+            cargo install sqlx-cli --version ^0.9 --no-default-features --features rustls,postgres --locked
+          fi
           sqlx migrate run --source crates/server/migrations
           cargo sqlx prepare --workspace --check -- --all-targets
 
