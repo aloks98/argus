@@ -86,6 +86,7 @@ message ServerFrame {
     UpdateAgent update = 10;            // self-update: download new binary + re-exec
     Ping ping = 11;
     PtyFlow pty_flow = 12;
+    UpdateChunk update_chunk = 13;      // binary payload following an UpdateAgent
   }
 }
 
@@ -205,7 +206,16 @@ message PtyClose { string session_id = 1; }
 // ---- Self-update -----------------------------------------------------------
 
 message UpdateAgent {
-  string url = 1;      // mTLS URL on the control plane to fetch the new binary
+  string url = 1;      // superseded: unset — the binary streams as UpdateChunk frames on this stream
   string version = 2;
   string sha256 = 3;   // verified before re-exec
+  uint64 total_bytes = 4;
+  string command_id = 5;   // UpdateAgent is a bare ServerFrame arm (no Command
+                           // envelope), so it carries its own correlation id
+  string issued_by = 6;    // and actor, mirroring Command, for the agent-side trail
+}
+
+message UpdateChunk {
+  bytes data = 1;
+  bool last = 2;
 }

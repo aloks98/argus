@@ -13,6 +13,7 @@ mod metrics;
 mod pty;
 mod session;
 mod systemd;
+mod update;
 
 use anyhow::Result;
 

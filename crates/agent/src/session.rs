@@ -70,6 +70,16 @@ fn should_reset_backoff(outcome_ok: bool, lasted: Duration) -> bool {
     outcome_ok && lasted >= STABLE
 }
 
+/// Turn an update step's Err into a CommandResult refusal frame.
+fn update_refusal(command_id: &str, msg: &str) -> CommandResult {
+    CommandResult {
+        command_id: command_id.to_string(),
+        ok: false,
+        exit_code: 1,
+        message: msg.to_string(),
+    }
+}
+
 /// Connects once, holds the bidi stream until it ends, then returns so the
 /// caller can measure how long it lasted. `Ok(())` = established and later
 /// ended cleanly; `Err` = the connect failed or the stream errored.
@@ -279,6 +289,20 @@ async fn connect_and_serve(
             .context("opening Session stream")?
             .into_inner();
 
+        // Resolved ONCE per session, before any update can swap the binary out
+        // from under /proc/self/exe.
+        let mut updater = match std::env::current_exe() {
+            Ok(exe) => Some(crate::update::Updater::new(exe)),
+            Err(e) => {
+                tracing::warn!(error = %e, "update: cannot resolve own binary; self-update disabled");
+                None
+            }
+        };
+        // Chunks don't carry the id -- the stream is ordered and one update
+        // runs at a time, so the remembered id from the announce is the
+        // right one for mid-stream refusals.
+        let mut last_update_command_id = String::new();
+
         loop {
             match inbound.next().await {
                 Some(Ok(frame)) => {
@@ -449,6 +473,75 @@ async fn connect_and_serve(
                                 // See PtyOpen above: `close()` blocks on a thread
                                 // join, so it must not run inline here either.
                                 tokio::task::spawn_blocking(move || h.close());
+                            }
+                        }
+                        Some(server_frame::Payload::Update(u)) => {
+                            tracing::info!(version = %u.version, issued_by = %u.issued_by, "update: announced");
+                            // Remember the correlation id for the chunks that follow.
+                            last_update_command_id = u.command_id.clone();
+                            let refusal = match updater.as_mut() {
+                                None => Some("self-update disabled: own path unresolved".to_string()),
+                                Some(up) => up
+                                    .begin(&u.version, &u.sha256, u.total_bytes, &u.command_id)
+                                    .err(),
+                            };
+                            if let Some(msg) = refusal {
+                                tracing::warn!(%msg, "update: refused");
+                                let _ = inbound_tx
+                                    .send(AgentFrame {
+                                        stream_id: frame.stream_id,
+                                        payload: Some(agent_frame::Payload::CommandResult(
+                                            update_refusal(&u.command_id, &msg),
+                                        )),
+                                    })
+                                    .await;
+                            }
+                        }
+                        Some(server_frame::Payload::UpdateChunk(c)) => {
+                            if let Some(up) = updater.as_mut() {
+                                match up.chunk(&c.data, c.last) {
+                                    Ok(None) => {}
+                                    Ok(Some(staged)) => {
+                                        tracing::info!(version = %staged.version, "update: staged; re-exec");
+                                        let _ = inbound_tx
+                                            .send(AgentFrame {
+                                                stream_id: frame.stream_id,
+                                                payload: Some(agent_frame::Payload::CommandResult(
+                                                    CommandResult {
+                                                        command_id: staged.command_id.clone(),
+                                                        ok: true,
+                                                        exit_code: 0,
+                                                        message: format!(
+                                                            "staged {}",
+                                                            staged.version
+                                                        ),
+                                                    },
+                                                )),
+                                            })
+                                            .await;
+                                        // Give the outbound task a moment to flush the result
+                                        // before this process image is replaced.
+                                        tokio::time::sleep(std::time::Duration::from_millis(500))
+                                            .await;
+                                        let err = crate::update::reexec(&staged.exe);
+                                        // Only reachable if exec itself failed. The staged (hash-
+                                        // verified) binary is already in place on disk and .old is
+                                        // beside it -- the next restart runs the new version. This
+                                        // process keeps running the old image; just record it.
+                                        tracing::error!(error = %err, "update: exec failed; staged binary will take effect on next restart");
+                                    }
+                                    Err(msg) => {
+                                        tracing::warn!(%msg, "update: refused mid-stream");
+                                        let _ = inbound_tx
+                                            .send(AgentFrame {
+                                                stream_id: frame.stream_id,
+                                                payload: Some(agent_frame::Payload::CommandResult(
+                                                    update_refusal(&last_update_command_id, &msg),
+                                                )),
+                                            })
+                                            .await;
+                                    }
+                                }
                             }
                         }
                         _ => {}

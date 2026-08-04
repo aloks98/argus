@@ -98,6 +98,7 @@ dependencies = [
  "prost",
  "rand 0.9.4",
  "rcgen",
+ "ring",
  "rustix",
  "rustls",
  "rustls-pemfile",

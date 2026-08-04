@@ -23,6 +23,8 @@ rustls.workspace = true
 tokio-rustls.workspace = true
 rcgen.workspace = true
 rustls-pemfile.workspace = true
+# sha256 for self-update verification — same crypto stack as rustls
+ring.workspace = true
 
 anyhow.workspace = true
 tracing.workspace = true
