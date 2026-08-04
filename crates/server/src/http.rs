@@ -52,9 +52,18 @@ pub struct AppState {
     /// agent-surface TLS leaf, so a value from this list passes certificate
     /// verification -- a hand-typed one only might.
     pub agent_endpoints: Vec<String>,
+    /// The bundled `argus-agent` binary this control plane can push via
+    /// self-update, loaded once at boot from `ARGUS_AGENT_BINARY`. `None` is
+    /// a valid, boot-succeeding state (design: unbundled deployments 503).
+    pub agent_binary: Option<Arc<crate::agent_binary::AgentBinary>>,
 }
 
-pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
+pub async fn serve(
+    cfg: &Config,
+    pool: PgPool,
+    hub: Arc<Hub>,
+    agent_binary: Option<Arc<crate::agent_binary::AgentBinary>>,
+) -> Result<()> {
     let oidc = cfg.oidc.clone().map(Arc::new);
     let cipher = Arc::new(
         crate::crypto::FieldCipher::from_b64_key(&cfg.field_key_b64)
@@ -84,6 +93,7 @@ pub async fn serve(cfg: &Config, pool: PgPool, hub: Arc<Hub>) -> Result<()> {
             .iter()
             .map(|san| format!("https://{san}:{agent_port}"))
             .collect(),
+        agent_binary,
     });
 
     let listener = tokio::net::TcpListener::bind(&cfg.http_addr).await?;
@@ -125,6 +135,8 @@ fn router(state: AppState) -> Router {
         // What the Enroll page interpolates into its printed block.
         .route("/api/enrollment-config", get(enrollment_config))
         .route("/api/audit", get(list_audit))
+        .route("/api/server-info", get(server_info))
+        .route("/api/machines/{id}/agent-update", post(agent_update))
         // The authenticated route predates the public /ca.pem below and is
         // kept for the download button + any existing automation; both call
         // the same handler.
@@ -1553,6 +1565,116 @@ async fn run_verb(
     }
 }
 
+#[derive(serde::Serialize)]
+struct ServerInfoDto {
+    version: &'static str,
+    agent_update: Option<AgentUpdateInfoDto>,
+}
+
+#[derive(serde::Serialize)]
+struct AgentUpdateInfoDto {
+    version: &'static str,
+    sha256: String,
+}
+
+/// Fixed at boot; the UI caches it like enrollment-config.
+async fn server_info(State(state): State<AppState>) -> Json<ServerInfoDto> {
+    Json(ServerInfoDto {
+        version: env!("CARGO_PKG_VERSION"),
+        agent_update: state.agent_binary.as_ref().map(|b| AgentUpdateInfoDto {
+            version: b.version,
+            sha256: b.sha256_hex.clone(),
+        }),
+    })
+}
+
+/// Push the bundled agent binary to this machine and wait (bounded) for the
+/// agent's staged/refused CommandResult. Mirrors run_verb's ordering: the
+/// audit row exists before dispatch, fail-closed on audit failure.
+async fn agent_update(
+    State(state): State<AppState>,
+    Path(id): Path<Uuid>,
+    crate::auth::AuthUser(identity): crate::auth::AuthUser,
+) -> Response {
+    let Some(bin) = state.agent_binary.clone() else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "no agent binary bundled").into_response();
+    };
+    // Arch guard: we bundle x86_64-musl only. NULL arch (agent predates
+    // inventory) is treated as a mismatch -- refuse rather than guess.
+    match repo::machine_arch(&state.pool, id).await {
+        Ok(Some(arch)) if arch == "x86_64" => {}
+        Ok(_) => return (StatusCode::CONFLICT, "unsupported or unknown arch").into_response(),
+        Err(e) => {
+            tracing::error!(error = %e, "agent-update: arch lookup failed");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    }
+
+    let command_id = Uuid::new_v4();
+    let cid = command_id.to_string();
+    let rx = state.hub.register_pending(cid.clone(), id);
+    if let Err(e) = repo::audit_command(
+        &state.pool,
+        repo::Actor::User(&identity),
+        "agent.update",
+        Some(id),
+        bin.version,
+        command_id,
+        "dispatched",
+    )
+    .await
+    {
+        state.hub.abandon_pending(&cid);
+        tracing::error!(error = %e, "agent-update: dispatched audit write failed; not dispatching");
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "failed to record audit entry",
+        )
+            .into_response();
+    }
+
+    if let Err(DispatchError::NotConnected) = state
+        .hub
+        .send_agent_update(
+            id,
+            cid.clone(),
+            repo::Actor::User(&identity).as_str().into_owned(),
+            &bin,
+        )
+        .await
+    {
+        state.hub.abandon_pending(&cid);
+        if let Err(e) = repo::update_command_result(&state.pool, command_id, id, "denied").await {
+            tracing::error!(error = %e, "agent-update: denied audit update failed");
+        }
+        return (StatusCode::CONFLICT, "agent not connected").into_response();
+    }
+
+    match tokio::time::timeout(Duration::from_secs(60), rx).await {
+        Ok(Ok(result)) => Json(VerbResult {
+            command_id: cid,
+            ok: Some(result.ok),
+            message: Some(result.message),
+            status: "completed",
+        })
+        .into_response(),
+        Ok(Err(_)) => (StatusCode::INTERNAL_SERVER_ERROR, "result channel closed").into_response(),
+        Err(_) => {
+            state.hub.abandon_pending(&cid);
+            (
+                StatusCode::ACCEPTED,
+                Json(VerbResult {
+                    command_id: cid,
+                    ok: None,
+                    message: None,
+                    status: "pending",
+                }),
+            )
+                .into_response()
+        }
+    }
+}
+
 /// Serve the embedded React app, falling back to `index.html` for client-side
 /// routes (PRD §10).
 async fn static_handler(uri: Uri) -> Response {
@@ -2516,6 +2638,105 @@ mod tests {
             "no Command frame may be dispatched when the audit write fails"
         );
 
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn server_info_reports_bundle_state(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
+        // Without a bundle: agent_update is null.
+        let app = router(test_state(pool.clone()));
+        let res = app
+            .oneshot(
+                Request::get("/api/server-info")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await?)?;
+        assert_eq!(body["version"], env!("CARGO_PKG_VERSION"));
+        assert!(body["agent_update"].is_null());
+
+        // With a bundle: version + sha surface.
+        let mut state = test_state(pool);
+        state.agent_binary = Some(std::sync::Arc::new(
+            crate::agent_binary::AgentBinary::for_tests(b"fake-binary".to_vec()),
+        ));
+        let app = router(state);
+        let res = app
+            .oneshot(
+                Request::get("/api/server-info")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        let body: serde_json::Value =
+            serde_json::from_slice(&to_bytes(res.into_body(), usize::MAX).await?)?;
+        assert_eq!(body["agent_update"]["version"], env!("CARGO_PKG_VERSION"));
+        let expected_hex: String = ring::digest::digest(&ring::digest::SHA256, b"fake-binary")
+            .as_ref()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(body["agent_update"]["sha256"], expected_hex);
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn agent_update_guards(pool: PgPool) -> anyhow::Result<()> {
+        // Machine exists but agent is not connected; arch seeded as x86_64.
+        let mid = sqlx::query_scalar!(
+            r#"INSERT INTO machines (machine_id, hostname, status, arch)
+               VALUES ('upd-guard', 'upd-host', 'online', 'x86_64') RETURNING id"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        let cookie = auth_cookie(&pool).await?;
+
+        // 503 when no binary is bundled.
+        let app = router(test_state(pool.clone()));
+        let res = app
+            .oneshot(
+                Request::post(format!("/api/machines/{mid}/agent-update"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::SERVICE_UNAVAILABLE);
+
+        // 409 when bundled but agent not connected.
+        let mut state = test_state(pool.clone());
+        state.agent_binary = Some(std::sync::Arc::new(
+            crate::agent_binary::AgentBinary::for_tests(b"fake-binary".to_vec()),
+        ));
+        let app = router(state);
+        let res = app
+            .clone()
+            .oneshot(
+                Request::post(format!("/api/machines/{mid}/agent-update"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
+
+        // 409 on arch mismatch (aarch64 machine), even before connectivity.
+        let mid_arm = sqlx::query_scalar!(
+            r#"INSERT INTO machines (machine_id, hostname, status, arch)
+               VALUES ('upd-arm', 'upd-arm-host', 'online', 'aarch64') RETURNING id"#
+        )
+        .fetch_one(&pool)
+        .await?;
+        let res = app
+            .oneshot(
+                Request::post(format!("/api/machines/{mid_arm}/agent-update"))
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::CONFLICT);
         Ok(())
     }
 
@@ -3566,6 +3787,7 @@ mod tests {
                 "https://agents.test:9443".into(),
                 "https://10.0.0.5:9443".into(),
             ],
+            agent_binary: None,
         }
     }
 

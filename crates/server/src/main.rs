@@ -2,6 +2,7 @@
 //! Serves two network surfaces -- browser HTTP (behind Traefik) and agent
 //! mTLS gRPC (behind a dedicated MetalLB LoadBalancer). See docs/PRD.md.
 
+mod agent_binary;
 mod auth;
 mod ca;
 mod config;
@@ -46,6 +47,19 @@ async fn main() -> Result<()> {
     let cfg = config::Config::from_env()?;
     tracing::info!(http_addr = %cfg.http_addr, agent_addr = %cfg.agent_addr, "starting argus control plane");
 
+    // Boot proceeds either way (unbundled or unreadable): the agent-update
+    // endpoint 503s until this is `Some`, matching the spec.
+    let agent_binary = cfg
+        .agent_binary_path
+        .as_deref()
+        .map(agent_binary::AgentBinary::load)
+        .transpose()
+        .unwrap_or_else(|e| {
+            tracing::error!(error = %e, "agent binary configured but unreadable; self-update disabled");
+            None
+        })
+        .map(Arc::new);
+
     // Readiness is gated on Postgres: connect and migrate before serving (PRD §2.5).
     let pool = db::connect(&cfg).await?;
     db::migrate(&pool).await?;
@@ -64,7 +78,7 @@ async fn main() -> Result<()> {
     let agent_svc = grpc::AgentSvc::new(ca, pool.clone(), hub.clone());
 
     tokio::try_join!(
-        http::serve(&cfg, pool.clone(), hub.clone()),
+        http::serve(&cfg, pool.clone(), hub.clone(), agent_binary),
         grpc::serve(&cfg, agent_svc, server_identity),
         jobs::run(pool.clone()),
         jobs::prune_retention(pool.clone()),

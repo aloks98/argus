@@ -802,6 +802,19 @@ pub async fn machine_detail(
     Ok(row)
 }
 
+/// The machine's reported CPU architecture, for the agent-update arch guard.
+/// `Ok(None)` covers both "no such machine" and "machine exists but hasn't
+/// reported an arch yet" -- the caller treats both as a refuse-rather-than-guess
+/// mismatch, so the distinction doesn't matter here.
+pub async fn machine_arch(exec: impl sqlx::PgExecutor<'_>, id: Uuid) -> Result<Option<String>> {
+    Ok(
+        sqlx::query_scalar!("SELECT arch FROM machines WHERE id = $1", id)
+            .fetch_optional(exec)
+            .await?
+            .flatten(),
+    )
+}
+
 /// Partial identity update. Each field is guarded by its own `apply` flag so
 /// one static, compile-time-checked query covers every PATCH combination --
 /// no dynamic SQL. Returns false when the machine id does not exist.

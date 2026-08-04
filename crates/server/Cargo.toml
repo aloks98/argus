@@ -50,6 +50,7 @@ hex.workspace = true
 x509-parser.workspace = true
 rand.workspace = true
 argon2.workspace = true
+ring.workspace = true
 
 [dev-dependencies]
 # For parsing PEM in tests only; `rcgen`/`x509-parser` already pull in `pem`

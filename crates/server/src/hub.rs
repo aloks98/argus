@@ -6,7 +6,8 @@
 use crate::repo;
 use argus_proto::v1::{
     server_frame, Command, CommandResult, Container, LogChunk, LogTailRequest, LogTailStop,
-    PtyClose, PtyFlow, PtyInput, PtyOpen, PtyResize, ServerFrame, Unit, Verb,
+    PtyClose, PtyFlow, PtyInput, PtyOpen, PtyResize, ServerFrame, Unit, UpdateAgent, UpdateChunk,
+    Verb,
 };
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -252,6 +253,52 @@ impl Hub {
         tx.send(Ok(frame))
             .await
             .map_err(|_| DispatchError::NotConnected)
+    }
+
+    /// Announce + stream a bundled agent binary down the machine's Session.
+    /// The outbound channel's bounded capacity is the backpressure: `send`
+    /// awaits when the stream is congested, so a slow agent link just slows
+    /// this loop rather than ballooning memory.
+    pub async fn send_agent_update(
+        &self,
+        machine_id: Uuid,
+        command_id: String,
+        issued_by: String,
+        bin: &crate::agent_binary::AgentBinary,
+    ) -> Result<(), DispatchError> {
+        const CHUNK: usize = 256 * 1024;
+        let (tx, stream_id) = self.conn_slot(machine_id)?;
+        let announce = ServerFrame {
+            stream_id,
+            payload: Some(server_frame::Payload::Update(UpdateAgent {
+                url: String::new(), // superseded: chunks follow on this stream
+                version: bin.version.to_string(),
+                sha256: bin.sha256_hex.clone(),
+                total_bytes: bin.total_bytes,
+                command_id,
+                issued_by,
+            })),
+        };
+        tx.send(Ok(announce))
+            .await
+            .map_err(|_| DispatchError::NotConnected)?;
+        let mut off = 0usize;
+        while off < bin.bytes.len() {
+            let end = (off + CHUNK).min(bin.bytes.len());
+            let last = end == bin.bytes.len();
+            let frame = ServerFrame {
+                stream_id,
+                payload: Some(server_frame::Payload::UpdateChunk(UpdateChunk {
+                    data: bin.bytes[off..end].to_vec(),
+                    last,
+                })),
+            };
+            tx.send(Ok(frame))
+                .await
+                .map_err(|_| DispatchError::NotConnected)?;
+            off = end;
+        }
+        Ok(())
     }
 
     /// Register interest in a command's result; the returned receiver resolves
@@ -871,6 +918,48 @@ mod tests {
             }
             other => panic!("expected a Command, got {other:?}"),
         }
+    }
+
+    #[tokio::test]
+    async fn agent_update_streams_announce_then_chunks_matching_hash() {
+        let hub = Hub::default();
+        let machine = Uuid::new_v4();
+        let (tx, mut rx) = mpsc::channel(64);
+        hub.register(machine, tx);
+        let bin = crate::agent_binary::AgentBinary::for_tests(vec![7u8; 600_000]);
+
+        hub.send_agent_update(machine, "cmd-1".into(), "tester".into(), &bin)
+            .await
+            .expect("dispatch");
+
+        // First frame: the announce, carrying size + sha.
+        let first = rx.recv().await.unwrap().unwrap();
+        let Some(server_frame::Payload::Update(u)) = first.payload else {
+            panic!("expected UpdateAgent first");
+        };
+        assert_eq!(u.total_bytes, 600_000);
+        assert_eq!(u.command_id, "cmd-1");
+        assert!(u.url.is_empty(), "url is superseded and must stay unset");
+
+        // Then chunks: concatenate, verify size, last flag, and hash.
+        let mut got = Vec::new();
+        let mut saw_last = false;
+        while let Some(Ok(frame)) = rx.recv().await {
+            let Some(server_frame::Payload::UpdateChunk(c)) = frame.payload else {
+                panic!("expected only chunks after announce");
+            };
+            got.extend_from_slice(&c.data);
+            if c.last {
+                saw_last = true;
+                break;
+            }
+            assert_eq!(c.data.len(), 256 * 1024, "non-final chunks are full-size");
+        }
+        assert!(saw_last);
+        assert_eq!(got.len(), 600_000);
+        let d = ring::digest::digest(&ring::digest::SHA256, &got);
+        let hex: String = d.as_ref().iter().map(|b| format!("{b:02x}")).collect();
+        assert_eq!(hex, bin.sha256_hex);
     }
 
     #[tokio::test]

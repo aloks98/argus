@@ -91,6 +91,9 @@ pub struct Config {
     /// `None` is a valid, boot-succeeding state -- see `oidc_from_env_values`
     /// and the boot rule in `main.rs`.
     pub oidc: Option<OidcConfig>,
+    /// Optional path to a bundled `argus-agent` binary (`ARGUS_AGENT_BINARY`).
+    /// `None` is a valid, boot-succeeding state -- self-update just 503s.
+    pub agent_binary_path: Option<String>,
 }
 
 impl Config {
@@ -148,6 +151,7 @@ impl Config {
                 oidc_ca_cert,
             )?,
             public_url,
+            agent_binary_path: std::env::var(env::AGENT_BINARY).ok(),
         })
     }
 }
@@ -294,6 +298,7 @@ mod tests {
             agent_sans: vec![],
             public_url: String::new(),
             oidc: None,
+            agent_binary_path: None,
         }
     }
 

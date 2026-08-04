@@ -83,6 +83,10 @@ pub mod env {
     /// Externally reachable base URL; builds the redirect URI and decides the
     /// session cookie's `Secure` attribute.
     pub const PUBLIC_URL: &str = "ARGUS_PUBLIC_URL";
+    /// Path to a bundled `argus-agent` binary the control plane can push to
+    /// machines via self-update. Optional: boot succeeds without it, and the
+    /// agent-update endpoint 503s until it's set.
+    pub const AGENT_BINARY: &str = "ARGUS_AGENT_BINARY";
 
     // ---- Agent ----
     /// Control-plane agent endpoint, e.g. `https://agents.argus.lab.example`.

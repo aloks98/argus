@@ -1123,6 +1123,7 @@ mod tests {
             public_url,
             limiter: Arc::new(crate::auth::ratelimit::LoginLimiter::new()),
             agent_endpoints: vec!["https://agents.test:9443".into()],
+            agent_binary: None,
         }
     }
 
@@ -1144,6 +1145,7 @@ mod tests {
             public_url: "http://localhost:8080".into(),
             limiter: Arc::new(crate::auth::ratelimit::LoginLimiter::new()),
             agent_endpoints: vec!["https://agents.test:9443".into()],
+            agent_binary: None,
         }
     }
 
