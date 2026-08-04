@@ -67,12 +67,31 @@ export async function rotateLocalAdmin(): Promise<string> {
   return body.password;
 }
 
+/**
+ * `GET /api/server-info` — fixed at control-plane boot (version is the
+ * compiled-in crate version; `agent_update` is `null` when no agent binary
+ * was bundled into this image). The machine page and fleet page both use
+ * `agent_update` to decide whether a connected machine is running an older
+ * agent than what this control plane would push.
+ */
+export type ServerInfo = {
+  version: string;
+  agent_update: { version: string; sha256: string } | null;
+};
+
+export async function getServerInfo(): Promise<ServerInfo> {
+  const r = unauthenticatedOr(await fetch("/api/server-info"));
+  if (!r.ok) throw new Error(`server-info ${r.status}`);
+  return r.json();
+}
+
 export type FleetRow = {
   id: string;
   hostname: string;
   display_name: string | null;
   os: string | null;
   primary_ip: string | null;
+  agent_version: string | null;
   status: "pending" | "online" | "offline";
   last_seen_at: string | null;
   tags: string[];
@@ -223,6 +242,27 @@ export async function unitAction(
   action: UnitAction,
 ): Promise<VerbResult> {
   return postVerb(`/api/machines/${id}/units/${encodeURIComponent(unit)}/${action}`);
+}
+
+/**
+ * `POST /api/machines/:id/agent-update` — pushes the bundled agent binary to
+ * this machine. Response shape matches the verb endpoints (`VerbResult`),
+ * but unlike `postVerb`'s callers the 409/503 guard failures here (no
+ * bundle, agent offline, unsupported arch) carry a human-readable
+ * plain-text body worth surfacing verbatim, so this reads it directly
+ * instead of collapsing to a generic status-code message.
+ */
+export async function updateAgent(id: string): Promise<VerbResult> {
+  const r = unauthenticatedOr(await fetch(`/api/machines/${id}/agent-update`, { method: "POST" }));
+  if (!r.ok) {
+    const text = await r.text().catch(() => "");
+    throw new Error(text.trim() !== "" ? text : `agent update failed: ${r.status}`);
+  }
+  const result: VerbResult = await r.json();
+  if (result.ok === false) {
+    throw new Error(result.message ?? "the update failed on the agent");
+  }
+  return result;
 }
 
 /** A log source: `journal:<unit>` or `docker:<container>`. */

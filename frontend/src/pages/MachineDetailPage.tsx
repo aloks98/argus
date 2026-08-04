@@ -8,6 +8,14 @@ import {
   Alert,
   AlertDescription,
   AlertTitle,
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
   Badge,
   Breadcrumb,
   BreadcrumbItem,
@@ -28,6 +36,7 @@ import {
   DialogHeader,
   DialogTitle,
   EmptyState,
+  Spinner,
   Tabs,
   TabsContent,
   TabsList,
@@ -60,7 +69,14 @@ import {
   latestResources,
   buildNetRateSeries,
 } from "../lib/metrics";
-import { useDocker, useMachine, useMetrics, useSystemd } from "../lib/queries";
+import {
+  useAgentUpdate,
+  useDocker,
+  useMachine,
+  useMetrics,
+  useServerInfo,
+  useSystemd,
+} from "../lib/queries";
 import type { Range } from "../lib/queries";
 import { machineTone } from "../lib/status";
 
@@ -128,6 +144,7 @@ export default function MachineDetailPage() {
   const [range, setRange] = useState<Range>("1h");
 
   const [editOpen, setEditOpen] = useState(false);
+  const [updateOpen, setUpdateOpen] = useState(false);
 
   // The active tab lives in the URL (`?tab=units`), not component state, so
   // a reload keeps it and a link to "the units on this box" is shareable.
@@ -141,6 +158,8 @@ export default function MachineDetailPage() {
   const metricsQuery = useMetrics(id as string, range);
   const dockerQuery = useDocker(id as string);
   const systemdQuery = useSystemd(id as string);
+  const serverInfo = useServerInfo();
+  const agentUpdate = useAgentUpdate(id as string);
 
   const machine = machineQuery.data ?? null;
   const metrics = metricsQuery.data ?? [];
@@ -258,6 +277,20 @@ export default function MachineDetailPage() {
   // NaNm".
   const uptime = machine.boot_time != null ? formatUptime(machine.boot_time) : "";
 
+  // Gated on all five: no bundle means nothing to push; offline/wrong-arch
+  // machines can't take the push at all (arch mismatch 409s server-side, and
+  // there's nowhere to dispatch a verb to an offline agent); `agent_version
+  // === null` means the agent predates version reporting — nothing to
+  // compare against, so don't claim it's outdated. Equal versions means
+  // there's nothing to offer.
+  const bundled = serverInfo.data?.agent_update ?? null;
+  const updateAvailable =
+    bundled !== null &&
+    machine.status === "online" &&
+    machine.arch === "x86_64" &&
+    machine.agent_version !== null &&
+    machine.agent_version !== bundled.version;
+
   // Five items only — Kernel/Arch/Agent/Processor/Virtualization/Disk/Memory/Swap
   // moved to the System tab (SystemCard). Uptime stays: tiny and ops-useful at a
   // glance.
@@ -325,6 +358,17 @@ export default function MachineDetailPage() {
             >
               Audit
             </Button>
+            {/* Bundled version, not the machine's own — the badge names
+                what's ON OFFER, the confirm dialog below repeats it against
+                "to". */}
+            {updateAvailable && bundled !== null && (
+              <>
+                <StatusBadge tone="warn" label={`agent v${bundled.version} available`} />
+                <Button variant="outline" size="sm" onClick={() => setUpdateOpen(true)}>
+                  Update agent
+                </Button>
+              </>
+            )}
           </div>
           {machine.display_name !== null && (
             <p className="mt-1 font-mono text-[11px] text-muted-foreground">{machine.hostname}</p>
@@ -361,6 +405,58 @@ export default function MachineDetailPage() {
           <MachineIdentity machine={machine} onSaved={() => setEditOpen(false)} />
         </DialogContent>
       </Dialog>
+
+      {/* Same controlled AlertDialog shape as RowActions' protected-verb
+          confirm (Cancel + action, both disabled while pending). No success
+          banner on close: the push drops and re-establishes the machine's
+          connection, and the existing "reconnecting…" status badge already
+          covers that visible gap — the update badge itself disappears once
+          the new version lands on the next poll. */}
+      <AlertDialog
+        open={updateOpen}
+        onOpenChange={(open) => {
+          if (!open) setUpdateOpen(false);
+        }}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>
+              Update agent to <span className="font-mono">v{bundled?.version}</span>?
+            </AlertDialogTitle>
+            <AlertDialogDescription>
+              Replaces the agent binary and re-execs it — this machine drops and re-establishes its
+              connection. The previous binary is kept beside it as{" "}
+              <span className="font-mono">argus-agent.old</span>.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+
+          {agentUpdate.error != null && (
+            <Alert variant="destructive">
+              <AlertTitle>Update failed</AlertTitle>
+              <AlertDescription>{describeError(agentUpdate.error)}</AlertDescription>
+            </Alert>
+          )}
+
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={agentUpdate.isPending}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              disabled={agentUpdate.isPending}
+              onClick={() => {
+                agentUpdate.mutate(undefined, { onSuccess: () => setUpdateOpen(false) });
+              }}
+            >
+              {agentUpdate.isPending ? (
+                <>
+                  <Spinner className="size-3.5" />
+                  Updating…
+                </>
+              ) : (
+                "Update agent"
+              )}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
 
       <Tabs value={tab} onValueChange={(value) => setTab(String(value))}>
         <TabsList>

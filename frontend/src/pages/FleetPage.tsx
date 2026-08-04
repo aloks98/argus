@@ -29,7 +29,7 @@ import {
   TableHeader,
   TableRow,
 } from "@e412/rnui-react";
-import type { FleetRow } from "../api";
+import type { FleetRow, ServerInfo } from "../api";
 import AssetTag from "../components/AssetTag";
 import PageHeader from "../components/PageHeader";
 import Sparkline from "../components/Sparkline";
@@ -37,7 +37,7 @@ import StatusBadge from "../components/StatusBadge";
 import { displayName, fleetTags, groupFleet, visibleFleet } from "../lib/fleet";
 import { formatPct, formatRelative } from "../lib/format";
 import { describeError } from "../lib/errors";
-import { useFleet } from "../lib/queries";
+import { useFleet, useServerInfo } from "../lib/queries";
 import { machineTone } from "../lib/status";
 
 const RECONNECT_THRESHOLD_MS = 45_000;
@@ -47,7 +47,7 @@ function isReconnecting(row: FleetRow): boolean {
   return Date.now() - Date.parse(row.last_seen_at) > RECONNECT_THRESHOLD_MS;
 }
 
-function StatusCell({ row }: { row: FleetRow }) {
+function StatusCell({ row, serverInfo }: { row: FleetRow; serverInfo: ServerInfo | undefined }) {
   return (
     <div className="flex flex-wrap items-center gap-2">
       <StatusBadge tone={machineTone(row.status)} label={row.status} />
@@ -58,6 +58,14 @@ function StatusCell({ row }: { row: FleetRow }) {
           label={`${row.failed_units} failed unit${row.failed_units === 1 ? "" : "s"}`}
         />
       )}
+      {/* Deliberately NOT arch-gated (unlike the machine page's update
+          button): a non-x86_64 machine with an old agent still IS outdated,
+          it just can't be updated from here. */}
+      {serverInfo?.agent_update != null &&
+        row.agent_version !== null &&
+        row.agent_version !== serverInfo.agent_update.version && (
+          <StatusBadge tone="warn" label="agent outdated" />
+        )}
     </div>
   );
 }
@@ -68,7 +76,13 @@ function StatusCell({ row }: { row: FleetRow }) {
  * only pass non-empty `rows` — the "no machines"/"no matches" empty states
  * live at the page level, above flat vs. grouped branching.
  */
-function FleetTable({ rows }: { rows: FleetRow[] }) {
+function FleetTable({
+  rows,
+  serverInfo,
+}: {
+  rows: FleetRow[];
+  serverInfo: ServerInfo | undefined;
+}) {
   return (
     <div className="border border-border">
       <Table>
@@ -100,7 +114,7 @@ function FleetTable({ rows }: { rows: FleetRow[] }) {
                 </Link>
               </TableCell>
               <TableCell>
-                <StatusCell row={row} />
+                <StatusCell row={row} serverInfo={serverInfo} />
               </TableCell>
               <TableCell className="font-mono">{row.primary_ip ?? "—"}</TableCell>
               <TableCell>{row.os ?? "—"}</TableCell>
@@ -151,7 +165,13 @@ function FleetTable({ rows }: { rows: FleetRow[] }) {
  * presents the same surface — the swap below only toggles which is
  * visible, not the border around it.
  */
-function FleetCards({ rows }: { rows: FleetRow[] }) {
+function FleetCards({
+  rows,
+  serverInfo,
+}: {
+  rows: FleetRow[];
+  serverInfo: ServerInfo | undefined;
+}) {
   return (
     <div className="border border-border">
       <ul className="flex flex-col divide-y divide-border">
@@ -160,7 +180,7 @@ function FleetCards({ rows }: { rows: FleetRow[] }) {
             <Link to={`/machines/${row.id}`} className="flex flex-col gap-2 p-3">
               <div className="flex flex-wrap items-center justify-between gap-2">
                 <AssetTag tone={machineTone(row.status)}>{displayName(row)}</AssetTag>
-                <StatusCell row={row} />
+                <StatusCell row={row} serverInfo={serverInfo} />
               </div>
               {row.display_name !== null && (
                 <span className="font-mono text-[11px] text-muted-foreground">{row.hostname}</span>
@@ -189,14 +209,14 @@ function FleetCards({ rows }: { rows: FleetRow[] }) {
  * breakpoint for this slice (no per-callsite improvisation). Both branches
  * render so the swap is pure CSS visibility, not a remount on resize.
  */
-function FleetRows({ rows }: { rows: FleetRow[] }) {
+function FleetRows({ rows, serverInfo }: { rows: FleetRow[]; serverInfo: ServerInfo | undefined }) {
   return (
     <>
       <div className="hidden md:block">
-        <FleetTable rows={rows} />
+        <FleetTable rows={rows} serverInfo={serverInfo} />
       </div>
       <div className="md:hidden">
-        <FleetCards rows={rows} />
+        <FleetCards rows={rows} serverInfo={serverInfo} />
       </div>
     </>
   );
@@ -204,6 +224,9 @@ function FleetRows({ rows }: { rows: FleetRow[] }) {
 
 export default function FleetPage() {
   const { data: rows = [], error, isPending } = useFleet();
+  // One subscription for the whole page — `StatusCell` takes the result as
+  // a prop rather than each row calling the hook itself.
+  const { data: serverInfo } = useServerInfo();
   const [params, setParams] = useSearchParams();
 
   const q = params.get("q") ?? "";
@@ -317,7 +340,7 @@ export default function FleetPage() {
           />
         </div>
       ) : groupSection === null ? (
-        <FleetRows rows={filtered} />
+        <FleetRows rows={filtered} serverInfo={serverInfo} />
       ) : (
         <div>
           <div className="flex flex-wrap items-baseline gap-2 pb-2">
@@ -334,7 +357,7 @@ export default function FleetPage() {
               />
             </div>
           ) : (
-            <FleetRows rows={groupSection.rows} />
+            <FleetRows rows={groupSection.rows} serverInfo={serverInfo} />
           )}
         </div>
       )}

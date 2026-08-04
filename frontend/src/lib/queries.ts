@@ -10,12 +10,14 @@ import {
   getFleet,
   getMachine,
   getMetrics,
+  getServerInfo,
   getSystemd,
   listTokens,
   mintToken,
   patchMachine,
   revokeToken,
   unitAction,
+  updateAgent,
 } from "../api";
 import type { ContainerAction, MachinePatchBody, MintTokenBody, UnitAction } from "../api";
 
@@ -28,6 +30,7 @@ export type Range = "1h" | "6h" | "24h";
 /** Every query key in the app lives here so no screen invents its own. */
 export const qk = {
   fleet: ["fleet"] as const,
+  serverInfo: ["server-info"] as const,
   machine: (id: string) => ["machine", id] as const,
   metrics: (id: string, range: Range) => ["metrics", id, range] as const,
   docker: (id: string) => ["docker", id] as const,
@@ -58,6 +61,11 @@ export function useMachine(id: string) {
     queryFn: () => getMachine(id),
     refetchInterval: MACHINE_INTERVAL,
   });
+}
+
+/** Fixed at control-plane boot — cache like enrollment-config. */
+export function useServerInfo() {
+  return useQuery({ queryKey: qk.serverInfo, queryFn: getServerInfo, staleTime: Infinity });
 }
 
 /**
@@ -130,6 +138,25 @@ export function useUnitAction(id: string) {
       unitAction(id, vars.unit, vars.action),
     onSettled: () => {
       void qc.invalidateQueries({ queryKey: qk.systemd(id) });
+    },
+  });
+}
+
+/**
+ * Invalidated on `onSuccess` only, not `onSettled` like the verb actions
+ * above: a failed/refused update leaves the agent's reported version
+ * unchanged, so there's nothing new to fetch. The version change lands with
+ * the agent's next Hello after it re-execs; the machine/fleet polls pick it
+ * up on their own cadence, but invalidating here means the badge clears as
+ * soon as it does rather than waiting for the next tick.
+ */
+export function useAgentUpdate(id: string) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => updateAgent(id),
+    onSuccess: () => {
+      void qc.invalidateQueries({ queryKey: qk.machine(id) });
+      void qc.invalidateQueries({ queryKey: qk.fleet });
     },
   });
 }
