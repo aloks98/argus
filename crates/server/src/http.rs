@@ -209,6 +209,9 @@ struct FleetRow {
     display_name: Option<String>,
     os: Option<String>,
     primary_ip: Option<String>,
+    /// `None` = the agent predates version reporting. Carried on the fleet
+    /// row so the "agent outdated" badge doesn't need a per-machine fetch.
+    agent_version: Option<String>,
     status: String,
     #[serde(with = "time::serde::rfc3339::option")]
     last_seen_at: Option<OffsetDateTime>,
@@ -243,8 +246,9 @@ async fn fleet(State(state): State<AppState>) -> Result<Json<Vec<FleetRow>>, Sta
     // pool has ample headroom for two connections.
     let (rows, spark_rows) = tokio::join!(
         sqlx::query!(
-            r#"SELECT id, hostname, display_name, os, host(primary_ip) as "primary_ip?", status,
-                      last_seen_at, tags, capabilities FROM machines ORDER BY hostname"#
+            r#"SELECT id, hostname, display_name, os, host(primary_ip) as "primary_ip?",
+                      agent_version, status, last_seen_at, tags, capabilities
+               FROM machines ORDER BY hostname"#
         )
         .fetch_all(&state.pool),
         repo::recent_series_all(&state.pool, 20),
@@ -287,6 +291,7 @@ async fn fleet(State(state): State<AppState>) -> Result<Json<Vec<FleetRow>>, Sta
                 display_name: r.display_name,
                 os: r.os,
                 primary_ip: r.primary_ip,
+                agent_version: r.agent_version,
                 status: r.status,
                 last_seen_at: r.last_seen_at,
                 tags: r.tags,

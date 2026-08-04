@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, hostname, display_name, os, host(primary_ip) as \"primary_ip?\", status,\n                      last_seen_at, tags, capabilities FROM machines ORDER BY hostname",
+  "query": "SELECT id, hostname, display_name, os, host(primary_ip) as \"primary_ip?\",\n                      agent_version, status, last_seen_at, tags, capabilities\n               FROM machines ORDER BY hostname",
   "describe": {
     "columns": [
       {
@@ -55,6 +55,17 @@
       },
       {
         "ordinal": 5,
+        "name": "agent_version",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "machines",
+            "name": "agent_version"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
         "name": "status",
         "type_info": "Text",
         "origin": {
@@ -65,7 +76,7 @@
         }
       },
       {
-        "ordinal": 6,
+        "ordinal": 7,
         "name": "last_seen_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -76,7 +87,7 @@
         }
       },
       {
-        "ordinal": 7,
+        "ordinal": 8,
         "name": "tags",
         "type_info": "TextArray",
         "origin": {
@@ -87,7 +98,7 @@
         }
       },
       {
-        "ordinal": 8,
+        "ordinal": 9,
         "name": "capabilities",
         "type_info": "TextArray",
         "origin": {
@@ -107,11 +118,12 @@
       true,
       true,
       null,
+      true,
       false,
       true,
       false,
       true
     ]
   },
-  "hash": "d11238c2d147ae3a8d10150a295e47342ffa7783aae3f24306cfc32a649de4a1"
+  "hash": "bab9c0209f57320020b7e11b95ee8e404706033b0bd002e9d0463a63e0ab6d69"
 }
