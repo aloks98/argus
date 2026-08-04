@@ -48,6 +48,7 @@ bundled binary's version IS the server's version by construction
 | no `ARGUS_AGENT_BINARY` configured / unreadable | 503 "no agent binary bundled" |
 | agent not connected | 409 (same `DispatchError::NotConnected` path as verbs) |
 | machine `arch` ≠ `x86_64` | 409 "unsupported arch" (we bundle one arch) |
+| an update already in flight for this machine | 409 "an agent update is already in flight for this machine" |
 
 Happy path: audit `agent.update` (target_ref = version, `command_id`
 correlation, result updated by `CommandResult` like every verb), send
