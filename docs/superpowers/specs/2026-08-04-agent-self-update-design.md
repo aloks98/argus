@@ -54,11 +54,20 @@ correlation, result updated by `CommandResult` like every verb), send
 `UpdateAgent { version, sha256, total_bytes }`, then stream chunks through the
 session's existing bounded outbound channel — its capacity is the
 backpressure; no new flow-control code. Bounded wait ~60 s for the
-`CommandResult`; 200 `{ "staged": true }` on ok, 502-style error body on a
-refusal, 504 on timeout (unconfirmed — the agent may still stage). Proof of
-success is the agent reconnecting and reporting the new `agent_version` in
-`Hello`. Same-version pushes are allowed (repair path); the UI just doesn't
-prompt for them.
+`CommandResult`; the response reuses the verb endpoints' `VerbResult` shape
+rather than a bespoke one: 200 `{ command_id, ok, message, status:
+"completed" }` once the agent answers, whether that answer is a successful
+stage or a refusal (`ok` distinguishes the two, `message` carries the detail);
+202 `{ command_id, status: "pending" }` if the 60 s wait elapses first (the
+agent may still stage; the reconnect + `agent_version` check below is how
+that eventually gets noticed). The guard-table responses above stay plain
+text, not JSON. Proof of success is the agent reconnecting and reporting the
+new `agent_version` in `Hello`. Same-version pushes are allowed (repair
+path); the UI just doesn't prompt for them.
+
+(Aligned with the verb endpoints during implementation: this paragraph
+originally specified a bespoke `200 {"staged": true}` / 502-style error body /
+504 contract.)
 
 **Server info for the UI.** New tiny `GET /api/server-info` →
 `{ version, agent_update: { version, sha256 } | null }` (null = nothing

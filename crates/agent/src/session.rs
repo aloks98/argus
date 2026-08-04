@@ -298,11 +298,6 @@ async fn connect_and_serve(
                 None
             }
         };
-        // Chunks don't carry the id -- the stream is ordered and one update
-        // runs at a time, so the remembered id from the announce is the
-        // right one for mid-stream refusals.
-        let mut last_update_command_id = String::new();
-
         loop {
             match inbound.next().await {
                 Some(Ok(frame)) => {
@@ -477,8 +472,6 @@ async fn connect_and_serve(
                         }
                         Some(server_frame::Payload::Update(u)) => {
                             tracing::info!(version = %u.version, issued_by = %u.issued_by, "update: announced");
-                            // Remember the correlation id for the chunks that follow.
-                            last_update_command_id = u.command_id.clone();
                             let refusal = match updater.as_mut() {
                                 None => Some("self-update disabled: own path unresolved".to_string()),
                                 Some(up) => up
@@ -530,13 +523,16 @@ async fn connect_and_serve(
                                         // process keeps running the old image; just record it.
                                         tracing::error!(error = %err, "update: exec failed; staged binary will take effect on next restart");
                                     }
-                                    Err(msg) => {
-                                        tracing::warn!(%msg, "update: refused mid-stream");
+                                    Err(e) => {
+                                        tracing::warn!(msg = %e.msg, "update: refused mid-stream");
                                         let _ = inbound_tx
                                             .send(AgentFrame {
                                                 stream_id: frame.stream_id,
                                                 payload: Some(agent_frame::Payload::CommandResult(
-                                                    update_refusal(&last_update_command_id, &msg),
+                                                    update_refusal(
+                                                        e.command_id.as_deref().unwrap_or(""),
+                                                        &e.msg,
+                                                    ),
                                                 )),
                                             })
                                             .await;

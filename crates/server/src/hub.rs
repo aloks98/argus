@@ -9,7 +9,7 @@ use argus_proto::v1::{
     PtyClose, PtyFlow, PtyInput, PtyOpen, PtyResize, ServerFrame, Unit, UpdateAgent, UpdateChunk,
     Verb,
 };
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use tokio::sync::{mpsc, oneshot, Notify};
@@ -76,6 +76,13 @@ pub struct Hub {
     /// `should_mark_online`'s debounce. Entries are dropped on session end
     /// (`clear_online_stamp`) so the map stays bounded by fleet size.
     online_stamps: Mutex<HashMap<Uuid, std::time::Instant>>,
+    /// Per-machine single-flight guard for `agent_update`: without it, two
+    /// concurrent POSTs would each open their own chunk stream on the same
+    /// Session and interleave, producing one corrupt sequence on the wire.
+    /// Membership only -- `try_begin_update` is the sole writer of a claim,
+    /// `end_update` the sole releaser, and every claim must be released
+    /// exactly once regardless of how the dispatch that follows turns out.
+    updates_in_flight: Mutex<HashSet<Uuid>>,
     epoch_counter: AtomicU64,
 }
 
@@ -149,6 +156,21 @@ impl Hub {
     /// closed, a real disconnect's `unregister` has already run.
     pub fn is_connected(&self, machine_id: Uuid) -> bool {
         self.conns.lock().unwrap().contains_key(&machine_id)
+    }
+
+    /// Claim the per-machine `agent_update` single-flight slot. `false` means
+    /// an update is already in flight for this machine -- the caller must
+    /// refuse rather than dispatch a second, interleaving chunk stream.
+    /// Every successful claim must be matched by exactly one `end_update`.
+    pub fn try_begin_update(&self, machine_id: Uuid) -> bool {
+        self.updates_in_flight.lock().unwrap().insert(machine_id)
+    }
+
+    /// Release a slot claimed by `try_begin_update`. Must run once the
+    /// dispatch it guarded is fully done, on every outcome (success, error,
+    /// or an early guard failure after the claim was taken).
+    pub fn end_update(&self, machine_id: Uuid) {
+        self.updates_in_flight.lock().unwrap().remove(&machine_id);
     }
 
     pub fn set_docker(&self, machine_id: Uuid, containers: Vec<Container>) {
@@ -875,6 +897,22 @@ mod tests {
         assert!(
             hub.conns.lock().unwrap().contains_key(&m),
             "the registry must still hold B's live connection"
+        );
+    }
+
+    #[test]
+    fn try_begin_update_is_single_flight_per_machine() {
+        let hub = Hub::new();
+        let m = Uuid::new_v4();
+        assert!(hub.try_begin_update(m), "first claim succeeds");
+        assert!(
+            !hub.try_begin_update(m),
+            "a second concurrent claim for the same machine must be refused"
+        );
+        hub.end_update(m);
+        assert!(
+            hub.try_begin_update(m),
+            "released after end_update, a new claim succeeds"
         );
     }
 

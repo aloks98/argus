@@ -1596,6 +1596,14 @@ async fn server_info(State(state): State<AppState>) -> Json<ServerInfoDto> {
 /// Push the bundled agent binary to this machine and wait (bounded) for the
 /// agent's staged/refused CommandResult. Mirrors run_verb's ordering: the
 /// audit row exists before dispatch, fail-closed on audit failure.
+///
+/// The announce+chunk stream itself runs in a spawned task (loss-tolerant
+/// one-off, per CLAUDE.md's background-work rule): if the operator's HTTP
+/// connection drops mid-request, hyper would otherwise drop this handler's
+/// future -- and `send_agent_update` along with it -- truncating the stream
+/// without a final chunk and leaving the agent's `Pending` dangling forever.
+/// Spawning detaches the dispatch from the request's lifetime; this handler
+/// only awaits the bounded 60s result wait.
 async fn agent_update(
     State(state): State<AppState>,
     Path(id): Path<Uuid>,
@@ -1615,6 +1623,28 @@ async fn agent_update(
         }
     }
 
+    // Single-flight per machine: two concurrent POSTs must never interleave
+    // two chunk streams into one session. Every successful claim below is
+    // matched by exactly one `end_update`, on every exit path.
+    if !state.hub.try_begin_update(id) {
+        return (
+            StatusCode::CONFLICT,
+            "an agent update is already in flight for this machine",
+        )
+            .into_response();
+    }
+
+    // With the send spawned below, a mid-stream NotConnected can no longer
+    // surface synchronously as this handler's response. Check connectivity
+    // up front, BEFORE registering/auditing, so the common case (agent
+    // simply offline) still gets an immediate, operator-visible 409 -- the
+    // spawned task's own NotConnected handling covers the remaining
+    // disconnect-after-this-check race.
+    if !state.hub.is_connected(id) {
+        state.hub.end_update(id);
+        return (StatusCode::CONFLICT, "agent not connected").into_response();
+    }
+
     let command_id = Uuid::new_v4();
     let cid = command_id.to_string();
     let rx = state.hub.register_pending(cid.clone(), id);
@@ -1630,6 +1660,7 @@ async fn agent_update(
     .await
     {
         state.hub.abandon_pending(&cid);
+        state.hub.end_update(id);
         tracing::error!(error = %e, "agent-update: dispatched audit write failed; not dispatching");
         return (
             StatusCode::INTERNAL_SERVER_ERROR,
@@ -1638,22 +1669,25 @@ async fn agent_update(
             .into_response();
     }
 
-    if let Err(DispatchError::NotConnected) = state
-        .hub
-        .send_agent_update(
-            id,
-            cid.clone(),
-            repo::Actor::User(&identity).as_str().into_owned(),
-            &bin,
-        )
-        .await
-    {
-        state.hub.abandon_pending(&cid);
-        if let Err(e) = repo::update_command_result(&state.pool, command_id, id, "denied").await {
-            tracing::error!(error = %e, "agent-update: denied audit update failed");
+    let hub = state.hub.clone();
+    let pool = state.pool.clone();
+    let issued_by = repo::Actor::User(&identity).as_str().into_owned();
+    let spawn_cid = cid.clone();
+    tokio::spawn(async move {
+        if let Err(DispatchError::NotConnected) = hub
+            .send_agent_update(id, spawn_cid.clone(), issued_by, &bin)
+            .await
+        {
+            hub.abandon_pending(&spawn_cid);
+            // Agent went away mid-dispatch: no CommandResult will ever
+            // arrive, so flip to terminal "denied" here -- mirroring the
+            // inline handling this replaced.
+            if let Err(e) = repo::update_command_result(&pool, command_id, id, "denied").await {
+                tracing::error!(error = %e, "agent-update: denied audit update failed");
+            }
         }
-        return (StatusCode::CONFLICT, "agent not connected").into_response();
-    }
+        hub.end_update(id);
+    });
 
     match tokio::time::timeout(Duration::from_secs(60), rx).await {
         Ok(Ok(result)) => Json(VerbResult {
@@ -3810,11 +3844,14 @@ mod tests {
             assert_eq!(res.status(), StatusCode::OK, "{path} must stay public");
         }
 
+        let agent_update_path = format!("/api/machines/{}/agent-update", Uuid::new_v4());
         for path in [
             "/api/fleet",
             "/api/me",
             "/api/enrollment-tokens",
             "/api/ca.pem",
+            "/api/server-info",
+            agent_update_path.as_str(),
         ] {
             let res = app
                 .clone()

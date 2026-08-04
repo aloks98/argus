@@ -30,6 +30,23 @@ pub struct Staged {
     pub exe: PathBuf,
 }
 
+/// A refused `chunk()` call, carrying the `command_id` of the update it was
+/// refusing (from the `Pending` state that call cleared) so the caller can
+/// correlate the refusal without keeping its own copy of the last-announced
+/// id. `None` only when there was no announced update to correlate at all
+/// (a chunk arriving with nothing pending).
+#[derive(Debug)]
+pub struct ChunkError {
+    pub command_id: Option<String>,
+    pub msg: String,
+}
+
+impl std::fmt::Display for ChunkError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.msg)
+    }
+}
+
 struct Pending {
     version: String,
     sha256_hex: String,
@@ -39,6 +56,20 @@ struct Pending {
     temp: PathBuf,
     received: u64,
     hasher: ring::digest::Context,
+}
+
+/// Backstop for every exit path (refusal, success, or the session itself
+/// tearing down mid-stream / panicking) -- a partially-written temp file
+/// must never outlive the `Pending` that was writing it. The explicit
+/// `fs::remove_file` calls sprinkled through `chunk()`/`abort()` stay in
+/// place for clarity at the call site; this makes cleanup unconditional
+/// rather than relying on every path remembering to do it. Deleting an
+/// already-deleted (renamed away, or already removed) temp file is a no-op
+/// error, ignored here same as everywhere else in this module.
+impl Drop for Pending {
+    fn drop(&mut self) {
+        let _ = fs::remove_file(&self.temp);
+    }
 }
 
 pub struct Updater {
@@ -83,20 +114,32 @@ impl Updater {
         Ok(())
     }
 
-    pub fn chunk(&mut self, data: &[u8], last: bool) -> Result<Option<Staged>, String> {
+    pub fn chunk(&mut self, data: &[u8], last: bool) -> Result<Option<Staged>, ChunkError> {
         let Some(p) = self.pending.as_mut() else {
-            return Err("chunk without an announced update".into());
+            return Err(ChunkError {
+                command_id: None,
+                msg: "chunk without an announced update".into(),
+            });
         };
+        // Captured before any refusal below clears `self.pending` -- every
+        // error from here on carries the id of the update it refused.
+        let command_id = p.command_id.clone();
         p.received += data.len() as u64;
         if p.received > p.total_bytes {
             let msg = format!("size overrun: got {} of {}", p.received, p.total_bytes);
             self.abort();
-            return Err(msg);
+            return Err(ChunkError {
+                command_id: Some(command_id),
+                msg,
+            });
         }
         if let Err(e) = p.file.write_all(data) {
             let msg = format!("write: {e}");
             self.abort();
-            return Err(msg);
+            return Err(ChunkError {
+                command_id: Some(command_id),
+                msg,
+            });
         }
         p.hasher.update(data);
         if !last {
@@ -105,19 +148,28 @@ impl Updater {
         if p.received != p.total_bytes {
             let msg = format!("size underrun: got {} of {}", p.received, p.total_bytes);
             self.abort();
-            return Err(msg);
+            return Err(ChunkError {
+                command_id: Some(command_id),
+                msg,
+            });
         }
         let digest = p.hasher.clone().finish();
         let got: String = digest.as_ref().iter().map(|b| format!("{b:02x}")).collect();
         if got != p.sha256_hex {
             let msg = format!("sha256 mismatch: got {got}, announced {}", p.sha256_hex);
             self.abort();
-            return Err(msg);
+            return Err(ChunkError {
+                command_id: Some(command_id),
+                msg,
+            });
         }
         if let Err(e) = p.file.sync_all() {
             let msg = format!("fsync: {e}");
             self.abort();
-            return Err(msg);
+            return Err(ChunkError {
+                command_id: Some(command_id),
+                msg,
+            });
         }
         // Verified. Swap: chmod temp, then exchange it with the current exe
         // in one syscall (never a window where the exe path is empty),
@@ -157,12 +209,23 @@ impl Updater {
             if !self.exe.exists() && old.exists() {
                 let _ = fs::rename(&old, &self.exe);
             }
+            let command_id = p.command_id.clone();
             let _ = fs::remove_file(&p.temp);
-            return Err(format!("swap: {e}"));
+            // `p` (the taken-out Pending) drops here too, so its own Drop
+            // impl retries the same removal -- harmless on an already-gone
+            // path.
+            return Err(ChunkError {
+                command_id: Some(command_id),
+                msg: format!("swap: {e}"),
+            });
         }
+        // `Pending` now implements `Drop` (the temp-file cleanup backstop),
+        // which forbids partial moves out of it -- clone the two Strings
+        // rather than moving them. `p` (and its now-irrelevant temp path)
+        // drops right after.
         Ok(Some(Staged {
-            version: p.version,
-            command_id: p.command_id,
+            version: p.version.clone(),
+            command_id: p.command_id.clone(),
             exe: self.exe.clone(),
         }))
     }
@@ -324,7 +387,12 @@ mod tests {
         )
         .unwrap();
         let err = u.chunk(&new_bin, true).unwrap_err();
-        assert!(err.contains("sha256"), "got: {err}");
+        assert!(err.msg.contains("sha256"), "got: {err}");
+        assert_eq!(
+            err.command_id.as_deref(),
+            Some("c"),
+            "a refusal must carry the pending update's command_id"
+        );
         assert_eq!(fs::read(&exe).unwrap(), b"OLD-BINARY");
         assert!(!dir.join(".argus-agent.update").exists());
         assert!(!dir.join("argus-agent.old").exists());
@@ -336,10 +404,10 @@ mod tests {
         let (dir, exe) = scratch();
         let mut u = Updater::new(exe.clone());
         u.begin("9", &hex_sha256(b"xx"), 2, "c").unwrap();
-        assert!(u.chunk(b"xxx", true).unwrap_err().contains("size"));
+        assert!(u.chunk(b"xxx", true).unwrap_err().msg.contains("size"));
         // Fresh begin after a refusal must work (state cleared).
         u.begin("9", &hex_sha256(b"xx"), 2, "c").unwrap();
-        assert!(u.chunk(b"x", true).unwrap_err().contains("size"));
+        assert!(u.chunk(b"x", true).unwrap_err().msg.contains("size"));
         fs::remove_dir_all(dir).unwrap();
     }
 
@@ -354,6 +422,43 @@ mod tests {
             .begin("9", "00", 10, "c")
             .unwrap_err()
             .contains("in flight"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn chunk_with_nothing_pending_has_no_command_id() {
+        let (dir, exe) = scratch();
+        let mut u = Updater::new(exe.clone());
+        let err = u.chunk(b"x", true).unwrap_err();
+        assert_eq!(err.command_id, None);
+        assert!(err.msg.contains("without an announced update"));
+        fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn dropping_the_updater_mid_stream_cleans_up_the_temp_file() {
+        // A session tearing down mid-update (dropped connection, panic,
+        // ordinary teardown) must not leave a partial temp file lying
+        // around until the next attempt happens to truncate it -- `Drop for
+        // Pending` is the backstop for every exit path, not just an
+        // explicit refusal.
+        let (dir, exe) = scratch();
+        let temp = dir.join(".argus-agent.update");
+        let mut u = Updater::new(exe.clone());
+        u.begin("9.9.9", &hex_sha256(b"whatever"), 100, "cmd-drop")
+            .unwrap();
+        // A non-final chunk: still pending, temp file exists and has content.
+        assert!(u.chunk(b"partial-data", false).unwrap().is_none());
+        assert!(temp.exists());
+
+        drop(u);
+
+        assert!(
+            !temp.exists(),
+            "the temp file must be cleaned up when the Updater (and its \
+             pending state) is dropped without ever reaching a terminal \
+             chunk"
+        );
         fs::remove_dir_all(dir).unwrap();
     }
 }
