@@ -94,6 +94,7 @@ dependencies = [
  "argus-proto",
  "bollard",
  "futures-util",
+ "libc",
  "portable-pty",
  "prost",
  "rand 0.9.4",

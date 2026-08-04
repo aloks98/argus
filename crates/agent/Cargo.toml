@@ -34,6 +34,8 @@ rand.workspace = true
 rustix.workspace = true
 x509-parser.workspace = true
 sysinfo.workspace = true
+# renameat2(RENAME_EXCHANGE) for the atomic self-update binary swap
+libc.workspace = true
 
 # Per-slice deps are added when their slice is built (keeps the agent lean):
 portable-pty = "0.9"

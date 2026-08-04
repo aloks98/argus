@@ -5,6 +5,16 @@
 //
 // Every failure path leaves the CURRENT binary untouched and running; the
 // worst possible outcome of a refused update is a deleted temp file.
+//
+// The final swap prefers `renameat2(RENAME_EXCHANGE)`: both the temp file
+// and the exe path change names in a single syscall, so a SIGKILL landing
+// mid-swap can never leave the exe path pointing at nothing (a supervisor
+// restart hitting ENOENT). The classic two-rename sequence (current -> .old,
+// temp -> current) has a window between those two renames where the exe path
+// doesn't exist; RENAME_EXCHANGE has no such window. Not every kernel/
+// filesystem supports it (older kernels, some non-Linux-native filesystems),
+// so an EINVAL/ENOSYS/ENOTSUP falls back to the two-rename sequence, keeping
+// its existing best-effort restore.
 use std::fs::{self, File};
 use std::io::Write;
 use std::os::unix::fs::PermissionsExt;
@@ -109,18 +119,41 @@ impl Updater {
             self.abort();
             return Err(msg);
         }
-        // Verified. Swap: chmod temp, current -> .old, temp -> current.
+        // Verified. Swap: chmod temp, then exchange it with the current exe
+        // in one syscall (never a window where the exe path is empty),
+        // falling back to the two-rename sequence when exchange isn't
+        // supported.
         let p = self.pending.take().expect("checked above");
         let old = self.old_path();
         let swap = (|| -> std::io::Result<()> {
             fs::set_permissions(&p.temp, fs::Permissions::from_mode(0o755))?;
-            fs::rename(&self.exe, &old)?;
-            fs::rename(&p.temp, &self.exe)?;
-            Ok(())
+            match exchange(&p.temp, &self.exe) {
+                Ok(()) => {
+                    // The swap is already complete and self.exe was never
+                    // briefly absent: the OLD binary now sits at the temp
+                    // path (names exchanged), so move it to .old for the
+                    // archival copy. Non-critical -- if this rename somehow
+                    // fails, the displaced old binary simply remains at the
+                    // temp path instead of at .old.
+                    let _ = fs::rename(&p.temp, &old);
+                    Ok(())
+                }
+                Err(e) if is_exchange_unsupported(&e) => {
+                    fs::rename(&self.exe, &old)?;
+                    fs::rename(&p.temp, &self.exe)?;
+                    Ok(())
+                }
+                // Any other exchange error: the current binary was never
+                // touched (RENAME_EXCHANGE either fully succeeds or has no
+                // effect), so this is a plain refusal.
+                Err(e) => Err(e),
+            }
         })();
         if let Err(e) = swap {
-            // Best effort to restore: if the current binary was already moved
-            // to .old but the temp rename failed, move it back.
+            // Best effort to restore: only reachable from the fallback
+            // two-rename branch (exchange itself never partially applies),
+            // where the current binary may already have been moved to .old
+            // while the temp rename failed.
             if !self.exe.exists() && old.exists() {
                 let _ = fs::rename(&old, &self.exe);
             }
@@ -153,6 +186,39 @@ impl Updater {
             self.exe.file_name().unwrap_or_default().to_string_lossy()
         ))
     }
+}
+
+/// Atomically exchange two paths (Linux renameat2 RENAME_EXCHANGE): both
+/// files swap places in one syscall, so the exe path is never empty.
+fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
+    use std::os::unix::ffi::OsStrExt;
+    let ca = std::ffi::CString::new(a.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let cb = std::ffi::CString::new(b.as_os_str().as_bytes())
+        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
+    let rc = unsafe {
+        libc::renameat2(
+            libc::AT_FDCWD,
+            ca.as_ptr(),
+            libc::AT_FDCWD,
+            cb.as_ptr(),
+            libc::RENAME_EXCHANGE,
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+/// Kernel/filesystem doesn't support `RENAME_EXCHANGE` -- fall back to the
+/// two-rename sequence rather than treating this as a refusal.
+fn is_exchange_unsupported(err: &std::io::Error) -> bool {
+    matches!(
+        err.raw_os_error(),
+        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::ENOTSUP)
+    )
 }
 
 /// Replace this process with `exe`, preserving the original argv and env --
