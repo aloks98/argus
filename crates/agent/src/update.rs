@@ -188,36 +188,31 @@ impl Updater {
     }
 }
 
-/// Atomically exchange two paths (Linux renameat2 RENAME_EXCHANGE): both
-/// files swap places in one syscall, so the exe path is never empty.
+/// Atomically exchange two paths (renameat2 RENAME_EXCHANGE): both files
+/// swap places in one syscall, so the exe path is never empty.
 fn exchange(a: &Path, b: &Path) -> std::io::Result<()> {
-    use std::os::unix::ffi::OsStrExt;
-    let ca = std::ffi::CString::new(a.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let cb = std::ffi::CString::new(b.as_os_str().as_bytes())
-        .map_err(|_| std::io::Error::from(std::io::ErrorKind::InvalidInput))?;
-    let rc = unsafe {
-        libc::renameat2(
-            libc::AT_FDCWD,
-            ca.as_ptr(),
-            libc::AT_FDCWD,
-            cb.as_ptr(),
-            libc::RENAME_EXCHANGE,
-        )
-    };
-    if rc == 0 {
-        Ok(())
-    } else {
-        Err(std::io::Error::last_os_error())
-    }
+    rustix::fs::renameat_with(
+        rustix::fs::CWD,
+        a,
+        rustix::fs::CWD,
+        b,
+        rustix::fs::RenameFlags::EXCHANGE,
+    )
+    .map_err(std::io::Error::from)
 }
 
 /// Kernel/filesystem doesn't support `RENAME_EXCHANGE` -- fall back to the
-/// two-rename sequence rather than treating this as a refusal.
+/// two-rename sequence rather than treating this as a refusal. `rustix`'s
+/// `Errno -> std::io::Error` conversion preserves the raw os error, so
+/// comparing against `rustix::io::Errno`'s raw values (rather than pulling
+/// in `libc` just for its `E*` constants) is exact.
 fn is_exchange_unsupported(err: &std::io::Error) -> bool {
+    use rustix::io::Errno;
     matches!(
         err.raw_os_error(),
-        Some(libc::EINVAL) | Some(libc::ENOSYS) | Some(libc::ENOTSUP)
+        Some(e) if e == Errno::INVAL.raw_os_error()
+            || e == Errno::NOSYS.raw_os_error()
+            || e == Errno::NOTSUP.raw_os_error()
     )
 }
 
