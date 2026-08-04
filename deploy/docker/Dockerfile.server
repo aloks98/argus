@@ -14,6 +14,9 @@ RUN pnpm run build
 # --- rust, cargo-chef for layer caching ---
 FROM lukemathwalker/cargo-chef:latest-rust-1 AS chef
 WORKDIR /app
+RUN apt-get update && apt-get install -y --no-install-recommends musl-tools \
+    && rm -rf /var/lib/apt/lists/* \
+    && rustup target add x86_64-unknown-linux-musl
 FROM chef AS planner
 COPY . .
 RUN cargo chef prepare --recipe-path recipe.json
@@ -44,6 +47,10 @@ COPY --from=frontend /app/frontend/dist /app/frontend/dist
 ENV SQLX_OFFLINE=true
 RUN cargo build --release -p argus-server
 
+# The matching agent binary, bundled so the control plane can push
+# self-updates (ARGUS_AGENT_BINARY). Same workspace version by construction.
+RUN cargo build --release -p argus-agent --target x86_64-unknown-linux-musl
+
 # --- runtime ---
 FROM debian:bookworm-slim AS runtime
 # The source label is what links the ghcr package to the GitHub (mirror) repo.
@@ -56,8 +63,11 @@ LABEL org.opencontainers.image.title="argus" \
       org.opencontainers.image.licenses="AGPL-3.0-only"
 RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates curl \
     && rm -rf /var/lib/apt/lists/* \
-    && useradd --system --no-create-home argus
+    && useradd --system --no-create-home argus \
+    && mkdir -p /usr/local/lib/argus
 COPY --from=builder /app/target/release/argus /usr/local/bin/argus
+COPY --from=builder /app/target/x86_64-unknown-linux-musl/release/argus-agent /usr/local/lib/argus/argus-agent
+ENV ARGUS_AGENT_BINARY=/usr/local/lib/argus/argus-agent
 USER argus
 EXPOSE 8080 9443
 HEALTHCHECK --interval=30s --timeout=3s CMD curl -sf http://localhost:8080/healthz || exit 1

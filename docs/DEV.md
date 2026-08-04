@@ -1408,6 +1408,23 @@ Verified headless: System tab desktop + 390px (zero overflow/errors),
 cpu/virt values rendered, swap row correctly absent on this swapless
 guest.
 
+## Agent self-update — dev notes
+
+Dev control plane: point `ARGUS_AGENT_BINARY` at any locally built agent
+(e.g. `target/debug/argus-agent`, or the musl build for prod parity) and
+restart the server; `GET /api/server-info` then reports `agent_update`.
+The pushed binary's advertised version is the SERVER's workspace version,
+not anything probed from the file — in dev those can differ; push what you
+mean to push.
+
+Manual rollback after a bad update (the previous binary survives beside the
+new one):
+
+    sudo mv /path/to/argus-agent.old /path/to/argus-agent && sudo systemctl restart argus-agent
+
+(dev equivalent: kill the agent and re-run it — the binary path is what was
+swapped, the env/config are untouched.)
+
 ## Releasing
 
 The pipeline (`.forgejo/workflows/release.yml`) is tag-driven: pushing
