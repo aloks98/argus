@@ -1425,6 +1425,42 @@ new one):
 (dev equivalent: kill the agent and re-run it — the binary path is what was
 swapped, the env/config are untouched.)
 
+### Self-update end-to-end verification (2026-08-04)
+
+Verified live on the dev host. To keep the swap observable, the *running*
+agent was the **debug** build (sha `5271929c…`) started from a scratch
+directory (`/tmp/argus-agent-bin/`, never the repo's `target/`), while the
+control plane bundled the **musl release** build (sha `e6f7b9d3…`) via
+`ARGUS_AGENT_BINARY` — two genuinely different binaries, so every filesystem
+assertion below distinguishes them by hash rather than by trust.
+
+- `GET /api/server-info` reported the bundle:
+  `{"version":"0.3.0","agent_update":{"version":"0.3.0","sha256":"e6f7b9d3…"}}`.
+- `POST /api/machines/:id/agent-update` returned **in 74 ms**
+  `{"ok":true,"message":"staged 0.3.0","status":"completed"}` — the ~8 MB
+  streams over the existing Session well inside the 60 s bounded wait.
+- **The binary was swapped:** the agent's path then hashed `e6f7b9d3…` (the
+  bundled musl build) and `argus-agent.old` beside it hashed `5271929c…`
+  (the debug build that had been running) — i.e. `.old` really is the
+  rollback artifact, not a copy of the new one.
+- **The pid survived** (this is what `exec` buys, and the reason the systemd
+  unit never notices): pid `1892595` with an unchanged start time was still
+  the agent afterwards, and `/proc/1892595/exe` hashed to the NEW binary.
+  Beware `pgrep -f /path/to/argus-agent` when checking this — it also matches
+  your own shell pipeline's subshells, which is easy to misread as "the pid
+  changed". Read `/proc/<pid>/exe` and `ps -o lstart=` instead.
+- Machine returned `online` within ~8 s; `audit_log` gained
+  `agent.update / ok / target_ref=0.3.0`.
+- **Rollback:** the documented one-liner restored `5271929c…` and the agent
+  reconnected `online` — the recovery path is exercised, not just written down.
+
+**Not covered by this run:** the *version-change* observable. Both binaries
+carry workspace version `0.3.0`, so `agent_version` read `0.3.0` before and
+after and the UI's outdated badge could not light up. The swap is proven by
+hash; proving the badge needs a patch-bumped build (bump the workspace
+version, rebuild the musl agent, then push) — worth doing once before the
+next release tag.
+
 ## Releasing
 
 The pipeline (`.forgejo/workflows/release.yml`) is tag-driven: pushing
