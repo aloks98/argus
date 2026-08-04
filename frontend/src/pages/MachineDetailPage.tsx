@@ -42,7 +42,7 @@ import {
   TabsList,
   TabsTrigger,
 } from "@e412/rnui-react";
-import { Pencil } from "lucide-react";
+import { CircleArrowUp, Pencil } from "lucide-react";
 import ContainersCard from "../components/ContainersCard";
 import LogDialog from "../components/LogDialog";
 import LogFilterBar from "../components/LogFilterBar";
@@ -358,16 +358,21 @@ export default function MachineDetailPage() {
             >
               Audit
             </Button>
-            {/* Bundled version, not the machine's own — the badge names
-                what's ON OFFER, the confirm dialog below repeats it against
-                "to". */}
+            {/* One element, not a floating "available" string beside a
+                generic button: the label names the version ON OFFER (the
+                confirm dialog repeats it), and the warn-tone icon is the
+                nudge. A separate badge here read as debris between the
+                buttons. */}
             {updateAvailable && bundled !== null && (
-              <>
-                <StatusBadge tone="warn" label={`agent v${bundled.version} available`} />
-                <Button variant="outline" size="sm" onClick={() => setUpdateOpen(true)}>
-                  Update agent
-                </Button>
-              </>
+              <Button
+                variant="outline"
+                size="sm"
+                title={`Agent ${machine.agent_version} — ${bundled.version} available`}
+                onClick={() => setUpdateOpen(true)}
+              >
+                <CircleArrowUp className="size-4 text-[var(--warn-text)]" />
+                Update to v{bundled.version}
+              </Button>
             )}
           </div>
           {machine.display_name !== null && (

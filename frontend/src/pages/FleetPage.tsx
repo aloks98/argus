@@ -29,6 +29,7 @@ import {
   TableHeader,
   TableRow,
 } from "@e412/rnui-react";
+import { CircleArrowUp } from "lucide-react";
 import type { FleetRow, ServerInfo } from "../api";
 import AssetTag from "../components/AssetTag";
 import PageHeader from "../components/PageHeader";
@@ -58,13 +59,29 @@ function StatusCell({ row, serverInfo }: { row: FleetRow; serverInfo: ServerInfo
           label={`${row.failed_units} failed unit${row.failed_units === 1 ? "" : "s"}`}
         />
       )}
-      {/* Deliberately NOT arch-gated (unlike the machine page's update
+      {/* An icon, not another status word: "outdated" is a nudge, not a
+          state, and a second uppercase mono string here fuses with the
+          status into one run-on ("ONLINE AGENT OUTDATED"). The shape (not
+          just the colour) carries it, with the versions in the tooltip and
+          the accessible name.
+
+          Deliberately NOT arch-gated (unlike the machine page's update
           button): a non-x86_64 machine with an old agent still IS outdated,
           it just can't be updated from here. */}
       {serverInfo?.agent_update != null &&
         row.agent_version !== null &&
         row.agent_version !== serverInfo.agent_update.version && (
-          <StatusBadge tone="warn" label="agent outdated" />
+          // A span carries the tooltip and the accessible name: lucide's
+          // icons take no `title` prop, and a wrapper is the more reliable
+          // hover target anyway.
+          <span
+            role="img"
+            aria-label={`Agent ${row.agent_version} — ${serverInfo.agent_update.version} available`}
+            title={`Agent ${row.agent_version} — ${serverInfo.agent_update.version} available`}
+            className="inline-flex text-[var(--warn-text)]"
+          >
+            <CircleArrowUp className="size-4 shrink-0" />
+          </span>
         )}
     </div>
   );
