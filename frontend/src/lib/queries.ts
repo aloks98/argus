@@ -4,6 +4,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import {
   containerAction,
   getCaPem,
+  getAudit,
   getDocker,
   getEnrollmentConfig,
   getFleet,
@@ -34,6 +35,7 @@ export const qk = {
   enrollmentTokens: ["enrollment-tokens"] as const,
   enrollmentConfig: ["enrollment-config"] as const,
   caPem: ["ca-pem"] as const,
+  audit: (f: AuditFilters) => ["audit", f.category, f.machine, f.result, f.window] as const,
 };
 
 /**
@@ -188,5 +190,32 @@ export function useRevokeToken() {
     onSuccess: () => {
       void qc.invalidateQueries({ queryKey: qk.enrollmentTokens });
     },
+  });
+}
+
+/** URL-state filter values; empty string = unset (matches the URL contract). */
+export type AuditFilters = {
+  category: string;
+  machine: string;
+  result: string;
+  window: string;
+};
+
+/**
+ * The audit page's HEAD query: first page only, polled — which also picks up
+ * the seconds-later `result` UPDATE that verb rows receive. Older pages are
+ * fetched imperatively by the page (they don't poll; cost stays flat).
+ */
+export function useAudit(filters: AuditFilters) {
+  return useQuery({
+    queryKey: qk.audit(filters),
+    queryFn: () =>
+      getAudit({
+        category: filters.category,
+        machine: filters.machine,
+        result: filters.result,
+        window: filters.window,
+      }),
+    refetchInterval: MACHINE_INTERVAL,
   });
 }

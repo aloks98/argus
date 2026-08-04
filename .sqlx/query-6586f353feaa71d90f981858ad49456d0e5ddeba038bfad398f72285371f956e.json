@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO audit_log (actor, action, result) VALUES ('system', 'unit.stop', 'denied')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "6586f353feaa71d90f981858ad49456d0e5ddeba038bfad398f72285371f956e"
+}

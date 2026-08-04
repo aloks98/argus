@@ -317,6 +317,14 @@ export default function MachineDetailPage() {
               <Pencil className="size-3.5" />
               Edit
             </Button>
+            <Button
+              variant="outline"
+              size="sm"
+              render={<Link to={`/audit?machine=${id}`} />}
+              nativeButton={false}
+            >
+              Audit
+            </Button>
           </div>
           {machine.display_name !== null && (
             <p className="mt-1 font-mono text-[11px] text-muted-foreground">{machine.hostname}</p>

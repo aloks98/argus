@@ -66,9 +66,6 @@ export default function ContainersCard({
         <span className="font-mono text-[11px] text-muted-foreground normal-case tracking-normal">
           {containers.length} container{containers.length === 1 ? "" : "s"}
         </span>
-        <span className="font-mono text-[11px] text-muted-foreground">
-          Docker containers on this host
-        </span>
       </div>
 
       {/* Success feedback lives in the acted-on ROW (RowActions' outcome

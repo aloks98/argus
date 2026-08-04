@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO audit_log (actor, action, result) VALUES ('system', 'auth.login', 'ok')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "92dcbe0a8672815665a56afd977ad15f421c4d5a98e1db616d5e5a6fab34585f"
+}

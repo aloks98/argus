@@ -124,6 +124,7 @@ fn router(state: AppState) -> Router {
         .route("/api/enrollment-tokens/{id}", delete(revoke_token))
         // What the Enroll page interpolates into its printed block.
         .route("/api/enrollment-config", get(enrollment_config))
+        .route("/api/audit", get(list_audit))
         // The authenticated route predates the public /ca.pem below and is
         // kept for the download button + any existing automation; both call
         // the same handler.
@@ -809,6 +810,138 @@ async fn machine_metrics(
     Ok(Json(history.into_iter().map(Into::into).collect()))
 }
 
+/// Query params for `GET /api/audit`. All optional; an unknown VALUE for a
+/// known param is rejected by hand below, and `deny_unknown_fields` rejects
+/// an unknown param NAME (e.g. a typo'd `categry=`) via axum's `Query`
+/// extractor -- both are a 400 rather than silently ignored.
+#[derive(serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AuditQuery {
+    category: Option<String>,
+    machine: Option<String>,
+    result: Option<String>,
+    window: Option<String>,
+    before_id: Option<i64>,
+    limit: Option<i64>,
+}
+
+/// The audit action namespaces the UI can filter on. Kept in ONE place so a
+/// new namespace is added here and nowhere else server-side.
+const AUDIT_CATEGORIES: &[&str] = &[
+    "agent",
+    "auth",
+    "container",
+    "unit",
+    "logs",
+    "terminal",
+    "enroll_token",
+    "machine",
+    "local_admin",
+];
+
+#[derive(serde::Serialize)]
+struct AuditRowDto {
+    id: i64,
+    ts: String,
+    actor: String,
+    action: String,
+    machine_id: Option<Uuid>,
+    hostname: Option<String>,
+    target_ref: Option<String>,
+    result: Option<String>,
+    detail: serde_json::Value,
+}
+
+#[derive(serde::Serialize)]
+struct AuditPageDto {
+    rows: Vec<AuditRowDto>,
+    has_more: bool,
+}
+
+/// Read-only page over `audit_log`. Deliberately writes NO audit row itself:
+/// reads that don't touch an agent are not audited anywhere (`logs.open` is
+/// audited because it drives one).
+async fn list_audit(State(state): State<AppState>, Query(q): Query<AuditQuery>) -> Response {
+    let category = match q.category.as_deref() {
+        None => None,
+        Some(c) if AUDIT_CATEGORIES.contains(&c) => Some(c),
+        Some(_) => return (StatusCode::BAD_REQUEST, "unknown category").into_response(),
+    };
+    let machine_id = match q.machine.as_deref() {
+        None => None,
+        Some(raw) => match raw.parse::<Uuid>() {
+            Ok(id) => Some(id),
+            Err(_) => return (StatusCode::BAD_REQUEST, "invalid machine id").into_response(),
+        },
+    };
+    let result = match q.result.as_deref() {
+        None => None,
+        Some(r @ ("ok" | "error" | "denied")) => Some(r),
+        Some(_) => return (StatusCode::BAD_REQUEST, "unknown result").into_response(),
+    };
+    let since = match q.window.as_deref() {
+        None | Some("7d") => Some(OffsetDateTime::now_utc() - time::Duration::days(7)),
+        Some("24h") => Some(OffsetDateTime::now_utc() - time::Duration::hours(24)),
+        Some("30d") => Some(OffsetDateTime::now_utc() - time::Duration::days(30)),
+        Some("all") => None,
+        Some(_) => return (StatusCode::BAD_REQUEST, "unknown window").into_response(),
+    };
+    let before_id = match q.before_id {
+        None => None,
+        Some(id) if id >= 1 => Some(id),
+        Some(_) => return (StatusCode::BAD_REQUEST, "invalid before_id").into_response(),
+    };
+    let limit = q.limit.unwrap_or(100);
+    if !(1..=500).contains(&limit) {
+        return (StatusCode::BAD_REQUEST, "limit must be 1..=500").into_response();
+    }
+
+    let page = match repo::audit_page(
+        &state.pool,
+        repo::AuditFilters {
+            category,
+            machine_id,
+            result,
+            since,
+            before_id,
+            limit,
+        },
+    )
+    .await
+    {
+        Ok(page) => page,
+        Err(err) => {
+            tracing::error!(error = %err, "failed to load audit page");
+            return StatusCode::INTERNAL_SERVER_ERROR.into_response();
+        }
+    };
+
+    let rows = page
+        .rows
+        .into_iter()
+        .map(|r| AuditRowDto {
+            id: r.id,
+            ts: r
+                .ts
+                .format(&time::format_description::well_known::Rfc3339)
+                .unwrap_or_default(),
+            actor: r.actor,
+            action: r.action,
+            machine_id: r.machine_id,
+            hostname: r.hostname,
+            target_ref: r.target_ref,
+            result: r.result,
+            detail: r.detail,
+        })
+        .collect();
+
+    Json(AuditPageDto {
+        rows,
+        has_more: page.has_more,
+    })
+    .into_response()
+}
+
 /// One container row for the detail page's container panel, mirroring the proto
 /// `Container` (which isn't `Serialize`).
 #[derive(serde::Serialize)]
@@ -1492,6 +1625,83 @@ mod tests {
     use tokio::sync::mpsc;
     use tonic::Status;
     use tower::ServiceExt;
+
+    #[sqlx::test]
+    async fn audit_endpoint_rejects_bad_params(pool: PgPool) -> anyhow::Result<()> {
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool));
+
+        for uri in [
+            "/api/audit?category=nonsense",
+            "/api/audit?result=maybe",
+            "/api/audit?window=1y",
+            "/api/audit?limit=0",
+            "/api/audit?limit=501",
+            "/api/audit?machine=not-a-uuid",
+            "/api/audit?before_id=0",
+            // Unknown param NAME (typo), not just an unknown value -- must
+            // 400 via `deny_unknown_fields`, not fall through unfiltered.
+            "/api/audit?categry=auth",
+        ] {
+            let res = app
+                .clone()
+                .oneshot(
+                    Request::get(uri)
+                        .header("cookie", &cookie)
+                        .body(Body::empty())?,
+                )
+                .await?;
+            assert_eq!(
+                res.status(),
+                StatusCode::BAD_REQUEST,
+                "expected 400 for {uri}"
+            );
+        }
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn audit_endpoint_returns_filtered_rows(pool: PgPool) -> anyhow::Result<()> {
+        sqlx::query!(
+            "INSERT INTO audit_log (actor, action, result) VALUES ('system', 'auth.login', 'ok')"
+        )
+        .execute(&pool)
+        .await?;
+        sqlx::query!(
+            "INSERT INTO audit_log (actor, action, result) VALUES ('system', 'unit.stop', 'denied')"
+        )
+        .execute(&pool)
+        .await?;
+
+        let cookie = auth_cookie(&pool).await?;
+        let app = router(test_state(pool));
+
+        let res = app
+            .clone()
+            .oneshot(
+                Request::get("/api/audit?category=auth&window=all")
+                    .header("cookie", &cookie)
+                    .body(Body::empty())?,
+            )
+            .await?;
+        assert_eq!(res.status(), StatusCode::OK);
+        let body = to_bytes(res.into_body(), usize::MAX).await?;
+        let page: serde_json::Value = serde_json::from_slice(&body)?;
+        let rows = page["rows"].as_array().unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["action"], "auth.login");
+        assert_eq!(rows[0]["hostname"], serde_json::Value::Null);
+        // Absent-key guard, same reasoning as the fleet test above.
+        assert!(rows[0].as_object().unwrap().contains_key("detail"));
+        assert_eq!(page["has_more"], false);
+
+        // Unauthenticated -> 401 from the shared middleware.
+        let res = app
+            .oneshot(Request::get("/api/audit").body(Body::empty())?)
+            .await?;
+        assert_eq!(res.status(), StatusCode::UNAUTHORIZED);
+        Ok(())
+    }
 
     #[sqlx::test]
     async fn readyz_reports_ready_with_a_live_database(pool: PgPool) -> anyhow::Result<()> {

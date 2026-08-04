@@ -536,6 +536,81 @@ pub async fn update_command_result(
     Ok(())
 }
 
+/// Copy so tests can reuse a base filter with struct-update syntax.
+#[derive(Clone, Copy)]
+pub struct AuditFilters<'a> {
+    pub category: Option<&'a str>,
+    pub machine_id: Option<Uuid>,
+    pub result: Option<&'a str>,
+    pub since: Option<OffsetDateTime>,
+    pub before_id: Option<i64>,
+    /// Already validated by the caller (1..=500).
+    pub limit: i64,
+}
+
+pub struct AuditPageRow {
+    pub id: i64,
+    pub ts: OffsetDateTime,
+    pub actor: String,
+    pub action: String,
+    pub machine_id: Option<Uuid>,
+    pub hostname: Option<String>,
+    pub target_ref: Option<String>,
+    pub result: Option<String>,
+    pub detail: serde_json::Value,
+}
+
+pub struct AuditPage {
+    pub rows: Vec<AuditPageRow>,
+    pub has_more: bool,
+}
+
+/// One page of the audit log, newest-first, keyset-paged on `id` (an identity
+/// column, so it tracks insertion order exactly). Filters are the endpoint's
+/// lean set; each is optional via the `($n IS NULL OR ...)` pattern used
+/// throughout this module.
+pub async fn audit_page(exec: impl sqlx::PgExecutor<'_>, f: AuditFilters<'_>) -> Result<AuditPage> {
+    let rows = sqlx::query!(
+        r#"SELECT a.id, a.ts, a.actor, a.action, a.machine_id,
+                  m.hostname as "hostname?", a.target_ref, a.result, a.detail
+           FROM audit_log a LEFT JOIN machines m ON m.id = a.machine_id
+           WHERE ($1::text        IS NULL OR a.action LIKE $1 || '.%')
+             AND ($2::uuid        IS NULL OR a.machine_id = $2)
+             AND ($3::text        IS NULL OR a.result = $3)
+             AND ($4::timestamptz IS NULL OR a.ts >= $4)
+             AND ($5::bigint      IS NULL OR a.id < $5)
+           ORDER BY a.id DESC
+           LIMIT $6"#,
+        f.category,
+        f.machine_id,
+        f.result,
+        f.since,
+        f.before_id,
+        f.limit + 1,
+    )
+    .fetch_all(exec)
+    .await?;
+
+    let has_more = rows.len() as i64 > f.limit;
+    let rows = rows
+        .into_iter()
+        .take(f.limit as usize)
+        .map(|r| AuditPageRow {
+            id: r.id,
+            ts: r.ts,
+            actor: r.actor,
+            action: r.action,
+            machine_id: r.machine_id,
+            hostname: r.hostname,
+            target_ref: r.target_ref,
+            result: r.result,
+            detail: r.detail,
+        })
+        .collect();
+
+    Ok(AuditPage { rows, has_more })
+}
+
 /// One heartbeat's worth of host metrics (mirrors the agent's metrics-sample
 /// proto message). Persisted as-is into `metrics`; `ts` is stamped by
 /// Postgres (`now()`) at insert time, not carried from the agent.
@@ -2092,6 +2167,152 @@ mod tests {
             .fetch_one(&pool)
             .await?;
         assert!(after.is_some());
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn audit_page_filters_and_pages(pool: PgPool) -> anyhow::Result<()> {
+        let m1 = seed_machine(&pool, "audit-host-a").await;
+        let m2 = seed_machine(&pool, "audit-host-b").await;
+
+        // 3 rows: unit verb on m1 (ok), container verb on m2 (error),
+        // fleet-level auth event (no machine).
+        audit_command(
+            &pool,
+            Actor::System,
+            "unit.restart",
+            Some(m1),
+            "docker.service",
+            Uuid::new_v4(),
+            "ok",
+        )
+        .await?;
+        audit_command(
+            &pool,
+            Actor::System,
+            "container.stop",
+            Some(m2),
+            "abc123",
+            Uuid::new_v4(),
+            "error",
+        )
+        .await?;
+        audit(&pool, Actor::System, "auth.login", None, "ok").await?;
+
+        let base = AuditFilters {
+            category: None,
+            machine_id: None,
+            result: None,
+            since: None,
+            before_id: None,
+            limit: 100,
+        };
+
+        // Unfiltered: all 3, newest (auth.login) first, no more pages.
+        let page = audit_page(&pool, AuditFilters { ..base }).await?;
+        assert_eq!(page.rows.len(), 3);
+        assert_eq!(page.rows[0].action, "auth.login");
+        assert!(!page.has_more);
+
+        // Category is a PREFIX match on the namespace, dot included:
+        // "unit" must match unit.restart only (not a hypothetical "units.x").
+        let page = audit_page(
+            &pool,
+            AuditFilters {
+                category: Some("unit"),
+                ..base
+            },
+        )
+        .await?;
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].action, "unit.restart");
+        assert_eq!(page.rows[0].hostname.as_deref(), Some("audit-host-a"));
+
+        // Machine filter.
+        let page = audit_page(
+            &pool,
+            AuditFilters {
+                machine_id: Some(m2),
+                ..base
+            },
+        )
+        .await?;
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].action, "container.stop");
+
+        // Result filter.
+        let page = audit_page(
+            &pool,
+            AuditFilters {
+                result: Some("error"),
+                ..base
+            },
+        )
+        .await?;
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].target_ref.as_deref(), Some("abc123"));
+
+        // Keyset: limit 2 -> has_more, then before_id of the oldest returned
+        // row yields the remaining row, EXCLUSIVE of the cursor row.
+        let page = audit_page(&pool, AuditFilters { limit: 2, ..base }).await?;
+        assert_eq!(page.rows.len(), 2);
+        assert!(page.has_more);
+        let cursor = page.rows[1].id;
+        let older = audit_page(
+            &pool,
+            AuditFilters {
+                before_id: Some(cursor),
+                ..base
+            },
+        )
+        .await?;
+        assert_eq!(older.rows.len(), 1);
+        assert!(older.rows[0].id < cursor);
+        assert!(!older.has_more);
+
+        // Fleet-level row carries no machine and no hostname. (Bind the page
+        // first — indexing into the temporary would drop it at end of statement.)
+        let auth_page = audit_page(
+            &pool,
+            AuditFilters {
+                category: Some("auth"),
+                ..base
+            },
+        )
+        .await?;
+        let auth_row = &auth_page.rows[0];
+        assert!(auth_row.machine_id.is_none());
+        assert!(auth_row.hostname.is_none());
+
+        Ok(())
+    }
+
+    #[sqlx::test]
+    async fn audit_page_window_cutoff(pool: PgPool) -> anyhow::Result<()> {
+        audit(&pool, Actor::System, "auth.login", None, "ok").await?;
+        // Backdate a second row past any window we'll ask for.
+        sqlx::query!(
+            "INSERT INTO audit_log (actor, action, result, ts)
+             VALUES ('system', 'auth.logout', 'ok', now() - interval '10 days')"
+        )
+        .execute(&pool)
+        .await?;
+
+        let since = OffsetDateTime::now_utc() - time::Duration::days(7);
+        let page = audit_page(
+            &pool,
+            AuditFilters {
+                category: None,
+                machine_id: None,
+                result: None,
+                since: Some(since),
+                before_id: None,
+                limit: 100,
+            },
+        )
+        .await?;
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].action, "auth.login");
         Ok(())
     }
 }

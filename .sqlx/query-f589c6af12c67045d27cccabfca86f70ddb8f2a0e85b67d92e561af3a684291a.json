@@ -1,0 +1,12 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO audit_log (actor, action, result, ts)\n             VALUES ('system', 'auth.logout', 'ok', now() - interval '10 days')",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": []
+    },
+    "nullable": []
+  },
+  "hash": "f589c6af12c67045d27cccabfca86f70ddb8f2a0e85b67d92e561af3a684291a"
+}

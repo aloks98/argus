@@ -84,9 +84,6 @@ export default function UnitsCard({
           {units.length} unit{units.length === 1 ? "" : "s"}
           {failed > 0 && ` · ${failed} failed`}
         </span>
-        <span className="font-mono text-[11px] text-muted-foreground">
-          systemd services on this host, plus any failed unit
-        </span>
       </div>
 
       {/* Success feedback lives in the acted-on ROW (RowActions' outcome

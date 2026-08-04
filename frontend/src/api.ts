@@ -417,3 +417,37 @@ export async function revokeToken(id: string): Promise<void> {
   const r = unauthenticatedOr(await fetch(`/api/enrollment-tokens/${id}`, { method: "DELETE" }));
   if (!r.ok) throw new Error(`revoke failed: ${r.status}`);
 }
+
+export type AuditRow = {
+  id: number;
+  ts: string;
+  actor: string;
+  action: string;
+  machine_id: string | null;
+  hostname: string | null;
+  target_ref: string | null;
+  result: string | null;
+  detail: Record<string, unknown>;
+};
+
+export type AuditPage = { rows: AuditRow[]; has_more: boolean };
+
+export type AuditParams = {
+  category?: string;
+  machine?: string;
+  result?: string;
+  window?: string;
+  before_id?: number;
+  limit?: number;
+};
+
+export async function getAudit(params: AuditParams): Promise<AuditPage> {
+  const q = new URLSearchParams();
+  for (const [key, value] of Object.entries(params)) {
+    if (value !== undefined && value !== "") q.set(key, String(value));
+  }
+  const qs = q.toString();
+  const r = unauthenticatedOr(await fetch(`/api/audit${qs === "" ? "" : `?${qs}`}`));
+  if (!r.ok) throw new Error(`audit ${r.status}`);
+  return r.json();
+}
